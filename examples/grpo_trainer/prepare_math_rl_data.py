@@ -19,7 +19,7 @@ import argparse
 import os
 from typing import Any
 
-from datasets import Dataset, load_dataset
+from datasets import Dataset, DatasetDict, load_dataset
 
 DEFAULT_PROMPT_PREFIX = (
     "Solve the following math problem step by step. "
@@ -106,7 +106,8 @@ def _pick_split(ds_dict):
 
 def iter_aime24_test():
     raw = load_dataset("HuggingFaceH4/aime_2024")
-    ds = raw if hasattr(raw, "__len__") else _pick_split(raw)
+    # HF 常返回 DatasetDict（如仅有 train），不能对 dict 做 ds[0] 索引
+    ds = _pick_split(raw) if isinstance(raw, DatasetDict) else raw
     for idx in range(len(ds)):
         ex = ds[idx]
         p = ex.get("problem") or ex.get("question")
