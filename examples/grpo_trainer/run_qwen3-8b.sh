@@ -6,7 +6,7 @@ set -x
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     data.train_files=$HOME/data/gsm8k/train.parquet \
-    data.val_files=$HOME/data/gsm8k/test.parquet \
+    data.val_files="['$HOME/data/gsm8k/test.parquet']" \
     data.train_batch_size=1024 \
     data.max_prompt_length=512 \
     data.max_response_length=1024 \
@@ -32,6 +32,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=32 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     algorithm.use_kl_in_reward=False \
+    custom_reward_function.path=$(dirname "$0")/custom_reward.py \
+    custom_reward_function.name=compute_score \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb"]' \
     trainer.project_name='verl_grpo_example_gsm8k' \
