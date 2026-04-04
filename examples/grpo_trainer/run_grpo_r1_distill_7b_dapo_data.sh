@@ -4,7 +4,7 @@
 #
 # 数据准备说明：
 # 1) 训练集：DAPO 风格 parquet，每条需含 prompt、data_source（建议 math_dapo）、reward_model.ground_truth。
-#    可用同目录下 prepare_dapo_style_parquet.py 从 JSONL 转换。
+#    可用同目录下 prepare_math_rl_data.py --output_dir DIR 从 HF 一键生成 parquet。
 # 2) MATH-500 测试 parquet：列 data_source 需为 HuggingFaceH4/MATH-500（与 default_compute_score 一致），
 #    并有 reward_model.ground_truth（字符串或可解析答案）。
 # 3) AIME24 测试 parquet：data_source 建议以 aime 开头（如 aime2024），走 math_dapo 判分分支。

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # GRPO + DAPO 风格（非对称 clip、动态组过滤、较大 gen_batch）数学训练示例。
-# 数据：先用 prepare_dapo_style_parquet.py 把 prompt+label 转为 VERL parquet（含 data_source / reward_model）。
+# 数据：可用 prepare_math_rl_data.py --output_dir DIR 从 HF 下载并预处理。
 #
 # 使用前请修改:
 #   TRAIN_PARQUET / TEST_PARQUET / MODEL_PATH / GPU 数量相关项
