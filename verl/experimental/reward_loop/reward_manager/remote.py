@@ -123,7 +123,10 @@ class RemoteRewardManager(RewardManagerBase):
                 reward_extra_info[key] = value
         else:
             score = result
-            reward_extra_info["acc"] = score
+            r = float(score)
+            reward_extra_info["score"] = r
+            reward_extra_info["acc"] = r
+            reward_extra_info["pred"] = None
 
         reward = score
 
