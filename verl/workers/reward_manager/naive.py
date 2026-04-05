@@ -101,7 +101,6 @@ class NaiveRewardManager(AbstractRewardManager):
                 r = float(reward)
                 reward_extra_info["score"].append(r)
                 reward_extra_info["acc"].append(r)
-                reward_extra_info["pred"].append(None)
 
             reward_tensor[i, valid_response_length - 1] = reward
 

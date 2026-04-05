@@ -447,7 +447,6 @@ class RateLimitedRewardManager(RewardManagerBase):
                     r = float(score)
                     reward_extra_info["score"] = r
                     reward_extra_info["acc"] = r
-                    reward_extra_info["pred"] = None
 
                 reward = score
 
@@ -460,7 +459,6 @@ class RateLimitedRewardManager(RewardManagerBase):
                 reward_extra_info["timeout"] = True
                 reward_extra_info["score"] = 0.0
                 reward_extra_info["acc"] = 0.0
-                reward_extra_info["pred"] = None
 
             except Exception as e:
                 logger.error(
@@ -471,7 +469,6 @@ class RateLimitedRewardManager(RewardManagerBase):
                 reward_extra_info["error"] = str(e)
                 reward_extra_info["score"] = 0.0
                 reward_extra_info["acc"] = 0.0
-                reward_extra_info["pred"] = None
 
         return {"reward_score": reward, "reward_extra_info": reward_extra_info}
 

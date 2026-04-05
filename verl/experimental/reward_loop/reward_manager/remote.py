@@ -126,7 +126,6 @@ class RemoteRewardManager(RewardManagerBase):
             r = float(score)
             reward_extra_info["score"] = r
             reward_extra_info["acc"] = r
-            reward_extra_info["pred"] = None
 
         reward = score
 

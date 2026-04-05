@@ -108,7 +108,6 @@ class BatchRewardManager(AbstractRewardManager):
                 r = float(reward)
                 reward_extra_info["score"].append(r)
                 reward_extra_info["acc"].append(r)
-                reward_extra_info["pred"].append(None)
 
             rewards.append(reward)
             reward_tensor[i, length - 1] = reward

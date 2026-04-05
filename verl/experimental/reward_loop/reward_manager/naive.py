@@ -96,7 +96,6 @@ class NaiveRewardManager(RewardManagerBase):
             # 与 dict 分支对齐键，避免 val 混 MATH-500(float) 与 AIME(dict) 时仅部分样本含 score
             reward_extra_info["score"] = r
             reward_extra_info["acc"] = r
-            reward_extra_info["pred"] = None
 
         reward = score
 
