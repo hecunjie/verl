@@ -29,9 +29,10 @@ from typing import Any
 from datasets import Dataset, DatasetDict, load_dataset
 
 # 与 open-r1/DAPO-Math-17k-Processed 中 user 文案一致（用于 MATH-500 / AIME 测试集）
+# 注意：须写成 ``{{$Answer}}``，否则 str.format 会把 ``\boxed{$Answer}`` 里的花括号当成占位符。
 DAPO_PROCESSED_USER_TEMPLATE = (
     "Solve the following math problem step by step. "
-    "The last line of your response should be of the form Answer: \\boxed{$Answer} "
+    "The last line of your response should be of the form Answer: \\boxed{{$Answer}} "
     "where $Answer is the answer to the problem.\n\n{problem}\n\n"
     'Remember to put your answer on its own line after "Answer:".'
 )
