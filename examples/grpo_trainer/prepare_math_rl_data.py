@@ -8,15 +8,9 @@
 
 若需使用字节版百万级数据，加 ``--train_source byted``。
 
-用法::
+用法（训练集与测试集均从 HuggingFace 在线拉取，需联网）::
 
-  # 从本机已下载目录或单个 parquet 生成（推荐离线）
-  python prepare_math_rl_data.py --output_dir ~/data/math_rl \\
-      --dapo_train_local /path/to/DAPO-Math-17k-Processed
-
-  # 从 HuggingFace 拉取 open-r1/DAPO-Math-17k-Processed
   python prepare_math_rl_data.py --output_dir ~/data/math_rl
-
   python prepare_math_rl_data.py --output_dir ~/data/math_rl --max_train_samples 1024
 
 生成（均在 output_dir 下）：
@@ -28,12 +22,11 @@
 from __future__ import annotations
 
 import argparse
-import glob
 import json
 import os
 from typing import Any
 
-from datasets import Dataset, DatasetDict, load_dataset, load_from_disk
+from datasets import Dataset, DatasetDict, load_dataset
 
 # 与 open-r1/DAPO-Math-17k-Processed 中 user 文案一致（用于 MATH-500 / AIME 测试集）
 DAPO_PROCESSED_USER_TEMPLATE = (
@@ -126,38 +119,6 @@ def _ground_truth_from_processed(ex: dict[str, Any]) -> str:
     raise ValueError(f"no label/reward_model.ground_truth in example keys={list(ex.keys())}")
 
 
-def _load_dapo_processed_local(local_path: str) -> Dataset:
-    path = os.path.expanduser(local_path)
-    if not os.path.exists(path):
-        raise FileNotFoundError(path)
-    if os.path.isfile(path):
-        ext = path.lower()
-        if ext.endswith(".parquet"):
-            raw = load_dataset("parquet", data_files=path)
-        elif ext.endswith(".jsonl") or ext.endswith(".json"):
-            raw = load_dataset("json", data_files=path)
-        else:
-            raise ValueError(f"unsupported file type: {path}")
-        return raw["train"] if isinstance(raw, DatasetDict) else raw
-    # directory
-    try:
-        disk = load_from_disk(path)
-        if isinstance(disk, DatasetDict):
-            for k in ("train", "test", "validation", "all"):
-                if k in disk:
-                    return disk[k]
-            keys = list(disk.keys())
-            return disk[keys[0]]
-        return disk
-    except Exception:
-        pass
-    parquets = sorted(glob.glob(os.path.join(path, "**", "*.parquet"), recursive=True))
-    if parquets:
-        raw = load_dataset("parquet", data_files=parquets)
-        return raw["train"] if isinstance(raw, DatasetDict) else raw
-    raise ValueError(f"could not load dataset from directory: {path} (no parquet / load_from_disk)")
-
-
 def _load_dapo_processed_hf() -> Dataset:
     """HF 上该数据集子集名为 ``all``，split 为 ``train``（约 17.4k 行）。"""
     last_err: Exception | None = None
@@ -175,16 +136,12 @@ def _load_dapo_processed_hf() -> Dataset:
             continue
     assert last_err is not None
     raise RuntimeError(
-        "无法从 HuggingFace 加载 open-r1/DAPO-Math-17k-Processed，"
-        "请使用 --dapo_train_local 指向本机已下载目录或 parquet。"
+        "无法从 HuggingFace 加载 open-r1/DAPO-Math-17k-Processed（请检查网络、代理与 HF_TOKEN 限流）。"
     ) from last_err
 
 
-def iter_dapo_processed_train(
-    dapo_train_local: str | None,
-    max_train_samples: int | None = None,
-):
-    ds = _load_dapo_processed_local(dapo_train_local) if dapo_train_local else _load_dapo_processed_hf()
+def iter_dapo_processed_train(max_train_samples: int | None = None):
+    ds = _load_dapo_processed_hf()
     n = len(ds) if max_train_samples is None else min(int(max_train_samples), len(ds))
     for idx in range(n):
         ex = ds[idx]
@@ -286,12 +243,6 @@ def main():
         help="processed=open-r1/DAPO-Math-17k-Processed；byted=BytedTsinghua-SIA 百万级全量",
     )
     ap.add_argument(
-        "--dapo_train_local",
-        type=str,
-        default=None,
-        help="本机已下载的 DAPO-Math-17k-Processed：parquet 文件、含 parquet 的目录、或 load_from_disk 目录；不设则从 HF 拉取",
-    )
-    ap.add_argument(
         "--max_train_samples",
         type=int,
         default=None,
@@ -305,7 +256,7 @@ def main():
         f_train = os.path.join(out, "dapo_math_17k_processed_train.parquet")
 
         def gen_train():
-            yield from iter_dapo_processed_train(args.dapo_train_local, args.max_train_samples)
+            yield from iter_dapo_processed_train(args.max_train_samples)
 
         print("1/3 open-r1/DAPO-Math-17k-Processed (train) ...")
         n1 = _write_parquet(f_train, gen_train)
