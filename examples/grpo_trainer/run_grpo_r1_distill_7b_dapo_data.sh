@@ -3,8 +3,8 @@
 # 硬件：单机 8 卡。训练 batch 与 PPO mini-batch 按你的要求固定。
 #
 # 数据准备说明：
-# 1) 训练集：DAPO 风格 parquet，每条需含 prompt、data_source（建议 math_dapo）、reward_model.ground_truth。
-#    可用同目录下 prepare_math_rl_data.py --output_dir DIR 从 HF 一键生成 parquet。
+# 1) 训练集：默认 open-r1/DAPO-Math-17k-Processed（约 17k 条），见 prepare_math_rl_data.py。
+#    本机已下载时：--dapo_train_local /path/to/dataset 生成 dapo_math_17k_processed_train.parquet。
 # 2) MATH-500 测试 parquet：列 data_source 需为 HuggingFaceH4/MATH-500（与 default_compute_score 一致），
 #    并有 reward_model.ground_truth（字符串或可解析答案）。
 # 3) AIME24 测试 parquet：data_source 建议以 aime 开头（如 aime2024），走 math_dapo 判分分支。
@@ -26,8 +26,8 @@ OUTPUT_DIR="${OUTPUT_DIR:-${HOME}/verl_checkpoints/${PROJECT_NAME}/${EXPERIMENT_
 mkdir -p "${OUTPUT_DIR}"
 echo "Checkpoint / trainer output dir: ${OUTPUT_DIR}"
 
-# 训练：DAPO 数据（parquet）
-TRAIN_FILES="${TRAIN_FILES:-${HOME}/data/dapo/train.parquet}"
+# 训练：DAPO-Math-17k-Processed 生成的 parquet（prepare_math_rl_data.py 默认文件名）
+TRAIN_FILES="${TRAIN_FILES:-${HOME}/data/math_rl/dapo_math_17k_processed_train.parquet}"
 
 # 验证：两个测试集（OmegaConf 列表字符串）
 MATH500_VAL="${MATH500_VAL:-${HOME}/data/math500/test.parquet}"

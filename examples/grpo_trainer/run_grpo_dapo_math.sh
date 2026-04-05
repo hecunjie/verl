@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # GRPO + DAPO 风格（非对称 clip、动态组过滤、较大 gen_batch）数学训练示例。
-# 数据：可用 prepare_math_rl_data.py --output_dir DIR 从 HF 下载并预处理。
+# 数据：prepare_math_rl_data.py（默认 open-r1/DAPO-Math-17k-Processed；可加 --dapo_train_local 本机路径）。
 #
 # 使用前请修改:
 #   TRAIN_PARQUET / TEST_PARQUET / MODEL_PATH / GPU 数量相关项

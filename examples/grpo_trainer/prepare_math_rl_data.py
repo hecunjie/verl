@@ -1,46 +1,91 @@
 #!/usr/bin/env python3
-"""从 HuggingFace 下载 DAPO-Math-17k（训练）、MATH-500（测）、AIME 2024（测），并写成 VERL 可直接用的 parquet。
+"""准备 VERL 数学 GRPO 用 parquet。
 
-每条样本：``DEFAULT_PROMPT_PREFIX`` + 换行 + 题干，与统一数学 RL 格式一致。
+**默认训练集**：[`open-r1/DAPO-Math-17k-Processed`](https://huggingface.co/datasets/open-r1/DAPO-Math-17k-Processed)
+（约 1.7 万条，与 DAPO 论文规模一致）。每条保留其 ``prompt`` 字段，将 ``label`` 写入 ``reward_model.ground_truth``。
 
-仅需一个参数::
+**测试集**：MATH-500、AIME 2024，题干用与上述数据集 **相同** 的 user 文案模板包裹（含 ``\\boxed`` 与末尾 ``Remember to put...``）。
 
+若需使用字节版百万级数据，加 ``--train_source byted``。
+
+用法::
+
+  # 从本机已下载目录或单个 parquet 生成（推荐离线）
+  python prepare_math_rl_data.py --output_dir ~/data/math_rl \\
+      --dapo_train_local /path/to/DAPO-Math-17k-Processed
+
+  # 从 HuggingFace 拉取 open-r1/DAPO-Math-17k-Processed
   python prepare_math_rl_data.py --output_dir ~/data/math_rl
 
-生成（均在 output_dir 下）：
-  - dapo_math_17k_train.parquet   # 训练
-  - math500_test.parquet         # 验证
-  - aime2024_test.parquet        # 验证
+  python prepare_math_rl_data.py --output_dir ~/data/math_rl --max_train_samples 1024
 
-需联网；依赖 datasets。"""
+生成（均在 output_dir 下）：
+  - dapo_math_17k_processed_train.parquet  # 默认：Processed 训练（或 byted 时为 dapo_math_byted_train.parquet）
+  - math500_test.parquet
+  - aime2024_test.parquet
+
+依赖：datasets。"""
 from __future__ import annotations
 
 import argparse
+import glob
+import json
 import os
 from typing import Any
 
-from datasets import Dataset, DatasetDict, load_dataset
+from datasets import Dataset, DatasetDict, load_dataset, load_from_disk
 
-DEFAULT_PROMPT_PREFIX = (
+# 与 open-r1/DAPO-Math-17k-Processed 中 user 文案一致（用于 MATH-500 / AIME 测试集）
+DAPO_PROCESSED_USER_TEMPLATE = (
+    "Solve the following math problem step by step. "
+    "The last line of your response should be of the form Answer: \\boxed{$Answer} "
+    "where $Answer is the answer to the problem.\n\n{problem}\n\n"
+    'Remember to put your answer on its own line after "Answer:".'
+)
+
+# 旧脚本里用于 Byted 全量数据的模板（无末尾 Remember 行）
+LEGACY_PROMPT_PREFIX = (
     "Solve the following math problem step by step. "
     "The last line of your response should be of the form Answer: \\boxed{$Answer} "
     "where $Answer is the answer to the problem."
 )
 
 
-def _user_content(problem: str) -> str:
-    return f"{DEFAULT_PROMPT_PREFIX.strip()}\n\n{str(problem).strip()}"
+def _user_content_legacy(problem: str) -> str:
+    return f"{LEGACY_PROMPT_PREFIX.strip()}\n\n{str(problem).strip()}"
+
+
+def _user_content_dapo_processed(problem: str) -> str:
+    return DAPO_PROCESSED_USER_TEMPLATE.format(problem=str(problem).strip())
 
 
 def _row(
-    problem: str,
+    user_content: str,
     ground_truth: str,
     data_source: str,
     extra_info: dict[str, Any] | None = None,
     ability: str = "math",
 ) -> dict[str, Any]:
     r: dict[str, Any] = {
-        "prompt": [{"role": "user", "content": _user_content(problem)}],
+        "prompt": [{"role": "user", "content": user_content}],
+        "data_source": data_source,
+        "ability": ability,
+        "reward_model": {"style": "rule", "ground_truth": str(ground_truth)},
+    }
+    if extra_info is not None:
+        r["extra_info"] = extra_info
+    return r
+
+
+def _row_prompt_list(
+    prompt: list[dict[str, Any]],
+    ground_truth: str,
+    data_source: str,
+    extra_info: dict[str, Any] | None = None,
+    ability: str = "math",
+) -> dict[str, Any]:
+    r: dict[str, Any] = {
+        "prompt": prompt,
         "data_source": data_source,
         "ability": ability,
         "reward_model": {"style": "rule", "ground_truth": str(ground_truth)},
@@ -58,6 +103,106 @@ def _gt(gt: Any) -> str:
     return str(gt)
 
 
+def _ensure_prompt_list(prompt: Any) -> list[dict[str, Any]]:
+    if isinstance(prompt, str):
+        try:
+            parsed = json.loads(prompt)
+            if isinstance(parsed, list):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+        return [{"role": "user", "content": prompt.strip()}]
+    if isinstance(prompt, list):
+        return prompt
+    raise ValueError(f"unsupported prompt type: {type(prompt)}")
+
+
+def _ground_truth_from_processed(ex: dict[str, Any]) -> str:
+    if ex.get("label") is not None:
+        return _gt(ex["label"])
+    rm = ex.get("reward_model")
+    if isinstance(rm, dict) and rm.get("ground_truth") is not None:
+        return _gt(rm["ground_truth"])
+    raise ValueError(f"no label/reward_model.ground_truth in example keys={list(ex.keys())}")
+
+
+def _load_dapo_processed_local(local_path: str) -> Dataset:
+    path = os.path.expanduser(local_path)
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+    if os.path.isfile(path):
+        ext = path.lower()
+        if ext.endswith(".parquet"):
+            raw = load_dataset("parquet", data_files=path)
+        elif ext.endswith(".jsonl") or ext.endswith(".json"):
+            raw = load_dataset("json", data_files=path)
+        else:
+            raise ValueError(f"unsupported file type: {path}")
+        return raw["train"] if isinstance(raw, DatasetDict) else raw
+    # directory
+    try:
+        disk = load_from_disk(path)
+        if isinstance(disk, DatasetDict):
+            for k in ("train", "test", "validation", "all"):
+                if k in disk:
+                    return disk[k]
+            keys = list(disk.keys())
+            return disk[keys[0]]
+        return disk
+    except Exception:
+        pass
+    parquets = sorted(glob.glob(os.path.join(path, "**", "*.parquet"), recursive=True))
+    if parquets:
+        raw = load_dataset("parquet", data_files=parquets)
+        return raw["train"] if isinstance(raw, DatasetDict) else raw
+    raise ValueError(f"could not load dataset from directory: {path} (no parquet / load_from_disk)")
+
+
+def _load_dapo_processed_hf() -> Dataset:
+    """HF 上该数据集子集名为 ``all``，split 为 ``train``（约 17.4k 行）。"""
+    last_err: Exception | None = None
+    for factory in (
+        lambda: load_dataset("open-r1/DAPO-Math-17k-Processed", "all", split="train"),
+        lambda: load_dataset("open-r1/DAPO-Math-17k-Processed", split="train"),
+    ):
+        try:
+            raw = factory()
+            if isinstance(raw, DatasetDict):
+                return _pick_split(raw)
+            return raw
+        except Exception as e:
+            last_err = e
+            continue
+    assert last_err is not None
+    raise RuntimeError(
+        "无法从 HuggingFace 加载 open-r1/DAPO-Math-17k-Processed，"
+        "请使用 --dapo_train_local 指向本机已下载目录或 parquet。"
+    ) from last_err
+
+
+def iter_dapo_processed_train(
+    dapo_train_local: str | None,
+    max_train_samples: int | None = None,
+):
+    ds = _load_dapo_processed_local(dapo_train_local) if dapo_train_local else _load_dapo_processed_hf()
+    n = len(ds) if max_train_samples is None else min(int(max_train_samples), len(ds))
+    for idx in range(n):
+        ex = ds[idx]
+        prompt = _ensure_prompt_list(ex["prompt"])
+        gt = _ground_truth_from_processed(ex)
+        extra = ex.get("extra_info")
+        if not isinstance(extra, dict):
+            extra = {}
+        extra = {**extra, "index": idx}
+        yield _row_prompt_list(
+            prompt,
+            gt,
+            "open-r1/DAPO-Math-17k-Processed",
+            extra_info=extra,
+            ability=str(ex.get("ability", "math")),
+        )
+
+
 def _first_user_prompt(prompt: list) -> str:
     for m in prompt:
         if isinstance(m, dict) and m.get("role") == "user":
@@ -65,13 +210,14 @@ def _first_user_prompt(prompt: list) -> str:
     raise ValueError("prompt 中无 user 消息")
 
 
-def iter_dapo_train():
+def iter_byted_dapo_train(max_train_samples: int | None = None):
     ds = load_dataset("BytedTsinghua-SIA/DAPO-Math-17k", "default", split="train")
-    for idx in range(len(ds)):
+    n = len(ds) if max_train_samples is None else min(int(max_train_samples), len(ds))
+    for idx in range(n):
         ex = ds[idx]
         prob = _first_user_prompt(ex["prompt"])
         yield _row(
-            prob,
+            _user_content_legacy(prob),
             _gt(ex["reward_model"]["ground_truth"]),
             ex.get("data_source") or "math_dapo",
             extra_info={**(ex.get("extra_info") or {}), "index": idx},
@@ -84,7 +230,7 @@ def iter_math500_test():
     for idx in range(len(ds)):
         ex = ds[idx]
         yield _row(
-            str(ex["problem"]).strip(),
+            _user_content_dapo_processed(str(ex["problem"]).strip()),
             _gt(ex["answer"]),
             "HuggingFaceH4/MATH-500",
             extra_info={
@@ -96,7 +242,7 @@ def iter_math500_test():
         )
 
 
-def _pick_split(ds_dict):
+def _pick_split(ds_dict: DatasetDict):
     keys = list(ds_dict.keys())
     for k in ("test", "validation", "train"):
         if k in keys:
@@ -106,7 +252,6 @@ def _pick_split(ds_dict):
 
 def iter_aime24_test():
     raw = load_dataset("HuggingFaceH4/aime_2024")
-    # HF 常返回 DatasetDict（如仅有 train），不能对 dict 做 ds[0] 索引
     ds = _pick_split(raw) if isinstance(raw, DatasetDict) else raw
     for idx in range(len(ds)):
         ex = ds[idx]
@@ -117,7 +262,7 @@ def iter_aime24_test():
         if a is None:
             raise KeyError(f"AIME idx={idx} no answer")
         yield _row(
-            str(p).strip(),
+            _user_content_dapo_processed(str(p).strip()),
             _gt(a),
             "aime2024",
             extra_info={"index": idx, "split": "aime2024", "source_id": ex.get("id", str(idx))},
@@ -133,23 +278,56 @@ def _write_parquet(path: str, gen):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--output_dir", type=str, required=True, help="输出目录（将自动创建）")
+    ap.add_argument(
+        "--train_source",
+        type=str,
+        choices=("processed", "byted"),
+        default="processed",
+        help="processed=open-r1/DAPO-Math-17k-Processed；byted=BytedTsinghua-SIA 百万级全量",
+    )
+    ap.add_argument(
+        "--dapo_train_local",
+        type=str,
+        default=None,
+        help="本机已下载的 DAPO-Math-17k-Processed：parquet 文件、含 parquet 的目录、或 load_from_disk 目录；不设则从 HF 拉取",
+    )
+    ap.add_argument(
+        "--max_train_samples",
+        type=int,
+        default=None,
+        help="仅导出训练集前 N 条",
+    )
     args = ap.parse_args()
     out = os.path.expanduser(args.output_dir)
     os.makedirs(out, exist_ok=True)
 
-    f_train = os.path.join(out, "dapo_math_17k_train.parquet")
+    if args.train_source == "processed":
+        f_train = os.path.join(out, "dapo_math_17k_processed_train.parquet")
+
+        def gen_train():
+            yield from iter_dapo_processed_train(args.dapo_train_local, args.max_train_samples)
+
+        print("1/3 open-r1/DAPO-Math-17k-Processed (train) ...")
+        n1 = _write_parquet(f_train, gen_train)
+    else:
+        f_train = os.path.join(out, "dapo_math_byted_train.parquet")
+
+        def gen_byted():
+            yield from iter_byted_dapo_train(args.max_train_samples)
+
+        print("1/3 BytedTsinghua-SIA/DAPO-Math-17k (train, 大规模) ...")
+        n1 = _write_parquet(f_train, gen_byted)
+
+    print(f"    -> {n1} rows, {f_train}")
+
     f_m500 = os.path.join(out, "math500_test.parquet")
     f_aime = os.path.join(out, "aime2024_test.parquet")
 
-    print("1/3 DAPO-Math-17k (train) ...")
-    n1 = _write_parquet(f_train, iter_dapo_train)
-    print(f"    -> {n1} rows, {f_train}")
-
-    print("2/3 MATH-500 (test) ...")
+    print("2/3 MATH-500 (test, DAPO-Processed 同款 prompt) ...")
     n2 = _write_parquet(f_m500, iter_math500_test)
     print(f"    -> {n2} rows, {f_m500}")
 
-    print("3/3 AIME 2024 ...")
+    print("3/3 AIME 2024 (test, 同上) ...")
     n3 = _write_parquet(f_aime, iter_aime24_test)
     print(f"    -> {n3} rows, {f_aime}")
 
