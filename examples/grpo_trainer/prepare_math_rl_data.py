@@ -155,7 +155,7 @@ def iter_dapo_processed_train(max_train_samples: int | None = None):
         yield _row_prompt_list(
             prompt,
             gt,
-            "open-r1/DAPO-Math-17k-Processed",
+            "math_dapo",
             extra_info=extra,
             ability=str(ex.get("ability", "math")),
         )
