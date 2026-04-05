@@ -109,7 +109,12 @@ class DAPORewardManager(AbstractRewardManager):
                     reward_extra_info[key].append(value)
             else:
                 score = result
-                reward_extra_info["acc"].append(score)
+                # float 路径也要写入 score/pred，否则 val 混 MATH-500(float) 与 AIME(dict) 时
+                # reward_extra_info["score"] 仅 dict 样本有条目，_validate 中断言与 sample_scores 长度不一致
+                r = float(score)
+                reward_extra_info["score"].append(r)
+                reward_extra_info["acc"].append(r)
+                reward_extra_info["pred"].append(None)
 
             reward = score
 
