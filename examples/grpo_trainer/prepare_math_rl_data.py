@@ -190,7 +190,7 @@ def iter_math500_test():
         yield _row(
             _user_content_dapo_processed(str(ex["problem"]).strip()),
             _gt(ex["answer"]),
-            "HuggingFaceH4/MATH-500",
+            "math_dapo",
             extra_info={
                 "index": idx,
                 "split": "test",
