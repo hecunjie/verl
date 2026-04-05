@@ -96,6 +96,12 @@ class NaiveRewardManager(AbstractRewardManager):
                     reward_extra_info[key].append(value)
             else:
                 reward = score
+                # 与 dict 分支对齐条数，避免 val 混合数据源时 reward_extra_info["score"] 等长度短于 batch
+                # （例如 MATH-500 返回 float，AIME 返回 dict，_validate 会 assert 各 key 与 sample_scores 等长）
+                r = float(reward)
+                reward_extra_info["score"].append(r)
+                reward_extra_info["acc"].append(r)
+                reward_extra_info["pred"].append(None)
 
             reward_tensor[i, valid_response_length - 1] = reward
 
