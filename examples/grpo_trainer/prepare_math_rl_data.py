@@ -2,7 +2,7 @@
 """准备 VERL 数学 GRPO 用 parquet。
 
 **默认训练集**：[`open-r1/DAPO-Math-17k-Processed`](https://huggingface.co/datasets/open-r1/DAPO-Math-17k-Processed)
-（约 1.7 万条，与 DAPO 论文规模一致）。每条保留其 ``prompt`` 字段，将 ``label`` 写入 ``reward_model.ground_truth``。
+（约 1.7 万条，与 DAPO 论文规模一致）。训练样本会统一为 DAPO prompt 指引格式（末行要求 ``Answer: \\boxed{...}``），并将 ``label`` 写入 ``reward_model.ground_truth``。
 
 **测试集**：MATH-500、AIME 2024，题干用与上述数据集 **相同** 的 user 文案模板包裹（含 ``\\boxed`` 与末尾 ``Remember to put...``）。
 
@@ -111,6 +111,32 @@ def _ensure_prompt_list(prompt: Any) -> list[dict[str, Any]]:
     raise ValueError(f"unsupported prompt type: {type(prompt)}")
 
 
+def _normalize_processed_prompt(prompt: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Ensure processed-train prompt uses the DAPO instruction format.
+
+    Some rows in open-r1/DAPO-Math-17k-Processed only contain a raw problem statement.
+    This causes model outputs to miss the expected `Answer:` format and hurts rule-based scoring.
+    """
+    normalized: list[dict[str, Any]] = []
+    for m in prompt:
+        if not isinstance(m, dict):
+            normalized.append(m)
+            continue
+        if m.get("role") != "user":
+            normalized.append(m)
+            continue
+        content = str(m.get("content", "")).strip()
+        has_instruction = (
+            "Answer:" in content
+            and "\\boxed" in content
+            and "Remember to put your answer on its own line after" in content
+        )
+        if not has_instruction:
+            content = _user_content_dapo_processed(content)
+        normalized.append({**m, "content": content})
+    return normalized
+
+
 def _ground_truth_from_processed(ex: dict[str, Any]) -> str:
     if ex.get("label") is not None:
         return _gt(ex["label"])
@@ -146,7 +172,7 @@ def iter_dapo_processed_train(max_train_samples: int | None = None):
     n = len(ds) if max_train_samples is None else min(int(max_train_samples), len(ds))
     for idx in range(n):
         ex = ds[idx]
-        prompt = _ensure_prompt_list(ex["prompt"])
+        prompt = _normalize_processed_prompt(_ensure_prompt_list(ex["prompt"]))
         gt = _ground_truth_from_processed(ex)
         extra = ex.get("extra_info")
         if not isinstance(extra, dict):

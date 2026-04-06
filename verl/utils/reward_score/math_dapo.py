@@ -62,6 +62,66 @@ def remove_boxed(s: str) -> str:
     return s[len(left) : -1]
 
 
+def _strip_latex_wrappers(s: str) -> str:
+    """Strip common LaTeX wrappers that do not affect semantics."""
+    s = s.replace("\\left", "").replace("\\right", "")
+    s = s.replace("\\tfrac", "\\frac").replace("\\dfrac", "\\frac")
+    return s
+
+
+def _is_wrapped_by(s: str, left: str, right: str) -> bool:
+    return len(s) >= 2 and s[0] == left and s[-1] == right
+
+
+def _split_top_level_commas(s: str) -> list[str]:
+    """Split by commas at top-level only, respecting bracket depth."""
+    parts: list[str] = []
+    depth = 0
+    start = 0
+    for i, ch in enumerate(s):
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth = max(0, depth - 1)
+        elif ch == "," and depth == 0:
+            parts.append(s[start:i].strip())
+            start = i + 1
+    parts.append(s[start:].strip())
+    return parts
+
+
+def _normalize_structured_answer(s: str) -> str:
+    """Normalize structured answers like tuples/intervals for robust matching."""
+    s = _strip_latex_wrappers(s).strip()
+    if _is_wrapped_by(s, "(", ")") or _is_wrapped_by(s, "[", "]"):
+        inner = s[1:-1].strip()
+        items = _split_top_level_commas(inner)
+        if len(items) > 1:
+            normalized_items = [normalize_final_answer(item) for item in items]
+            return f"{s[0]}{','.join(normalized_items)}{s[-1]}"
+    return normalize_final_answer(s)
+
+
+def extract_answer_candidate(
+    solution_str: str, answer_pattern: str = r"(?i)Answer\s*:\s*([^\n]+)"
+) -> tuple[str, bool]:
+    """Extract final answer candidate and whether it came from \\boxed{...}."""
+    matches = re.findall(answer_pattern, solution_str)
+    answer_line = matches[-1] if matches else ""
+    boxed = last_boxed_only_string(answer_line)
+    if boxed is not None:
+        return remove_boxed(boxed), True
+
+    # Fallback: sometimes boxed answer is outside the strict Answer-line capture.
+    boxed_full = last_boxed_only_string(solution_str)
+    if boxed_full is not None:
+        return remove_boxed(boxed_full), True
+
+    if answer_line:
+        return answer_line, False
+    return "[INVALID]", False
+
+
 # Constants for normalization
 SUBSTITUTIONS = [
     ("an ", ""),
@@ -164,7 +224,7 @@ def normalize_final_answer(final_answer: str) -> str:
 
 def is_correct_minerva(
     solution_str: str, gt: str, gt_need_extract: bool = False, answer_pattern: str = r"(?i)Answer\s*:\s*([^\n]+)"
-) -> tuple[bool, str]:
+) -> tuple[bool, str, bool]:
     """Check if the solution is correct according to Minerva criteria.
 
     Args:
@@ -176,18 +236,18 @@ def is_correct_minerva(
     Returns:
         Tuple of (is_correct, normalized_prediction)
     """
-    # Extract answer from solution
-    match = re.findall(answer_pattern, solution_str)
-    extracted_answer = match[-1] if match else "[INVALID]"
-    pred = normalize_final_answer(extracted_answer)
+    # Extract answer from solution (prefer boxed answer)
+    extracted_answer, from_boxed = extract_answer_candidate(solution_str, answer_pattern)
+    pred = _normalize_structured_answer(extracted_answer)
 
     # Process ground truth
     if gt_need_extract:
-        gt = normalize_final_answer(remove_boxed(last_boxed_only_string(gt)))
+        gt_boxed = last_boxed_only_string(gt)
+        gt = _normalize_structured_answer(remove_boxed(gt_boxed)) if gt_boxed is not None else _normalize_structured_answer(gt)
     else:
-        gt = normalize_final_answer(gt)
+        gt = _normalize_structured_answer(gt)
 
-    return (pred == gt), pred
+    return (pred == gt), pred, from_boxed
 
 
 def is_correct_strict_box(
@@ -219,7 +279,7 @@ def is_correct_strict_box(
 
 def verify(
     solution_str: str, answer: str, strict_box_verify: bool = False, pause_tokens_index: Optional[list[int]] = None
-) -> bool:
+) -> tuple[bool, Optional[str], bool]:
     """Verify if the solution is correct.
 
     Args:
@@ -233,10 +293,10 @@ def verify(
     """
     if strict_box_verify:
         correct, pred = is_correct_strict_box(solution_str, answer, pause_tokens_index)
-        return correct == 1, pred
+        return correct == 1, pred, pred is not None
 
-    correct, pred = is_correct_minerva(solution_str, answer)
-    return correct, pred
+    correct, pred, from_boxed = is_correct_minerva(solution_str, answer)
+    return correct, pred, from_boxed
 
 
 def compute_score(
@@ -244,6 +304,7 @@ def compute_score(
     ground_truth: str,
     strict_box_verify: bool = False,
     pause_tokens_index: Optional[list[int]] = None,
+    format_penalty: float = -0.2,
 ) -> float:
     """Compute the reward score for a solution.
 
@@ -254,19 +315,22 @@ def compute_score(
         pause_tokens_index: Indices of pause tokens
 
     Returns:
-        Reward score (1.0 for correct, 0.0 for incorrect)
+        Reward score (correctness score + format penalty when format is wrong).
     """
     # Limit solution length for efficiency
     solution_str = solution_str[-300:]  # The longest answer in MATH-500 has 159 characters
 
     # Verify the solution
-    correct, pred = verify(solution_str, ground_truth, strict_box_verify, pause_tokens_index)
+    correct, pred, from_boxed = verify(solution_str, ground_truth, strict_box_verify, pause_tokens_index)
 
-    reward = 1.0 if correct else 0.0
+    format_term = 0.0 if from_boxed else float(format_penalty)
+    reward = (1.0 if correct else 0.0) + format_term
     acc = correct
 
     return {
         "score": reward,
         "acc": acc,
         "pred": pred,
+        "format_score": format_term,
+        "from_boxed": from_boxed,
     }

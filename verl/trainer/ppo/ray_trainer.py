@@ -1713,6 +1713,27 @@ class RayPPOTrainer:
                 )
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                # Add explicit training reward/advantage metrics for easier tracking in logger backends.
+                if "token_level_scores" in batch.batch and "response_mask" in batch.batch:
+                    seq_raw_reward = batch.batch["token_level_scores"].sum(-1)
+                    metrics.update(
+                        {
+                            "training/raw_reward/mean": torch.mean(seq_raw_reward).detach().item(),
+                            "training/raw_reward/max": torch.max(seq_raw_reward).detach().item(),
+                            "training/raw_reward/min": torch.min(seq_raw_reward).detach().item(),
+                        }
+                    )
+                if "advantages" in batch.batch and "response_mask" in batch.batch:
+                    response_mask_bool = batch.batch["response_mask"].bool()
+                    valid_adv = torch.masked_select(batch.batch["advantages"], response_mask_bool)
+                    if valid_adv.numel() > 0:
+                        metrics.update(
+                            {
+                                "training/advantage/mean": torch.mean(valid_adv).detach().item(),
+                                "training/advantage/max": torch.max(valid_adv).detach().item(),
+                                "training/advantage/min": torch.min(valid_adv).detach().item(),
+                            }
+                        )
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()
