@@ -22,7 +22,7 @@ ROLLOUTS_PER_PROMPT="${ROLLOUTS_PER_PROMPT:-8}"
 
 # Phase2 默认使用方法 B（Outcome flip rate）
 PHASE2_METHOD="${PHASE2_METHOD:-B}"
-METHOD_B_M_SAMPLES="${METHOD_B_M_SAMPLES:-4}"
+METHOD_B_M_SAMPLES="${METHOD_B_M_SAMPLES:-8}"
 METHOD_B_TOPK_ALT="${METHOD_B_TOPK_ALT:-10}"
 
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-512}"
@@ -33,7 +33,7 @@ SEED="${SEED:-42}"
 mkdir -p "${OUTPUT_DIR}"
 
 torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" \
-  examples/grpo_trainer/entropy_credit_experiment.py \
+  examples/entropy_ce/entropy_credit_experiment.py \
   --input_data "${INPUT_DATA}" \
   --model_path "${MODEL_PATH}" \
   --output_dir "${OUTPUT_DIR}" \
