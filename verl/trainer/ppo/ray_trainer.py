@@ -468,9 +468,20 @@ class RayPPOTrainer:
             if len(v) == n:
                 base_data[k] = v
 
+        def _to_jsonable(x):
+            if isinstance(x, np.generic):
+                return x.item()
+            if isinstance(x, np.ndarray):
+                return x.tolist()
+            if isinstance(x, dict):
+                return {kk: _to_jsonable(vv) for kk, vv in x.items()}
+            if isinstance(x, (list, tuple)):
+                return [_to_jsonable(vv) for vv in x]
+            return x
+
         lines = []
         for i in range(n):
-            entry = {k: v[i] for k, v in base_data.items()}
+            entry = {k: _to_jsonable(v[i]) for k, v in base_data.items()}
             lines.append(json.dumps(entry, ensure_ascii=False))
 
         with open(filename, "w") as f:
