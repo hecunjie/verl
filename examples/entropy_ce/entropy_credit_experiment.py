@@ -214,12 +214,30 @@ def method_b_importance(
         tk = min(max(2, top_k_alt), logits.shape[-1])
         topk = torch.topk(logits, k=tk, dim=-1)
         candidates = topk.indices.tolist()
-        probs = torch.softmax(topk.values, dim=-1).numpy()
+        topk_values = topk.values.detach().float().cpu().numpy()
         alt_tokens = [c for c in candidates if c != response_ids[pos]]
         if not alt_tokens:
             continue
-        alt_probs = np.array([probs[candidates.index(t)] for t in alt_tokens], dtype=np.float64)
-        alt_probs = alt_probs / alt_probs.sum()
+        alt_scores = np.array([topk_values[candidates.index(t)] for t in alt_tokens], dtype=np.float64)
+        finite_mask = np.isfinite(alt_scores)
+        if not np.any(finite_mask):
+            alt_probs = np.ones(len(alt_tokens), dtype=np.float64) / float(len(alt_tokens))
+        else:
+            # 数值稳定 softmax：仅对有限值参与归一化，避免 NaN/Inf 传播。
+            safe_scores = alt_scores[finite_mask]
+            safe_scores = safe_scores - np.max(safe_scores)
+            safe_probs = np.exp(safe_scores)
+            safe_sum = float(safe_probs.sum())
+            if (not np.isfinite(safe_sum)) or safe_sum <= 0.0:
+                alt_probs = np.ones(len(alt_tokens), dtype=np.float64) / float(len(alt_tokens))
+            else:
+                alt_probs = np.zeros(len(alt_tokens), dtype=np.float64)
+                alt_probs[finite_mask] = safe_probs / safe_sum
+                total = float(alt_probs.sum())
+                if (not np.isfinite(total)) or total <= 0.0:
+                    alt_probs = np.ones(len(alt_tokens), dtype=np.float64) / float(len(alt_tokens))
+                else:
+                    alt_probs = alt_probs / total
 
         flips = 0
         for _ in range(m_samples):
