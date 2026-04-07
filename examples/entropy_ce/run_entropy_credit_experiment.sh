@@ -25,12 +25,20 @@ PHASE2_METHOD="${PHASE2_METHOD:-B}"
 METHOD_B_M_SAMPLES="${METHOD_B_M_SAMPLES:-8}"
 METHOD_B_TOPK_ALT="${METHOD_B_TOPK_ALT:-10}"
 
-MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-2048}"
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-512}"
 TEMPERATURE="${TEMPERATURE:-1.0}"
 TOP_P="${TOP_P:-0.95}"
 SEED="${SEED:-42}"
 
+# 进度条：默认仅 rank0 显示；每卡各一条可设 PROGRESS_ALL_RANKS=1 或 export TQDM_DISABLE=1 关闭
+PROGRESS_ALL_RANKS="${PROGRESS_ALL_RANKS:-0}"
+EXTRA_ARGS=()
+if [ "${PROGRESS_ALL_RANKS}" = "1" ]; then
+  EXTRA_ARGS+=(--progress_all_ranks)
+fi
+
 mkdir -p "${OUTPUT_DIR}"
+
 
 torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" \
   examples/entropy_ce/entropy_credit_experiment.py \
@@ -46,4 +54,5 @@ torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" \
   --method_b_m_samples "${METHOD_B_M_SAMPLES}" \
   --method_b_topk_alt "${METHOD_B_TOPK_ALT}" \
   --seed "${SEED}" \
+  "${EXTRA_ARGS[@]}" \
   "$@"

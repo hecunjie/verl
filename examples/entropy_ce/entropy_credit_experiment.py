@@ -29,6 +29,11 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from verl.utils.reward_score import default_compute_score
 
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # pragma: no cover
+    tqdm = None  # type: ignore[misc, assignment]
+
 
 def is_dist() -> bool:
     return dist.is_available() and dist.is_initialized()
@@ -298,6 +303,12 @@ def main() -> None:
     parser.add_argument("--method_b_m_samples", type=int, default=4)
     parser.add_argument("--method_b_topk_alt", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--no_progress", action="store_true", help="Disable tqdm progress bars.")
+    parser.add_argument(
+        "--progress_all_ranks",
+        action="store_true",
+        help="Show a progress bar on every rank (default: rank 0 only).",
+    )
     args = parser.parse_args()
 
     local_rank, rank, world_size = init_dist()
@@ -326,13 +337,42 @@ def main() -> None:
     rows = load_data(args.input_data, args.max_samples, args.seed)
     local_rows = [row for idx, row in enumerate(rows) if idx % world_size == rank]
 
-    for local_i, row in enumerate(local_rows):
+    env_no_tqdm = os.environ.get("TQDM_DISABLE", "").strip().lower() in ("1", "true", "yes")
+    use_tqdm = tqdm is not None and not args.no_progress and not env_no_tqdm
+    pbar_ranks = range(world_size) if (use_tqdm and args.progress_all_ranks) else [0]
+    show_outer = use_tqdm and rank in pbar_ranks
+    show_inner = use_tqdm and rank in pbar_ranks
+
+    outer_it = enumerate(local_rows)
+    if show_outer:
+        bar_pos = rank * 2 if args.progress_all_ranks else 0
+        outer_it = tqdm(
+            outer_it,
+            total=len(local_rows),
+            desc=f"rank{rank} samples",
+            dynamic_ncols=True,
+            position=bar_pos,
+            leave=True,
+        )
+
+    for local_i, row in outer_it:
         global_idx = local_i * world_size + rank
         prompt_text = build_prompt_text(tokenizer, row["prompt"])
         data_source = row.get("data_source", "math_dapo")
         ground_truth = str((row.get("reward_model") or {}).get("ground_truth", ""))
 
-        for rollout_idx in range(args.rollouts_per_prompt):
+        rollout_it = range(args.rollouts_per_prompt)
+        if show_inner:
+            inner_pos = rank * 2 + 1 if args.progress_all_ranks else 1
+            rollout_it = tqdm(
+                rollout_it,
+                total=args.rollouts_per_prompt,
+                desc=f"rank{rank} rollouts",
+                dynamic_ncols=True,
+                position=inner_pos,
+                leave=False,
+            )
+        for rollout_idx in rollout_it:
             response_ids, scores = generate_rollout(
                 model=model,
                 tokenizer=tokenizer,
