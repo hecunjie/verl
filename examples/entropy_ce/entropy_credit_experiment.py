@@ -28,6 +28,7 @@ import torch.distributed as dist
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from verl.utils.reward_score import default_compute_score
+from verl.utils.reward_score import math_dapo as math_dapo_score
 
 try:
     from tqdm.auto import tqdm
@@ -149,6 +150,16 @@ def extract_acc(result: Any) -> bool:
     return float(result) > 0.5
 
 
+def evaluate_solution_acc(data_source: str, solution_str: str, ground_truth: str) -> tuple[bool, dict[str, Any]]:
+    """Evaluate correctness with math_dapo boxed-answer logic for math-like sources."""
+    if data_source in {"math_dapo", "math", "math_dapo_reasoning"} or data_source.startswith("aime"):
+        res = math_dapo_score.compute_score(solution_str, ground_truth, strict_box_verify=True)
+        return bool(res.get("acc", False)), {"mode": "math_dapo_strict_box", **res}
+
+    res = default_compute_score(data_source=data_source, solution_str=solution_str, ground_truth=ground_truth)
+    return extract_acc(res), {"mode": "default_compute_score", "raw_result": res}
+
+
 def build_token_context(tokenizer, response_ids: list[int], pos: int, window: int) -> dict[str, Any]:
     left = max(0, pos - window)
     right = min(len(response_ids), pos + window + 1)
@@ -228,8 +239,7 @@ def method_b_importance(
     context_window_tokens: int = 24,
 ) -> tuple[list[float], list[dict[str, Any]], bool]:
     base_response = tokenizer.decode(response_ids, skip_special_tokens=True)
-    base_result = default_compute_score(data_source=data_source, solution_str=base_response, ground_truth=ground_truth)
-    base_acc = extract_acc(base_result)
+    base_acc, base_eval = evaluate_solution_acc(data_source=data_source, solution_str=base_response, ground_truth=ground_truth)
 
     encoded = tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False)
     prompt_ids = encoded["input_ids"][0].tolist()
@@ -303,8 +313,7 @@ def method_b_importance(
             new_ids = out.sequences[0, prefix_tensor.shape[1] :].tolist()
             full_mutated = mutated[: pos + 1] + new_ids
             new_resp = tokenizer.decode(full_mutated, skip_special_tokens=True)
-            res = default_compute_score(data_source=data_source, solution_str=new_resp, ground_truth=ground_truth)
-            acc = extract_acc(res)
+            acc, cf_eval = evaluate_solution_acc(data_source=data_source, solution_str=new_resp, ground_truth=ground_truth)
             is_flip = acc != base_acc
             if is_flip:
                 flips += 1
@@ -324,6 +333,8 @@ def method_b_importance(
                     "base_acc": bool(base_acc),
                     "counterfactual_acc": bool(acc),
                     "flip": bool(is_flip),
+                    "base_eval": base_eval,
+                    "counterfactual_eval": cf_eval,
                 }
             )
         importance[pos] = float(flips / m_samples)
@@ -477,8 +488,9 @@ def main() -> None:
             if not response_ids:
                 continue
             response_text = tokenizer.decode(response_ids, skip_special_tokens=True)
-            base_score = default_compute_score(data_source=data_source, solution_str=response_text, ground_truth=ground_truth)
-            base_acc = extract_acc(base_score)
+            base_acc, base_eval = evaluate_solution_acc(
+                data_source=data_source, solution_str=response_text, ground_truth=ground_truth
+            )
             entropies = [entropy_from_logits(s) for s in scores[: len(response_ids)]]
             varentropies = [compute_varentropy(s, h) for s, h in zip(scores[: len(response_ids)], entropies, strict=False)]
             branching = [math.exp(h) for h in entropies]
@@ -545,6 +557,7 @@ def main() -> None:
                                 "response_text": response_text,
                                 "response_token_ids": response_ids,
                                 "base_acc": bool(base_acc),
+                                "base_eval": base_eval,
                                 "phase2_candidates": candidates if args.phase2_method == "B" else [],
                             },
                             ensure_ascii=False,
