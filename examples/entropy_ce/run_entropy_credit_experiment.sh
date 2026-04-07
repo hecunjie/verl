@@ -24,6 +24,8 @@ ROLLOUTS_PER_PROMPT="${ROLLOUTS_PER_PROMPT:-8}"
 PHASE2_METHOD="${PHASE2_METHOD:-B}"
 METHOD_B_M_SAMPLES="${METHOD_B_M_SAMPLES:-8}"
 METHOD_B_TOPK_ALT="${METHOD_B_TOPK_ALT:-10}"
+PHASE2_MAX_POSITIONS="${PHASE2_MAX_POSITIONS:-64}"
+PHASE2_PROGRESS="${PHASE2_PROGRESS:-0}"
 
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-512}"
 TEMPERATURE="${TEMPERATURE:-1.0}"
@@ -35,6 +37,9 @@ PROGRESS_ALL_RANKS="${PROGRESS_ALL_RANKS:-0}"
 EXTRA_ARGS=()
 if [ "${PROGRESS_ALL_RANKS}" = "1" ]; then
   EXTRA_ARGS+=(--progress_all_ranks)
+fi
+if [ "${PHASE2_PROGRESS}" = "1" ]; then
+  EXTRA_ARGS+=(--phase2_progress)
 fi
 
 mkdir -p "${OUTPUT_DIR}"
@@ -53,6 +58,7 @@ torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" \
   --phase2_method "${PHASE2_METHOD}" \
   --method_b_m_samples "${METHOD_B_M_SAMPLES}" \
   --method_b_topk_alt "${METHOD_B_TOPK_ALT}" \
+  --phase2_max_positions "${PHASE2_MAX_POSITIONS}" \
   --seed "${SEED}" \
   "${EXTRA_ARGS[@]}" \
   "$@"

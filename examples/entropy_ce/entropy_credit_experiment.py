@@ -203,6 +203,9 @@ def method_b_importance(
     selected_positions: list[int],
     m_samples: int,
     top_k_alt: int,
+    show_progress: bool = False,
+    progress_position: int = 2,
+    progress_desc: str = "phase2 candidates",
 ) -> list[float]:
     base_response = tokenizer.decode(response_ids, skip_special_tokens=True)
     base_result = default_compute_score(data_source=data_source, solution_str=base_response, ground_truth=ground_truth)
@@ -212,7 +215,18 @@ def method_b_importance(
     prompt_ids = encoded["input_ids"][0].tolist()
     importance = [0.0 for _ in range(len(response_ids))]
 
-    for pos in selected_positions:
+    pos_iter = selected_positions
+    if show_progress and tqdm is not None:
+        pos_iter = tqdm(
+            selected_positions,
+            total=len(selected_positions),
+            desc=progress_desc,
+            dynamic_ncols=True,
+            position=progress_position,
+            leave=False,
+        )
+
+    for pos in pos_iter:
         if pos < 0 or pos >= len(response_ids) or pos >= len(scores):
             continue
         logits = scores[pos]
@@ -289,6 +303,19 @@ def pick_candidate_positions(deltas: list[float], entropies: list[float], seed: 
     return sorted(set(idx_delta + idx_entropy + idx_random))
 
 
+def cap_positions(positions: list[int], cap: int, seed: int) -> list[int]:
+    """Cap candidate positions to avoid Method-B blowup.
+
+    Keep a deterministic random subset so the mix (delta/high-H/random) is roughly preserved.
+    """
+    if cap <= 0 or len(positions) <= cap:
+        return positions
+    rng = random.Random(seed)
+    pos = positions[:]
+    rng.shuffle(pos)
+    return sorted(pos[:cap])
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input_data", type=str, required=True, help="VERL format parquet/json/jsonl.")
@@ -302,12 +329,23 @@ def main() -> None:
     parser.add_argument("--phase2_method", type=str, default="B", choices=["A", "B"])
     parser.add_argument("--method_b_m_samples", type=int, default=4)
     parser.add_argument("--method_b_topk_alt", type=int, default=10)
+    parser.add_argument(
+        "--phase2_max_positions",
+        type=int,
+        default=64,
+        help="Cap the number of candidate token positions for Phase2 (Method B). Set <=0 to disable cap.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no_progress", action="store_true", help="Disable tqdm progress bars.")
     parser.add_argument(
         "--progress_all_ranks",
         action="store_true",
         help="Show a progress bar on every rank (default: rank 0 only).",
+    )
+    parser.add_argument(
+        "--phase2_progress",
+        action="store_true",
+        help="Show tqdm progress inside Phase2 (Method B) candidate loop (rank 0 by default).",
     )
     args = parser.parse_args()
 
@@ -393,7 +431,9 @@ def main() -> None:
                 deltas.append(et - et1)
 
             if args.phase2_method == "B":
-                candidates = pick_candidate_positions(deltas, entropies, args.seed + global_idx + rollout_idx)
+                cand_seed = args.seed + global_idx + rollout_idx
+                candidates = pick_candidate_positions(deltas, entropies, cand_seed)
+                candidates = cap_positions(candidates, args.phase2_max_positions, cand_seed)
                 importance = method_b_importance(
                     model=model,
                     tokenizer=tokenizer,
@@ -405,6 +445,9 @@ def main() -> None:
                     selected_positions=candidates,
                     m_samples=args.method_b_m_samples,
                     top_k_alt=args.method_b_topk_alt,
+                    show_progress=bool(args.phase2_progress and show_inner),
+                    progress_position=(rank * 2 + 2) if args.progress_all_ranks else 2,
+                    progress_desc=f"rank{rank} phase2",
                 )
             else:
                 importance = [0.0 for _ in range(len(response_ids))]
