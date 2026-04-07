@@ -26,6 +26,8 @@ METHOD_B_M_SAMPLES="${METHOD_B_M_SAMPLES:-8}"
 METHOD_B_TOPK_ALT="${METHOD_B_TOPK_ALT:-10}"
 PHASE2_MAX_POSITIONS="${PHASE2_MAX_POSITIONS:-64}"
 PHASE2_PROGRESS="${PHASE2_PROGRESS:-0}"
+SAVE_CASE_TRACES="${SAVE_CASE_TRACES:-1}"
+CONTEXT_WINDOW_TOKENS="${CONTEXT_WINDOW_TOKENS:-24}"
 
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-512}"
 TEMPERATURE="${TEMPERATURE:-1.0}"
@@ -40,6 +42,9 @@ if [ "${PROGRESS_ALL_RANKS}" = "1" ]; then
 fi
 if [ "${PHASE2_PROGRESS}" = "1" ]; then
   EXTRA_ARGS+=(--phase2_progress)
+fi
+if [ "${SAVE_CASE_TRACES}" = "1" ]; then
+  EXTRA_ARGS+=(--save_case_traces)
 fi
 
 mkdir -p "${OUTPUT_DIR}"
@@ -59,6 +64,7 @@ torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" \
   --method_b_m_samples "${METHOD_B_M_SAMPLES}" \
   --method_b_topk_alt "${METHOD_B_TOPK_ALT}" \
   --phase2_max_positions "${PHASE2_MAX_POSITIONS}" \
+  --context_window_tokens "${CONTEXT_WINDOW_TOKENS}" \
   --seed "${SEED}" \
   "${EXTRA_ARGS[@]}" \
   "$@"

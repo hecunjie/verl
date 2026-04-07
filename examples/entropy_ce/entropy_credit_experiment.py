@@ -142,6 +142,25 @@ def precision_at_k(signal: list[float], importance: list[float], k: int) -> floa
     return float(hit / k)
 
 
+def extract_acc(result: Any) -> bool:
+    """Normalize reward output to a boolean correctness flag."""
+    if isinstance(result, dict) and "acc" in result:
+        return bool(result["acc"])
+    return float(result) > 0.5
+
+
+def build_token_context(tokenizer, response_ids: list[int], pos: int, window: int) -> dict[str, Any]:
+    left = max(0, pos - window)
+    right = min(len(response_ids), pos + window + 1)
+    return {
+        "branch_token_index": pos,
+        "context_window": window,
+        "context_left_text": tokenizer.decode(response_ids[left:pos], skip_special_tokens=True),
+        "branch_token_text": tokenizer.decode([response_ids[pos]], skip_special_tokens=True),
+        "context_right_text": tokenizer.decode(response_ids[pos + 1 : right], skip_special_tokens=True),
+    }
+
+
 @dataclass
 class RolloutItem:
     sample_index: int
@@ -206,14 +225,16 @@ def method_b_importance(
     show_progress: bool = False,
     progress_position: int = 2,
     progress_desc: str = "phase2 candidates",
-) -> list[float]:
+    context_window_tokens: int = 24,
+) -> tuple[list[float], list[dict[str, Any]], bool]:
     base_response = tokenizer.decode(response_ids, skip_special_tokens=True)
     base_result = default_compute_score(data_source=data_source, solution_str=base_response, ground_truth=ground_truth)
-    base_acc = bool(base_result["acc"] if isinstance(base_result, dict) and "acc" in base_result else float(base_result) > 0.5)
+    base_acc = extract_acc(base_result)
 
     encoded = tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False)
     prompt_ids = encoded["input_ids"][0].tolist()
     importance = [0.0 for _ in range(len(response_ids))]
+    trace_records: list[dict[str, Any]] = []
 
     pos_iter = selected_positions
     if show_progress and tqdm is not None:
@@ -259,7 +280,8 @@ def method_b_importance(
                     alt_probs = alt_probs / total
 
         flips = 0
-        for _ in range(m_samples):
+        pos_ctx = build_token_context(tokenizer, response_ids, pos, context_window_tokens)
+        for sample_id in range(m_samples):
             sampled = int(np.random.choice(np.array(alt_tokens), p=alt_probs))
             mutated = response_ids[:]
             mutated[pos] = sampled
@@ -282,11 +304,30 @@ def method_b_importance(
             full_mutated = mutated[: pos + 1] + new_ids
             new_resp = tokenizer.decode(full_mutated, skip_special_tokens=True)
             res = default_compute_score(data_source=data_source, solution_str=new_resp, ground_truth=ground_truth)
-            acc = bool(res["acc"] if isinstance(res, dict) and "acc" in res else float(res) > 0.5)
-            if acc != base_acc:
+            acc = extract_acc(res)
+            is_flip = acc != base_acc
+            if is_flip:
                 flips += 1
+            trace_records.append(
+                {
+                    "branch_position": pos_ctx,
+                    "sample_id": sample_id,
+                    "original_token_id": int(response_ids[pos]),
+                    "original_token_text": tokenizer.decode([response_ids[pos]], skip_special_tokens=True),
+                    "replaced_token_id": int(sampled),
+                    "replaced_token_text": tokenizer.decode([sampled], skip_special_tokens=True),
+                    "candidate_token_ids": [int(t) for t in alt_tokens],
+                    "candidate_probs": [float(p) for p in alt_probs.tolist()],
+                    "mutated_prefix_text": tokenizer.decode(mutated[: pos + 1], skip_special_tokens=True),
+                    "generated_suffix_text": tokenizer.decode(new_ids, skip_special_tokens=True),
+                    "counterfactual_response_text": new_resp,
+                    "base_acc": bool(base_acc),
+                    "counterfactual_acc": bool(acc),
+                    "flip": bool(is_flip),
+                }
+            )
         importance[pos] = float(flips / m_samples)
-    return importance
+    return importance, trace_records, base_acc
 
 
 def pick_candidate_positions(deltas: list[float], entropies: list[float], seed: int) -> list[int]:
@@ -347,6 +388,17 @@ def main() -> None:
         action="store_true",
         help="Show tqdm progress inside Phase2 (Method B) candidate loop (rank 0 by default).",
     )
+    parser.add_argument(
+        "--save_case_traces",
+        action="store_true",
+        help="Save per-case branch traces to output_dir/cases/case_<sample_index>.jsonl.",
+    )
+    parser.add_argument(
+        "--context_window_tokens",
+        type=int,
+        default=24,
+        help="Number of response tokens to keep on each side of the branch position.",
+    )
     args = parser.parse_args()
 
     local_rank, rank, world_size = init_dist()
@@ -356,6 +408,9 @@ def main() -> None:
 
     out_dir = Path(args.output_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+    case_dir = out_dir / "cases"
+    if args.save_case_traces:
+        case_dir.mkdir(parents=True, exist_ok=True)
     part_file = out_dir / f"phase1_3_rank{rank}.jsonl"
     with open(part_file, "w", encoding="utf-8"):
         pass
@@ -421,6 +476,9 @@ def main() -> None:
             )
             if not response_ids:
                 continue
+            response_text = tokenizer.decode(response_ids, skip_special_tokens=True)
+            base_score = default_compute_score(data_source=data_source, solution_str=response_text, ground_truth=ground_truth)
+            base_acc = extract_acc(base_score)
             entropies = [entropy_from_logits(s) for s in scores[: len(response_ids)]]
             varentropies = [compute_varentropy(s, h) for s, h in zip(scores[: len(response_ids)], entropies, strict=False)]
             branching = [math.exp(h) for h in entropies]
@@ -434,7 +492,7 @@ def main() -> None:
                 cand_seed = args.seed + global_idx + rollout_idx
                 candidates = pick_candidate_positions(deltas, entropies, cand_seed)
                 candidates = cap_positions(candidates, args.phase2_max_positions, cand_seed)
-                importance = method_b_importance(
+                importance, branch_traces, base_acc_from_method_b = method_b_importance(
                     model=model,
                     tokenizer=tokenizer,
                     prompt_text=prompt_text,
@@ -448,9 +506,12 @@ def main() -> None:
                     show_progress=bool(args.phase2_progress and show_inner),
                     progress_position=(rank * 2 + 2) if args.progress_all_ranks else 2,
                     progress_desc=f"rank{rank} phase2",
+                    context_window_tokens=args.context_window_tokens,
                 )
+                base_acc = bool(base_acc_from_method_b)
             else:
                 importance = [0.0 for _ in range(len(response_ids))]
+                branch_traces = []
 
             item = RolloutItem(
                 sample_index=global_idx,
@@ -458,7 +519,7 @@ def main() -> None:
                 data_source=data_source,
                 ground_truth=ground_truth,
                 prompt_text=prompt_text,
-                response_text=tokenizer.decode(response_ids, skip_special_tokens=True),
+                response_text=response_text,
                 response_token_ids=response_ids,
                 entropies=entropies,
                 deltas=deltas,
@@ -468,6 +529,40 @@ def main() -> None:
             )
             with open(part_file, "a", encoding="utf-8") as f:
                 f.write(json.dumps(item.__dict__, ensure_ascii=False) + "\n")
+            if args.save_case_traces:
+                case_path = case_dir / f"case_{global_idx}.jsonl"
+                with open(case_path, "a", encoding="utf-8") as cf:
+                    cf.write(
+                        json.dumps(
+                            {
+                                "event": "rollout_base",
+                                "rank": rank,
+                                "sample_index": global_idx,
+                                "rollout_index": rollout_idx,
+                                "data_source": data_source,
+                                "ground_truth": ground_truth,
+                                "prompt_text": prompt_text,
+                                "response_text": response_text,
+                                "response_token_ids": response_ids,
+                                "base_acc": bool(base_acc),
+                                "phase2_candidates": candidates if args.phase2_method == "B" else [],
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
+                    for tr in branch_traces:
+                        tr_line = {
+                            "event": "branch_counterfactual",
+                            "rank": rank,
+                            "sample_index": global_idx,
+                            "rollout_index": rollout_idx,
+                            "data_source": data_source,
+                            "ground_truth": ground_truth,
+                            "prompt_text": prompt_text,
+                            **tr,
+                        }
+                        cf.write(json.dumps(tr_line, ensure_ascii=False) + "\n")
 
     barrier()
 
