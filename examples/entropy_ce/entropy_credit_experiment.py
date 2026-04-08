@@ -17,6 +17,7 @@ import json
 import math
 import os
 import random
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -51,6 +52,19 @@ def get_world_size() -> int:
 def barrier() -> None:
     if is_dist():
         dist.barrier()
+
+
+def file_sync(out_dir: Path, rank: int, world_size: int, tag: str = "done", poll_s: float = 2.0) -> None:
+    """File-based sync to avoid NCCL/TCPStore barrier timeouts."""
+    marker = out_dir / f"_{tag}_rank{rank}"
+    marker.write_text("ok\n", encoding="utf-8")
+    if rank != 0:
+        return
+    expected = [out_dir / f"_{tag}_rank{r}" for r in range(world_size)]
+    while True:
+        if all(p.exists() for p in expected):
+            return
+        time.sleep(poll_s)
 
 
 def init_dist() -> tuple[int, int, int]:
@@ -577,7 +591,8 @@ def main() -> None:
                         }
                         cf.write(json.dumps(tr_line, ensure_ascii=False) + "\n")
 
-    barrier()
+    # Avoid NCCL barrier timeout when ranks finish at very different times.
+    file_sync(out_dir=out_dir, rank=rank, world_size=world_size, tag="done")
 
     if rank == 0:
         all_records = []
