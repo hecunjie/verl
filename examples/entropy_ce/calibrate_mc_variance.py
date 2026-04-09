@@ -21,6 +21,7 @@ from entropy_credit_experiment import (
     build_prompt_text,
     clamp_vllm_logprobs_topk,
     entropy_from_logprobs_topk,
+    file_sync,
     generate_rollout_vllm,
     init_dist,
     load_data,
@@ -228,6 +229,8 @@ def main() -> None:
                 }
                 with open(part_path, "a", encoding="utf-8") as f:
                     f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    file_sync(out_dir=out_dir, rank=rank, world_size=world_size, tag="done_calib")
 
     if rank == 0:
         merged: list[dict[str, Any]] = []
