@@ -39,9 +39,13 @@ BACKEND="${BACKEND:-hf}"
 VLLM_LOGPROBS_TOPK="${VLLM_LOGPROBS_TOPK:-256}"
 VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.9}"
 VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-32768}"
-# 若仍出现 “Cannot re-initialize CUDA in forked subprocess”，可先试：export VLLM_USE_V1=0
+# 单机多卡：vLLM v1 若连 pod IP 导致 TCPStore 600s 超时，请 export VLLM_HOST_IP=127.0.0.1 并 unset HOST_IP
+VLLM_HOST_IP="${VLLM_HOST_IP:-127.0.0.1}"
+export VLLM_HOST_IP
+unset HOST_IP 2>/dev/null || true
+# 若仍出现 “Cannot re-initialize CUDA in forked subprocess”，可先试：export VLLM_USE_V1=0 或加 --vllm_legacy_engine
 # Python 侧已对 backend=vllm 调用 multiprocessing spawn（见 entropy_credit_experiment.py）
-# vLLM：勿再用 HOST_IP；若需指定进程间通信 IP，请用 VLLM_HOST_IP（K8s/Docker 常见）
+# backend=vllm 时脚本不 init NCCL，仅用 torchrun 的 RANK/WORLD_SIZE 分片 + 文件同步，避免 TCPStore 卡死
 
 # 进度条：默认仅 rank0 显示；每卡各一条可设 PROGRESS_ALL_RANKS=1 或 export TQDM_DISABLE=1 关闭
 PROGRESS_ALL_RANKS="${PROGRESS_ALL_RANKS:-0}"
@@ -54,6 +58,9 @@ if [ "${PHASE2_PROGRESS}" = "1" ]; then
 fi
 if [ "${SAVE_CASE_TRACES}" = "1" ]; then
   EXTRA_ARGS+=(--save_case_traces)
+fi
+if [ "${VLLM_LEGACY_ENGINE:-0}" = "1" ]; then
+  EXTRA_ARGS+=(--vllm_legacy_engine)
 fi
 
 mkdir -p "${OUTPUT_DIR}"

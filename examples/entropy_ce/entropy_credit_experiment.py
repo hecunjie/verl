@@ -19,7 +19,6 @@ import math
 import multiprocessing
 import os
 import random
-import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -90,6 +89,13 @@ _TORCHRUN_DIST_ENV_KEYS = (
     "ROLE_RANK",
     "ROLE_WORLD_SIZE",
     "TORCHELASTIC_RUN_ID",
+    # PyTorch elastic / rendezvous (vLLM subprocesses may otherwise open stray TCPStore clients)
+    "PET_MASTER_ADDR",
+    "PET_MASTER_PORT",
+    "PET_NNODES",
+    "PET_NODE_RANK",
+    "PET_NPROC_PER_NODE",
+    "PET_LOCAL_RANK",
 )
 
 
@@ -108,32 +114,14 @@ def _restore_torchrun_dist_env(snap: dict[str, str | None]) -> None:
             os.environ[k] = v
 
 
-def _wait_all_ranks_vllm_loaded_before_init_dist(rank: int, world_size: int, poll_s: float = 2.0) -> None:
-    """Ensure every rank finishes LLM() before any rank calls init_process_group.
+def _configure_vllm_ipc_for_single_node() -> None:
+    """vLLM v1 may create TCP/c10d connections using the pod IP; that often yields 600s TCPStore timeouts.
 
-    If a fast rank reaches ``init_process_group`` while another is still inside ``LLM()``,
-    TCPStore clients may retry until the default 600s timeout (connection to MASTER_ADDR:MASTER_PORT).
+    Prefer loopback for single-machine multi-GPU. Override for true multi-node: export VLLM_HOST_IP=<iface-ip>.
+    Docker/K8s sometimes set deprecated HOST_IP; vLLM ignores it but other code paths may still see it.
     """
-    if world_size <= 1:
-        return
-    addr = os.environ.get("MASTER_ADDR", "localhost")
-    port = os.environ.get("MASTER_PORT", "0")
-    run_id = os.environ.get("TORCHELASTIC_RUN_ID", "norunid")
-    safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in f"{addr}_{port}_{run_id}")[:200]
-    sync_dir = Path(tempfile.gettempdir()) / f"entropy_ce_vllm_ready_{safe}_ws{world_size}"
-    sync_dir.mkdir(parents=True, exist_ok=True)
-    marker = sync_dir / f"ready_rank{rank}"
-    marker.write_text("ok\n", encoding="utf-8")
-    expected = [sync_dir / f"ready_rank{r}" for r in range(world_size)]
-    deadline = time.time() + 7200.0
-    while time.time() < deadline:
-        if all(p.exists() for p in expected):
-            return
-        time.sleep(poll_s)
-    raise RuntimeError(
-        f"Timed out waiting for all {world_size} ranks to finish vLLM load (see {sync_dir}). "
-        "Slow rank may still be loading the model or stuck."
-    )
+    os.environ.pop("HOST_IP", None)
+    os.environ.setdefault("VLLM_HOST_IP", "127.0.0.1")
 
 
 def _configure_vllm_multiprocessing_spawn() -> None:
@@ -151,14 +139,21 @@ def _configure_vllm_multiprocessing_spawn() -> None:
 
 
 def init_dist(backend: str = "hf") -> tuple[int, int, int]:
-    """When backend=vllm, each process only sees one GPU (cuda:0 == physical LOCAL_RANK)."""
+    """Init rank / device. When backend=vllm, each process only sees cuda:0 (physical LOCAL_RANK).
+
+    vLLM path does **not** call ``init_process_group``: this script only needs ``RANK``/``WORLD_SIZE``
+    from torchrun for data sharding and file-based sync. Skipping NCCL/TCPStore avoids 600s TCPStore
+    timeouts and removes the need for all ranks to enter the rendezvous in lockstep after ``LLM()``.
+    """
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
     local_rank_env = int(os.environ.get("LOCAL_RANK", "0"))
     if backend == "vllm":
         local_rank = 0
-    else:
-        local_rank = local_rank_env
+        if torch.cuda.is_available():
+            torch.cuda.set_device(0)
+        return local_rank, rank, world_size
+    local_rank = local_rank_env
     if world_size > 1 and not dist.is_initialized():
         dist.init_process_group(backend="nccl", init_method="env://")
         torch.cuda.set_device(local_rank)
@@ -642,12 +637,20 @@ def main() -> None:
         default=32768,
         help="When backend=vllm: max_model_len for vLLM engine (prompt + max_new_tokens).",
     )
+    parser.add_argument(
+        "--vllm_legacy_engine",
+        action="store_true",
+        help="When backend=vllm: set VLLM_USE_V1=0 (legacy engine). Try if v1 EngineCore hits TCPStore timeouts.",
+    )
     args = parser.parse_args()
 
     if args.backend == "vllm":
         # Must run before LLM(): v1 EngineCore subprocess + fork breaks if CUDA was initialized in parent.
         _configure_vllm_multiprocessing_spawn()
         configure_cuda_visible_one_gpu_per_rank_for_vllm()
+        _configure_vllm_ipc_for_single_node()
+        if args.vllm_legacy_engine:
+            os.environ["VLLM_USE_V1"] = "0"
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
     if tokenizer.pad_token_id is None:
@@ -666,8 +669,15 @@ def main() -> None:
         model.eval()
     else:
         # Avoid vLLM EngineCore inheriting torchrun's MASTER_ADDR/PORT and joining the wrong store.
+        _vr = int(os.environ.get("RANK", "0"))
+        _vw = int(os.environ.get("WORLD_SIZE", "1"))
+        print(
+            f"[entropy_ce] rank {_vr}/{_vw}: loading vLLM engine (silent until done; often several min)...",
+            flush=True,
+        )
         dist_snap = _snapshot_and_clear_torchrun_dist_env()
         try:
+            _configure_vllm_ipc_for_single_node()
             os.environ.setdefault("VLLM_LOGGING_LEVEL", "WARNING")
             from vllm import LLM
 
@@ -682,10 +692,8 @@ def main() -> None:
             )
         finally:
             _restore_torchrun_dist_env(dist_snap)
-        _pre_ws = int(os.environ.get("WORLD_SIZE", "1"))
-        _pre_rank = int(os.environ.get("RANK", "0"))
-        _wait_all_ranks_vllm_loaded_before_init_dist(rank=_pre_rank, world_size=_pre_ws)
         local_rank, rank, world_size = init_dist(backend="vllm")
+        print(f"[entropy_ce] rank {rank}/{world_size}: vLLM ready; using env-only rank (no NCCL init).", flush=True)
 
     np.random.seed(args.seed + rank)
     random.seed(args.seed + rank)
