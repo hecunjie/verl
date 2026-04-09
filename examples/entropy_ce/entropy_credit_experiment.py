@@ -74,6 +74,38 @@ def configure_cuda_visible_one_gpu_per_rank_for_vllm() -> None:
     os.environ["CUDA_VISIBLE_DEVICES"] = str(lr)
 
 
+# torchrun/torchelastic injects these; vLLM EngineCore subprocesses inherit them and may try to
+# join the *same* TCPStore as this script, causing 600s timeouts. Strip while constructing LLM().
+_TORCHRUN_DIST_ENV_KEYS = (
+    "MASTER_ADDR",
+    "MASTER_PORT",
+    "WORLD_SIZE",
+    "RANK",
+    "LOCAL_RANK",
+    "LOCAL_WORLD_SIZE",
+    "GROUP_RANK",
+    "GROUP_WORLD_SIZE",
+    "ROLE_RANK",
+    "ROLE_WORLD_SIZE",
+    "TORCHELASTIC_RUN_ID",
+)
+
+
+def _snapshot_and_clear_torchrun_dist_env() -> dict[str, str | None]:
+    snap: dict[str, str | None] = {}
+    for k in _TORCHRUN_DIST_ENV_KEYS:
+        snap[k] = os.environ.pop(k, None)
+    return snap
+
+
+def _restore_torchrun_dist_env(snap: dict[str, str | None]) -> None:
+    for k, v in snap.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+
+
 def init_dist(backend: str = "hf") -> tuple[int, int, int]:
     """When backend=vllm, each process only sees one GPU (cuda:0 == physical LOCAL_RANK)."""
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -571,7 +603,41 @@ def main() -> None:
     if args.backend == "vllm":
         configure_cuda_visible_one_gpu_per_rank_for_vllm()
 
-    local_rank, rank, world_size = init_dist(backend=args.backend)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    model: Any = None
+    llm: Any = None
+    if args.backend == "hf":
+        local_rank, rank, world_size = init_dist(backend="hf")
+        torch_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_path,
+            trust_remote_code=True,
+            torch_dtype=torch_dtype,
+            device_map={"": local_rank} if torch.cuda.is_available() else "cpu",
+        )
+        model.eval()
+    else:
+        # Avoid vLLM EngineCore inheriting torchrun's MASTER_ADDR/PORT and joining the wrong store.
+        dist_snap = _snapshot_and_clear_torchrun_dist_env()
+        try:
+            os.environ.setdefault("VLLM_LOGGING_LEVEL", "WARNING")
+            from vllm import LLM
+
+            llm = LLM(
+                model=args.model_path,
+                trust_remote_code=True,
+                dtype="bfloat16",
+                tensor_parallel_size=1,
+                gpu_memory_utilization=float(args.vllm_gpu_memory_utilization),
+                max_model_len=int(args.vllm_max_model_len),
+                enforce_eager=True,
+            )
+        finally:
+            _restore_torchrun_dist_env(dist_snap)
+        local_rank, rank, world_size = init_dist(backend="vllm")
+
     np.random.seed(args.seed + rank)
     random.seed(args.seed + rank)
     torch.manual_seed(args.seed + rank)
@@ -584,35 +650,6 @@ def main() -> None:
     part_file = out_dir / f"phase1_3_rank{rank}.jsonl"
     with open(part_file, "w", encoding="utf-8"):
         pass
-
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    model: Any = None
-    llm: Any = None
-    if args.backend == "hf":
-        torch_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model_path,
-            trust_remote_code=True,
-            torch_dtype=torch_dtype,
-            device_map={"": local_rank} if torch.cuda.is_available() else "cpu",
-        )
-        model.eval()
-    else:
-        # Reduce vLLM log spam so tqdm bars stay readable (especially with | tee).
-        os.environ.setdefault("VLLM_LOGGING_LEVEL", "WARNING")
-        from vllm import LLM
-
-        llm = LLM(
-            model=args.model_path,
-            trust_remote_code=True,
-            dtype="bfloat16",
-            tensor_parallel_size=1,
-            gpu_memory_utilization=float(args.vllm_gpu_memory_utilization),
-            max_model_len=int(args.vllm_max_model_len),
-            enforce_eager=True,
-        )
 
     rows = load_data(args.input_data, args.max_samples, args.seed)
     local_rows = [row for idx, row in enumerate(rows) if idx % world_size == rank]
