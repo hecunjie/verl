@@ -19,6 +19,7 @@ import math
 import multiprocessing
 import os
 import random
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -105,6 +106,34 @@ def _restore_torchrun_dist_env(snap: dict[str, str | None]) -> None:
             os.environ.pop(k, None)
         else:
             os.environ[k] = v
+
+
+def _wait_all_ranks_vllm_loaded_before_init_dist(rank: int, world_size: int, poll_s: float = 2.0) -> None:
+    """Ensure every rank finishes LLM() before any rank calls init_process_group.
+
+    If a fast rank reaches ``init_process_group`` while another is still inside ``LLM()``,
+    TCPStore clients may retry until the default 600s timeout (connection to MASTER_ADDR:MASTER_PORT).
+    """
+    if world_size <= 1:
+        return
+    addr = os.environ.get("MASTER_ADDR", "localhost")
+    port = os.environ.get("MASTER_PORT", "0")
+    run_id = os.environ.get("TORCHELASTIC_RUN_ID", "norunid")
+    safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in f"{addr}_{port}_{run_id}")[:200]
+    sync_dir = Path(tempfile.gettempdir()) / f"entropy_ce_vllm_ready_{safe}_ws{world_size}"
+    sync_dir.mkdir(parents=True, exist_ok=True)
+    marker = sync_dir / f"ready_rank{rank}"
+    marker.write_text("ok\n", encoding="utf-8")
+    expected = [sync_dir / f"ready_rank{r}" for r in range(world_size)]
+    deadline = time.time() + 7200.0
+    while time.time() < deadline:
+        if all(p.exists() for p in expected):
+            return
+        time.sleep(poll_s)
+    raise RuntimeError(
+        f"Timed out waiting for all {world_size} ranks to finish vLLM load (see {sync_dir}). "
+        "Slow rank may still be loading the model or stuck."
+    )
 
 
 def _configure_vllm_multiprocessing_spawn() -> None:
@@ -653,6 +682,9 @@ def main() -> None:
             )
         finally:
             _restore_torchrun_dist_env(dist_snap)
+        _pre_ws = int(os.environ.get("WORLD_SIZE", "1"))
+        _pre_rank = int(os.environ.get("RANK", "0"))
+        _wait_all_ranks_vllm_loaded_before_init_dist(rank=_pre_rank, world_size=_pre_ws)
         local_rank, rank, world_size = init_dist(backend="vllm")
 
     np.random.seed(args.seed + rank)

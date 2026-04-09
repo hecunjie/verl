@@ -41,6 +41,7 @@ VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.9}"
 VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-32768}"
 # 若仍出现 “Cannot re-initialize CUDA in forked subprocess”，可先试：export VLLM_USE_V1=0
 # Python 侧已对 backend=vllm 调用 multiprocessing spawn（见 entropy_credit_experiment.py）
+# vLLM：勿再用 HOST_IP；若需指定进程间通信 IP，请用 VLLM_HOST_IP（K8s/Docker 常见）
 
 # 进度条：默认仅 rank0 显示；每卡各一条可设 PROGRESS_ALL_RANKS=1 或 export TQDM_DISABLE=1 关闭
 PROGRESS_ALL_RANKS="${PROGRESS_ALL_RANKS:-0}"
