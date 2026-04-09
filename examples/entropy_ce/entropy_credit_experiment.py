@@ -16,6 +16,7 @@ import argparse
 import inspect
 import json
 import math
+import multiprocessing
 import os
 import random
 import time
@@ -104,6 +105,20 @@ def _restore_torchrun_dist_env(snap: dict[str, str | None]) -> None:
             os.environ.pop(k, None)
         else:
             os.environ[k] = v
+
+
+def _configure_vllm_multiprocessing_spawn() -> None:
+    """vLLM v1 EngineCore may fork workers; if PyTorch CUDA was touched in parent, fork breaks.
+
+    Force spawn before constructing LLM(). Safe to call once per torchrun worker process.
+    """
+    try:
+        multiprocessing.set_start_method("spawn", force=True)
+    except RuntimeError:
+        # Already set (e.g. by another library); ignore.
+        pass
+    # Some vLLM builds read this; harmless if ignored.
+    os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
 
 def init_dist(backend: str = "hf") -> tuple[int, int, int]:
@@ -601,6 +616,8 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.backend == "vllm":
+        # Must run before LLM(): v1 EngineCore subprocess + fork breaks if CUDA was initialized in parent.
+        _configure_vllm_multiprocessing_spawn()
         configure_cuda_visible_one_gpu_per_rank_for_vllm()
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
