@@ -13,6 +13,7 @@ Features:
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import math
 import os
@@ -279,6 +280,14 @@ def generate_rollout(
     return gen_ids, scores
 
 
+def vllm_generate_quiet(llm: Any, prompts: list, sampling_params: Any) -> Any:
+    """Call vLLM without its per-request tqdm (conflicts with our outer tqdm)."""
+    sig = inspect.signature(llm.generate)
+    if "use_tqdm" in sig.parameters:
+        return llm.generate(prompts, sampling_params=sampling_params, use_tqdm=False)
+    return llm.generate(prompts, sampling_params=sampling_params)
+
+
 def generate_rollout_vllm(
     llm: Any,
     tokenizer,
@@ -299,7 +308,7 @@ def generate_rollout_vllm(
         top_p=top_p,
         logprobs=logprobs_k,
     )
-    outputs = llm.generate([TokensPrompt(prompt_token_ids=prompt_ids)], sampling_params=sp)
+    outputs = vllm_generate_quiet(llm, [TokensPrompt(prompt_token_ids=prompt_ids)], sp)
     o = outputs[0].outputs[0]
     gen_ids = list(o.token_ids)
     logprobs_per_step: list[dict[int, float]] = []
@@ -417,7 +426,7 @@ def method_b_importance(
 
                 assert llm is not None
                 sp = SamplingParams(max_tokens=rem_len, temperature=1.0, top_p=0.95)
-                out = llm.generate([TokensPrompt(prompt_token_ids=prefix)], sampling_params=sp)
+                out = vllm_generate_quiet(llm, [TokensPrompt(prompt_token_ids=prefix)], sp)
                 new_ids = list(out[0].outputs[0].token_ids)
             else:
                 prefix_tensor = torch.tensor(prefix, dtype=torch.long, device=model.device).unsqueeze(0)
@@ -591,6 +600,8 @@ def main() -> None:
         )
         model.eval()
     else:
+        # Reduce vLLM log spam so tqdm bars stay readable (especially with | tee).
+        os.environ.setdefault("VLLM_LOGGING_LEVEL", "WARNING")
         from vllm import LLM
 
         llm = LLM(
