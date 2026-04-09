@@ -7,6 +7,7 @@ import math
 import os
 import random
 import statistics
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -63,6 +64,8 @@ def estimate_suffix_return_samples(
     temperature: float,
     top_p: float,
     logprobs_k: int,
+    *,
+    m_iter: Any | None = None,
 ) -> list[float]:
     from vllm import SamplingParams
     from vllm.inputs import TokensPrompt
@@ -75,7 +78,8 @@ def estimate_suffix_return_samples(
         top_p=top_p,
         logprobs=clamp_vllm_logprobs_topk(logprobs_k),
     )
-    for _ in range(m_max):
+    loop = m_iter if m_iter is not None else range(m_max)
+    for _ in loop:
         out = vllm_generate_quiet(llm, [TokensPrompt(prompt_token_ids=prefix_ids)], sp)
         o = out[0].outputs[0]
         step_logprobs = []
@@ -145,6 +149,11 @@ def main() -> None:
         action="store_true",
         help="Show tqdm on every shard process (default: rank 0 only).",
     )
+    parser.add_argument(
+        "--progress_nested",
+        action="store_true",
+        help="Nested tqdm: rollouts → prefixes → MC samples (see ETA for inner loops).",
+    )
     args = parser.parse_args()
 
     m_grid = parse_int_list(args.m_grid)
@@ -201,9 +210,11 @@ def main() -> None:
     use_tqdm = tqdm is not None and not args.no_progress and not env_no_tqdm and (
         args.progress_all_ranks or rank == 0
     )
-    # 每个 GPU 进程一条主进度条；position 用 rank 错开，多进程写同一终端时少重叠
-    bar_pos = int(rank) if use_tqdm else 0
+    use_nested = bool(use_tqdm and args.progress_nested)
+    # 单层：position=rank；嵌套：每层占一行，多卡时按 rank*4 起算避免重叠
+    bar_base = (rank * 4) if (use_tqdm and use_nested and args.progress_all_ranks) else (rank if use_tqdm else 0)
     shard_desc = f"shard{rank}"
+    _tqdm_kw = {"file": sys.stderr, "dynamic_ncols": True}
 
     prompt_iter = enumerate(local_rows)
     if use_tqdm:
@@ -211,10 +222,10 @@ def main() -> None:
             prompt_iter,
             total=len(local_rows),
             desc=f"{shard_desc} prompts",
-            dynamic_ncols=True,
-            position=bar_pos,
+            position=bar_base,
             leave=True,
             mininterval=0.5,
+            **_tqdm_kw,
         )
 
     for local_i, row in prompt_iter:
@@ -222,7 +233,19 @@ def main() -> None:
         prompt_text = build_prompt_text(tokenizer, row["prompt"])
         prompt_ids = tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False)["input_ids"][0].tolist()
 
-        for rollout_idx in range(args.rollouts_per_prompt):
+        rollout_iter = range(args.rollouts_per_prompt)
+        if use_nested and tqdm is not None:
+            rollout_iter = tqdm(
+                rollout_iter,
+                total=args.rollouts_per_prompt,
+                desc=f"{shard_desc} rollouts",
+                position=bar_base + 1,
+                leave=False,
+                mininterval=0.2,
+                **_tqdm_kw,
+            )
+
+        for rollout_idx in rollout_iter:
             response_ids, scores = generate_rollout_vllm(
                 llm=llm,
                 tokenizer=tokenizer,
@@ -237,9 +260,32 @@ def main() -> None:
             entropies = [entropy_from_logprobs_topk(s) for s in scores[: len(response_ids)]]
             positions = pick_positions_by_entropy(entropies, args.max_positions_per_rollout)
 
-            for pos in positions:
+            pos_iter = positions
+            if use_nested and tqdm is not None:
+                pos_iter = tqdm(
+                    positions,
+                    total=len(positions),
+                    desc=f"{shard_desc} prefixes",
+                    position=bar_base + 2,
+                    leave=False,
+                    mininterval=0.1,
+                    **_tqdm_kw,
+                )
+
+            for pos in pos_iter:
                 # Prefix before token at index pos.
                 prefix_ids = prompt_ids + response_ids[:pos]
+                mc_iter = range(m_max)
+                if use_nested and tqdm is not None:
+                    mc_iter = tqdm(
+                        range(m_max),
+                        total=m_max,
+                        desc=f"{shard_desc} MC",
+                        position=bar_base + 3,
+                        leave=False,
+                        mininterval=0.05,
+                        **_tqdm_kw,
+                    )
                 suffix_returns = estimate_suffix_return_samples(
                     llm=llm,
                     prefix_ids=prefix_ids,
@@ -248,6 +294,7 @@ def main() -> None:
                     temperature=args.temperature,
                     top_p=args.top_p,
                     logprobs_k=args.vllm_logprobs_topk,
+                    m_iter=mc_iter,
                 )
                 stats_by_m = summarize_variance_from_samples(suffix_returns, m_grid)
                 rec = {

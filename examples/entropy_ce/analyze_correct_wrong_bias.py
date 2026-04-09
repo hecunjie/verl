@@ -6,6 +6,7 @@ import json
 import math
 import os
 import random
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -52,6 +53,8 @@ def estimate_F_from_prefix_vllm(
     temperature: float,
     top_p: float,
     logprobs_k: int,
+    *,
+    m_iter: Any | None = None,
 ) -> float:
     from vllm import SamplingParams
     from vllm.inputs import TokensPrompt
@@ -64,7 +67,8 @@ def estimate_F_from_prefix_vllm(
         top_p=top_p,
         logprobs=clamp_vllm_logprobs_topk(logprobs_k),
     )
-    for _ in range(m_samples):
+    loop = m_iter if m_iter is not None else range(m_samples)
+    for _ in loop:
         out = vllm_generate_quiet(llm, [TokensPrompt(prompt_token_ids=prefix_ids)], sp)
         o = out[0].outputs[0]
         step_logprobs = []
@@ -131,6 +135,11 @@ def main() -> None:
         action="store_true",
         help="Show tqdm on every shard process (default: rank 0 only).",
     )
+    parser.add_argument(
+        "--progress_nested",
+        action="store_true",
+        help="Nested tqdm: rollouts → positions → MC samples per F estimate.",
+    )
     args = parser.parse_args()
 
     vllm_standalone = args.vllm_shard_rank is not None and args.vllm_shard_world_size is not None
@@ -184,8 +193,10 @@ def main() -> None:
     use_tqdm = tqdm is not None and not args.no_progress and not env_no_tqdm and (
         args.progress_all_ranks or rank == 0
     )
-    bar_pos = int(rank) if use_tqdm else 0
+    use_nested = bool(use_tqdm and args.progress_nested)
+    bar_base = (rank * 4) if (use_tqdm and use_nested and args.progress_all_ranks) else (rank if use_tqdm else 0)
     shard_desc = f"shard{rank}"
+    _tqdm_kw = {"file": sys.stderr, "dynamic_ncols": True}
 
     prompt_iter = enumerate(local_rows)
     if use_tqdm:
@@ -193,10 +204,10 @@ def main() -> None:
             prompt_iter,
             total=len(local_rows),
             desc=f"{shard_desc} prompts",
-            dynamic_ncols=True,
-            position=bar_pos,
+            position=bar_base,
             leave=True,
             mininterval=0.5,
+            **_tqdm_kw,
         )
 
     for local_i, row in prompt_iter:
@@ -207,7 +218,18 @@ def main() -> None:
         ground_truth = str((row.get("reward_model") or {}).get("ground_truth", ""))
 
         rollouts: list[dict[str, Any]] = []
-        for rollout_idx in range(args.rollouts_per_prompt):
+        rollout_iter = range(args.rollouts_per_prompt)
+        if use_nested and tqdm is not None:
+            rollout_iter = tqdm(
+                rollout_iter,
+                total=args.rollouts_per_prompt,
+                desc=f"{shard_desc} rollouts",
+                position=bar_base + 1,
+                leave=False,
+                mininterval=0.2,
+                **_tqdm_kw,
+            )
+        for rollout_idx in rollout_iter:
             response_ids, scores = generate_rollout_vllm(
                 llm=llm,
                 tokenizer=tokenizer,
@@ -248,13 +270,37 @@ def main() -> None:
             response_ids = rr["response_ids"]
             scores = rr["scores"]
             positions = pick_top_entropy_positions(entropies, args.top_entropy_ratio, args.max_positions_per_rollout)
-            for pos in positions:
+            pos_iter = positions
+            if use_nested and tqdm is not None:
+                pos_iter = tqdm(
+                    positions,
+                    total=len(positions),
+                    desc=f"{shard_desc} {group_name[:4]} pos",
+                    position=bar_base + 2,
+                    leave=False,
+                    mininterval=0.1,
+                    **_tqdm_kw,
+                )
+            for pos in pos_iter:
                 if pos >= len(scores):
                     continue
                 step_lp = scores[pos]
                 tids, probs = topk_candidates_with_probs(step_lp, args.topk_alt)
                 if not tids:
                     continue
+
+                def _mc_iter() -> Any:
+                    if use_nested and tqdm is not None:
+                        return tqdm(
+                            range(args.mc_m_samples),
+                            total=args.mc_m_samples,
+                            desc=f"{shard_desc} MC",
+                            position=bar_base + 3,
+                            leave=False,
+                            mininterval=0.05,
+                            **_tqdm_kw,
+                        )
+                    return range(args.mc_m_samples)
 
                 # F(x_{<=t}) for actually selected token:
                 prefix_selected = prompt_ids + response_ids[: pos + 1]
@@ -266,6 +312,7 @@ def main() -> None:
                     temperature=args.temperature,
                     top_p=args.top_p,
                     logprobs_k=args.vllm_logprobs_topk,
+                    m_iter=_mc_iter(),
                 )
 
                 # \bar F_t approx with top-k alternatives
@@ -280,6 +327,7 @@ def main() -> None:
                         temperature=args.temperature,
                         top_p=args.top_p,
                         logprobs_k=args.vllm_logprobs_topk,
+                        m_iter=_mc_iter(),
                     )
                     f_bar += float(p) * float(f_alt)
 
