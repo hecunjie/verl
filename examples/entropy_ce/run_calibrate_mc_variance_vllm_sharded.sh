@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # vLLM + 多卡：每 GPU 一个独立 python 进程（勿用 torchrun），与 run_entropy_credit_experiment_vllm_sharded.sh 一致。
 #
-# 每个 GPU 进程一条 tqdm（shard0..shardN-1）；关闭：传参 --no_progress 或 export TQDM_DISABLE=1
+# 默认仅 rank0 显示 tqdm（时间更清晰）；开启所有进程进度条：PROGRESS_ALL_RANKS=1
+# 关闭：传参 --no_progress 或 export TQDM_DISABLE=1
 #
 # 用法（在 VERL 根目录）:
 #   bash examples/entropy_ce/run_calibrate_mc_variance_vllm_sharded.sh
@@ -29,6 +30,7 @@ TOP_P="${TOP_P:-0.95}"
 VLLM_LOGPROBS_TOPK="${VLLM_LOGPROBS_TOPK:-20}"
 VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.9}"
 VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-32768}"
+PROGRESS_ALL_RANKS="${PROGRESS_ALL_RANKS:-0}"
 
 export VLLM_HOST_IP="${VLLM_HOST_IP:-127.0.0.1}"
 unset HOST_IP 2>/dev/null || true
@@ -38,6 +40,10 @@ mkdir -p "${OUTPUT_DIR}"
 
 PIDS=()
 for ((r = 0; r < NPROC_PER_NODE; r++)); do
+  EXTRA_ARGS=()
+  if [ "${PROGRESS_ALL_RANKS}" = "1" ]; then
+    EXTRA_ARGS+=(--progress_all_ranks)
+  fi
   CUDA_VISIBLE_DEVICES="${r}" python3 examples/entropy_ce/calibrate_mc_variance.py \
     --input_data "${INPUT_DATA}" \
     --model_path "${MODEL_PATH}" \
@@ -56,6 +62,7 @@ for ((r = 0; r < NPROC_PER_NODE; r++)); do
     --vllm_max_model_len "${VLLM_MAX_MODEL_LEN}" \
     --vllm_shard_rank "${r}" \
     --vllm_shard_world_size "${NPROC_PER_NODE}" \
+    "${EXTRA_ARGS[@]}" \
     "$@" &
   PIDS+=("$!")
 done

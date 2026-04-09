@@ -126,6 +126,11 @@ def main() -> None:
     parser.add_argument("--vllm_shard_rank", type=int, default=None)
     parser.add_argument("--vllm_shard_world_size", type=int, default=None)
     parser.add_argument("--no_progress", action="store_true", help="Disable tqdm progress bars.")
+    parser.add_argument(
+        "--progress_all_ranks",
+        action="store_true",
+        help="Show tqdm on every shard process (default: rank 0 only).",
+    )
     args = parser.parse_args()
 
     vllm_standalone = args.vllm_shard_rank is not None and args.vllm_shard_world_size is not None
@@ -176,7 +181,9 @@ def main() -> None:
     local_rows = [row for idx, row in enumerate(rows) if idx % world_size == rank]
 
     env_no_tqdm = os.environ.get("TQDM_DISABLE", "").strip().lower() in ("1", "true", "yes")
-    use_tqdm = tqdm is not None and not args.no_progress and not env_no_tqdm
+    use_tqdm = tqdm is not None and not args.no_progress and not env_no_tqdm and (
+        args.progress_all_ranks or rank == 0
+    )
     bar_pos = int(rank) if use_tqdm else 0
     shard_desc = f"shard{rank}"
 
