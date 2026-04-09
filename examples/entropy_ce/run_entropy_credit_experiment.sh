@@ -35,6 +35,8 @@ TOP_P="${TOP_P:-0.95}"
 SEED="${SEED:-42}"
 
 # 推理后端：hf（默认）或 vllm（更快；熵特征为 top-K logprobs 近似）
+# vLLM 多卡若遇 torchrun/TCPStore 卡死：不要用本脚本里的 torchrun，请改用
+#   bash examples/entropy_ce/run_entropy_credit_experiment_vllm_sharded.sh
 BACKEND="${BACKEND:-hf}"
 VLLM_LOGPROBS_TOPK="${VLLM_LOGPROBS_TOPK:-256}"
 VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.9}"

@@ -98,6 +98,32 @@ _TORCHRUN_DIST_ENV_KEYS = (
     "PET_LOCAL_RANK",
 )
 
+# Extra keys removed only for --vllm_shard_rank/--vllm_shard_world_size (no torchrun) mode.
+_EXTRA_DIST_ENV_FOR_VLLM_STANDALONE = (
+    "INIT_METHOD",
+    "DIST_INIT_METHOD",
+    "NNODES",
+    "NODE_RANK",
+    "NPROC_PER_NODE",
+    "RDZV_ENDPOINT",
+    "RDZV_ID",
+    "RDZV_BACKEND",
+)
+
+
+def _purge_env_keys(keys: tuple[str, ...]) -> None:
+    for k in keys:
+        os.environ.pop(k, None)
+
+
+def purge_all_torchrun_like_env_for_vllm_standalone() -> None:
+    """Remove distributed rendezvous env so vLLM child processes never see MASTER_* / TCPStore.
+
+    Use when launching one process per GPU **without** torchrun (see run_entropy_credit_experiment_vllm_sharded.sh).
+    """
+    _purge_env_keys(_TORCHRUN_DIST_ENV_KEYS)
+    _purge_env_keys(_EXTRA_DIST_ENV_FOR_VLLM_STANDALONE)
+
 
 def _snapshot_and_clear_torchrun_dist_env() -> dict[str, str | None]:
     snap: dict[str, str | None] = {}
@@ -138,15 +164,27 @@ def _configure_vllm_multiprocessing_spawn() -> None:
     os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
 
-def init_dist(backend: str = "hf") -> tuple[int, int, int]:
+def init_dist(
+    backend: str = "hf",
+    *,
+    rank_override: int | None = None,
+    world_size_override: int | None = None,
+) -> tuple[int, int, int]:
     """Init rank / device. When backend=vllm, each process only sees cuda:0 (physical LOCAL_RANK).
 
     vLLM path does **not** call ``init_process_group``: this script only needs ``RANK``/``WORLD_SIZE``
     from torchrun for data sharding and file-based sync. Skipping NCCL/TCPStore avoids 600s TCPStore
     timeouts and removes the need for all ranks to enter the rendezvous in lockstep after ``LLM()``.
+
+    When using standalone vLLM sharding (no torchrun), pass ``rank_override`` / ``world_size_override``
+    after purging the environment (see ``purge_all_torchrun_like_env_for_vllm_standalone``).
     """
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    rank = int(os.environ.get("RANK", "0"))
+    world_size = (
+        int(world_size_override)
+        if world_size_override is not None
+        else int(os.environ.get("WORLD_SIZE", "1"))
+    )
+    rank = int(rank_override) if rank_override is not None else int(os.environ.get("RANK", "0"))
     local_rank_env = int(os.environ.get("LOCAL_RANK", "0"))
     if backend == "vllm":
         local_rank = 0
@@ -642,12 +680,37 @@ def main() -> None:
         action="store_true",
         help="When backend=vllm: set VLLM_USE_V1=0 (legacy engine). Try if v1 EngineCore hits TCPStore timeouts.",
     )
+    parser.add_argument(
+        "--vllm_shard_rank",
+        type=int,
+        default=None,
+        help="When backend=vllm: shard index [0, N). Use with --vllm_shard_world_size and **without** torchrun "
+        "(one process per GPU; set CUDA_VISIBLE_DEVICES). Avoids TCPStore/torchrun conflicts.",
+    )
+    parser.add_argument(
+        "--vllm_shard_world_size",
+        type=int,
+        default=None,
+        help="When backend=vllm: total number of vLLM worker processes (e.g. 8). Must match --vllm_shard_rank range.",
+    )
     args = parser.parse_args()
 
+    vllm_standalone = (
+        args.backend == "vllm"
+        and args.vllm_shard_rank is not None
+        and args.vllm_shard_world_size is not None
+    )
     if args.backend == "vllm":
+        if (args.vllm_shard_rank is None) ^ (args.vllm_shard_world_size is None):
+            raise SystemExit("Pass both --vllm_shard_rank and --vllm_shard_world_size, or neither.")
+        if vllm_standalone:
+            if args.vllm_shard_world_size < 1 or not (0 <= args.vllm_shard_rank < args.vllm_shard_world_size):
+                raise SystemExit("Invalid --vllm_shard_rank / --vllm_shard_world_size.")
+            purge_all_torchrun_like_env_for_vllm_standalone()
         # Must run before LLM(): v1 EngineCore subprocess + fork breaks if CUDA was initialized in parent.
         _configure_vllm_multiprocessing_spawn()
-        configure_cuda_visible_one_gpu_per_rank_for_vllm()
+        if not vllm_standalone:
+            configure_cuda_visible_one_gpu_per_rank_for_vllm()
         _configure_vllm_ipc_for_single_node()
         if args.vllm_legacy_engine:
             os.environ["VLLM_USE_V1"] = "0"
@@ -669,8 +732,11 @@ def main() -> None:
         model.eval()
     else:
         # Avoid vLLM EngineCore inheriting torchrun's MASTER_ADDR/PORT and joining the wrong store.
-        _vr = int(os.environ.get("RANK", "0"))
-        _vw = int(os.environ.get("WORLD_SIZE", "1"))
+        if vllm_standalone:
+            _vr, _vw = args.vllm_shard_rank, args.vllm_shard_world_size
+        else:
+            _vr = int(os.environ.get("RANK", "0"))
+            _vw = int(os.environ.get("WORLD_SIZE", "1"))
         print(
             f"[entropy_ce] rank {_vr}/{_vw}: loading vLLM engine (silent until done; often several min)...",
             flush=True,
@@ -692,8 +758,13 @@ def main() -> None:
             )
         finally:
             _restore_torchrun_dist_env(dist_snap)
-        local_rank, rank, world_size = init_dist(backend="vllm")
-        print(f"[entropy_ce] rank {rank}/{world_size}: vLLM ready; using env-only rank (no NCCL init).", flush=True)
+        local_rank, rank, world_size = init_dist(
+            backend="vllm",
+            rank_override=args.vllm_shard_rank if vllm_standalone else None,
+            world_size_override=args.vllm_shard_world_size if vllm_standalone else None,
+        )
+        mode = "vllm-standalone (no torchrun)" if vllm_standalone else "env-only rank (no NCCL init)"
+        print(f"[entropy_ce] rank {rank}/{world_size}: vLLM ready; {mode}.", flush=True)
 
     np.random.seed(args.seed + rank)
     random.seed(args.seed + rank)
