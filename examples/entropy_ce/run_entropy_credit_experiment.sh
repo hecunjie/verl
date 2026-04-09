@@ -38,7 +38,8 @@ SEED="${SEED:-42}"
 # vLLM 多卡若遇 torchrun/TCPStore 卡死：不要用本脚本里的 torchrun，请改用
 #   bash examples/entropy_ce/run_entropy_credit_experiment_vllm_sharded.sh
 BACKEND="${BACKEND:-hf}"
-VLLM_LOGPROBS_TOPK="${VLLM_LOGPROBS_TOPK:-256}"
+# vLLM legacy / 多数构建单步最多 ~20 个 logprobs；设更大也会被脚本截断
+VLLM_LOGPROBS_TOPK="${VLLM_LOGPROBS_TOPK:-20}"
 VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.9}"
 VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-32768}"
 # 单机多卡：vLLM v1 若连 pod IP 导致 TCPStore 600s 超时，请 export VLLM_HOST_IP=127.0.0.1 并 unset HOST_IP

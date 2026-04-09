@@ -389,6 +389,16 @@ def generate_rollout(
     return gen_ids, scores
 
 
+def vllm_max_logprobs_allowed() -> int:
+    """vLLM caps top logprobs per token (legacy engine commonly max 20)."""
+    return int(os.environ.get("VLLM_ENTROPY_MAX_LOGPROBS", "20"))
+
+
+def clamp_vllm_logprobs_topk(requested: int) -> int:
+    cap = vllm_max_logprobs_allowed()
+    return min(max(0, requested), cap)
+
+
 def vllm_generate_quiet(llm: Any, prompts: list, sampling_params: Any) -> Any:
     """Call vLLM without its per-request tqdm (conflicts with our outer tqdm)."""
     sig = inspect.signature(llm.generate)
@@ -409,13 +419,14 @@ def generate_rollout_vllm(
     from vllm import SamplingParams
     from vllm.inputs import TokensPrompt
 
+    k = clamp_vllm_logprobs_topk(logprobs_k)
     encoded = tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False)
     prompt_ids = encoded["input_ids"][0].tolist()
     sp = SamplingParams(
         max_tokens=max_new_tokens,
         temperature=temperature,
         top_p=top_p,
-        logprobs=logprobs_k,
+        logprobs=k,
     )
     outputs = vllm_generate_quiet(llm, [TokensPrompt(prompt_token_ids=prompt_ids)], sp)
     o = outputs[0].outputs[0]
@@ -660,8 +671,9 @@ def main() -> None:
     parser.add_argument(
         "--vllm_logprobs_topk",
         type=int,
-        default=256,
-        help="When backend=vllm: number of top logprobs per generated token (for Delta/H/V).",
+        default=20,
+        help="When backend=vllm: top logprobs per token for entropy (capped by vLLM, often max 20 for legacy engine). "
+        "Override cap with env VLLM_ENTROPY_MAX_LOGPROBS if your vLLM build allows more.",
     )
     parser.add_argument(
         "--vllm_gpu_memory_utilization",
@@ -765,6 +777,11 @@ def main() -> None:
         )
         mode = "vllm-standalone (no torchrun)" if vllm_standalone else "env-only rank (no NCCL init)"
         print(f"[entropy_ce] rank {rank}/{world_size}: vLLM ready; {mode}.", flush=True)
+        if rank == 0 and args.vllm_logprobs_topk > vllm_max_logprobs_allowed():
+            print(
+                f"[entropy_ce] --vllm_logprobs_topk={args.vllm_logprobs_topk} capped to {vllm_max_logprobs_allowed()} (vLLM limit).",
+                flush=True,
+            )
 
     np.random.seed(args.seed + rank)
     random.seed(args.seed + rank)
@@ -903,7 +920,7 @@ def main() -> None:
                 importance_method_b=importance,
                 score_backend=args.backend,
                 entropy_note=(
-                    f"vllm_top{args.vllm_logprobs_topk}_renorm"
+                    f"vllm_top{clamp_vllm_logprobs_topk(args.vllm_logprobs_topk)}_renorm"
                     if args.backend == "vllm"
                     else "full_vocab_softmax"
                 ),
