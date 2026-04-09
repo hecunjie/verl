@@ -34,6 +34,12 @@ TEMPERATURE="${TEMPERATURE:-1.0}"
 TOP_P="${TOP_P:-0.95}"
 SEED="${SEED:-42}"
 
+# 推理后端：hf（默认）或 vllm（更快；熵特征为 top-K logprobs 近似）
+BACKEND="${BACKEND:-hf}"
+VLLM_LOGPROBS_TOPK="${VLLM_LOGPROBS_TOPK:-256}"
+VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.9}"
+VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-32768}"
+
 # 进度条：默认仅 rank0 显示；每卡各一条可设 PROGRESS_ALL_RANKS=1 或 export TQDM_DISABLE=1 关闭
 PROGRESS_ALL_RANKS="${PROGRESS_ALL_RANKS:-0}"
 EXTRA_ARGS=()
@@ -66,5 +72,9 @@ torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" \
   --phase2_max_positions "${PHASE2_MAX_POSITIONS}" \
   --context_window_tokens "${CONTEXT_WINDOW_TOKENS}" \
   --seed "${SEED}" \
+  --backend "${BACKEND}" \
+  --vllm_logprobs_topk "${VLLM_LOGPROBS_TOPK}" \
+  --vllm_gpu_memory_utilization "${VLLM_GPU_MEMORY_UTILIZATION}" \
+  --vllm_max_model_len "${VLLM_MAX_MODEL_LEN}" \
   "${EXTRA_ARGS[@]}" \
   "$@"

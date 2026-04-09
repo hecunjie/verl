@@ -67,10 +67,21 @@ def file_sync(out_dir: Path, rank: int, world_size: int, tag: str = "done", poll
         time.sleep(poll_s)
 
 
-def init_dist() -> tuple[int, int, int]:
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+def configure_cuda_visible_one_gpu_per_rank_for_vllm() -> None:
+    """vLLM expects a single visible GPU per engine; map physical GPU via LOCAL_RANK."""
+    lr = int(os.environ.get("LOCAL_RANK", "0"))
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(lr)
+
+
+def init_dist(backend: str = "hf") -> tuple[int, int, int]:
+    """When backend=vllm, each process only sees one GPU (cuda:0 == physical LOCAL_RANK)."""
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
+    local_rank_env = int(os.environ.get("LOCAL_RANK", "0"))
+    if backend == "vllm":
+        local_rank = 0
+    else:
+        local_rank = local_rank_env
     if world_size > 1 and not dist.is_initialized():
         dist.init_process_group(backend="nccl", init_method="env://")
         torch.cuda.set_device(local_rank)
@@ -107,6 +118,36 @@ def entropy_from_logits(logits: torch.Tensor) -> float:
     probs = torch.softmax(logits, dim=-1)
     log_probs = torch.log(probs.clamp(min=1e-20))
     return float((-probs * log_probs).sum().item())
+
+
+def entropy_from_logprobs_topk(logprobs_dict: dict[int, float]) -> float:
+    """Entropy over renormalized top-K logprobs (vLLM); not identical to full-vocab softmax."""
+    if not logprobs_dict:
+        return 0.0
+    lps = np.array(list(logprobs_dict.values()), dtype=np.float64)
+    m = float(np.max(lps))
+    p = np.exp(lps - m)
+    z = float(p.sum())
+    if z <= 0.0 or not np.isfinite(z):
+        return 0.0
+    p = p / z
+    return float(-np.sum(p * np.log(np.clip(p, 1e-20, 1.0))))
+
+
+def varentropy_from_logprobs_topk(logprobs_dict: dict[int, float], entropy: float) -> float:
+    """Match HF varentropy form on renormalized top-K: sum q_i (log q_i + H)^2."""
+    if not logprobs_dict:
+        return 0.0
+    lps = np.array(list(logprobs_dict.values()), dtype=np.float64)
+    m = float(np.max(lps))
+    p = np.exp(lps - m)
+    z = float(p.sum())
+    if z <= 0.0 or not np.isfinite(z):
+        return 0.0
+    p = p / z
+    log_q = (lps - m) - math.log(z + 1e-20)
+    center = log_q + entropy
+    return float(np.sum(p * (center**2)))
 
 
 def suffix_avg(values: list[float], start: int) -> float:
@@ -200,6 +241,8 @@ class RolloutItem:
     varentropies: list[float]
     branching_factor: list[float]
     importance_method_b: list[float]
+    score_backend: str = "hf"
+    entropy_note: str = "full_vocab_softmax"
 
 
 def compute_varentropy(logits: torch.Tensor, entropy: float) -> float:
@@ -236,12 +279,46 @@ def generate_rollout(
     return gen_ids, scores
 
 
+def generate_rollout_vllm(
+    llm: Any,
+    tokenizer,
+    prompt_text: str,
+    max_new_tokens: int,
+    temperature: float,
+    top_p: float,
+    logprobs_k: int,
+) -> tuple[list[int], list[dict[int, float]]]:
+    from vllm import SamplingParams
+    from vllm.inputs import TokensPrompt
+
+    encoded = tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False)
+    prompt_ids = encoded["input_ids"][0].tolist()
+    sp = SamplingParams(
+        max_tokens=max_new_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        logprobs=logprobs_k,
+    )
+    outputs = llm.generate([TokensPrompt(prompt_token_ids=prompt_ids)], sampling_params=sp)
+    o = outputs[0].outputs[0]
+    gen_ids = list(o.token_ids)
+    logprobs_per_step: list[dict[int, float]] = []
+    for step_lp in o.logprobs or []:
+        d: dict[int, float] = {}
+        for tid, info in step_lp.items():
+            d[int(tid)] = float(info.logprob)
+        logprobs_per_step.append(d)
+    while len(logprobs_per_step) < len(gen_ids):
+        logprobs_per_step.append({})
+    return gen_ids, logprobs_per_step
+
+
 def method_b_importance(
-    model,
+    model: Any,
     tokenizer,
     prompt_text: str,
     response_ids: list[int],
-    scores: list[torch.Tensor],
+    scores: list[torch.Tensor] | list[dict[int, float]],
     data_source: str,
     ground_truth: str,
     selected_positions: list[int],
@@ -251,6 +328,8 @@ def method_b_importance(
     progress_position: int = 2,
     progress_desc: str = "phase2 candidates",
     context_window_tokens: int = 24,
+    backend: str = "hf",
+    llm: Any | None = None,
 ) -> tuple[list[float], list[dict[str, Any]], bool]:
     base_response = tokenizer.decode(response_ids, skip_special_tokens=True)
     base_acc, base_eval = evaluate_solution_acc(data_source=data_source, solution_str=base_response, ground_truth=ground_truth)
@@ -274,34 +353,54 @@ def method_b_importance(
     for pos in pos_iter:
         if pos < 0 or pos >= len(response_ids) or pos >= len(scores):
             continue
-        logits = scores[pos]
-        tk = min(max(2, top_k_alt), logits.shape[-1])
-        topk = torch.topk(logits, k=tk, dim=-1)
-        candidates = topk.indices.tolist()
-        topk_values = topk.values.detach().float().cpu().numpy()
-        alt_tokens = [c for c in candidates if c != response_ids[pos]]
-        if not alt_tokens:
-            continue
-        alt_scores = np.array([topk_values[candidates.index(t)] for t in alt_tokens], dtype=np.float64)
-        finite_mask = np.isfinite(alt_scores)
-        if not np.any(finite_mask):
-            alt_probs = np.ones(len(alt_tokens), dtype=np.float64) / float(len(alt_tokens))
+        step_sc = scores[pos]
+        if isinstance(step_sc, dict):
+            lp = step_sc
+            if not lp:
+                continue
+            tk = min(max(2, top_k_alt), len(lp))
+            items = sorted(lp.items(), key=lambda x: x[1], reverse=True)[:tk]
+            candidates = [tid for tid, _ in items]
+            vals = np.array([v for _, v in items], dtype=np.float64)
+            m = float(np.max(vals))
+            expv = np.exp(vals - m)
+            zsum = float(expv.sum())
+            if zsum <= 0.0 or not np.isfinite(zsum):
+                continue
+            idx_map = {tid: i for i, (tid, _) in enumerate(items)}
+            alt_tokens = [c for c in candidates if c != response_ids[pos]]
+            if not alt_tokens:
+                continue
+            alt_probs = np.array([expv[idx_map[t]] for t in alt_tokens], dtype=np.float64)
+            alt_probs = alt_probs / alt_probs.sum()
         else:
-            # 数值稳定 softmax：仅对有限值参与归一化，避免 NaN/Inf 传播。
-            safe_scores = alt_scores[finite_mask]
-            safe_scores = safe_scores - np.max(safe_scores)
-            safe_probs = np.exp(safe_scores)
-            safe_sum = float(safe_probs.sum())
-            if (not np.isfinite(safe_sum)) or safe_sum <= 0.0:
+            logits = step_sc
+            tk = min(max(2, top_k_alt), logits.shape[-1])
+            topk = torch.topk(logits, k=tk, dim=-1)
+            candidates = topk.indices.tolist()
+            topk_values = topk.values.detach().float().cpu().numpy()
+            alt_tokens = [c for c in candidates if c != response_ids[pos]]
+            if not alt_tokens:
+                continue
+            alt_scores = np.array([topk_values[candidates.index(t)] for t in alt_tokens], dtype=np.float64)
+            finite_mask = np.isfinite(alt_scores)
+            if not np.any(finite_mask):
                 alt_probs = np.ones(len(alt_tokens), dtype=np.float64) / float(len(alt_tokens))
             else:
-                alt_probs = np.zeros(len(alt_tokens), dtype=np.float64)
-                alt_probs[finite_mask] = safe_probs / safe_sum
-                total = float(alt_probs.sum())
-                if (not np.isfinite(total)) or total <= 0.0:
+                safe_scores = alt_scores[finite_mask]
+                safe_scores = safe_scores - np.max(safe_scores)
+                safe_probs = np.exp(safe_scores)
+                safe_sum = float(safe_probs.sum())
+                if (not np.isfinite(safe_sum)) or safe_sum <= 0.0:
                     alt_probs = np.ones(len(alt_tokens), dtype=np.float64) / float(len(alt_tokens))
                 else:
-                    alt_probs = alt_probs / total
+                    alt_probs = np.zeros(len(alt_tokens), dtype=np.float64)
+                    alt_probs[finite_mask] = safe_probs / safe_sum
+                    total = float(alt_probs.sum())
+                    if (not np.isfinite(total)) or total <= 0.0:
+                        alt_probs = np.ones(len(alt_tokens), dtype=np.float64) / float(len(alt_tokens))
+                    else:
+                        alt_probs = alt_probs / total
 
         flips = 0
         pos_ctx = build_token_context(tokenizer, response_ids, pos, context_window_tokens)
@@ -312,19 +411,28 @@ def method_b_importance(
 
             prefix = prompt_ids + mutated[: pos + 1]
             rem_len = max(1, len(response_ids) - pos - 1)
-            prefix_tensor = torch.tensor(prefix, dtype=torch.long, device=model.device).unsqueeze(0)
-            attn = torch.ones_like(prefix_tensor)
-            out = model.generate(
-                input_ids=prefix_tensor,
-                attention_mask=attn,
-                max_new_tokens=rem_len,
-                do_sample=True,
-                temperature=1.0,
-                top_p=0.95,
-                return_dict_in_generate=True,
-                pad_token_id=tokenizer.eos_token_id,
-            )
-            new_ids = out.sequences[0, prefix_tensor.shape[1] :].tolist()
+            if backend == "vllm":
+                from vllm import SamplingParams
+                from vllm.inputs import TokensPrompt
+
+                assert llm is not None
+                sp = SamplingParams(max_tokens=rem_len, temperature=1.0, top_p=0.95)
+                out = llm.generate([TokensPrompt(prompt_token_ids=prefix)], sampling_params=sp)
+                new_ids = list(out[0].outputs[0].token_ids)
+            else:
+                prefix_tensor = torch.tensor(prefix, dtype=torch.long, device=model.device).unsqueeze(0)
+                attn = torch.ones_like(prefix_tensor)
+                out = model.generate(
+                    input_ids=prefix_tensor,
+                    attention_mask=attn,
+                    max_new_tokens=rem_len,
+                    do_sample=True,
+                    temperature=1.0,
+                    top_p=0.95,
+                    return_dict_in_generate=True,
+                    pad_token_id=tokenizer.eos_token_id,
+                )
+                new_ids = out.sequences[0, prefix_tensor.shape[1] :].tolist()
             full_mutated = mutated[: pos + 1] + new_ids
             new_resp = tokenizer.decode(full_mutated, skip_special_tokens=True)
             acc, cf_eval = evaluate_solution_acc(data_source=data_source, solution_str=new_resp, ground_truth=ground_truth)
@@ -424,9 +532,37 @@ def main() -> None:
         default=24,
         help="Number of response tokens to keep on each side of the branch position.",
     )
+    parser.add_argument(
+        "--backend",
+        type=str,
+        default="hf",
+        choices=["hf", "vllm"],
+        help="hf: HuggingFace generate + full-vocab logits. vllm: faster inference; entropies from top-K logprobs.",
+    )
+    parser.add_argument(
+        "--vllm_logprobs_topk",
+        type=int,
+        default=256,
+        help="When backend=vllm: number of top logprobs per generated token (for Delta/H/V).",
+    )
+    parser.add_argument(
+        "--vllm_gpu_memory_utilization",
+        type=float,
+        default=0.9,
+        help="When backend=vllm: vLLM gpu_memory_utilization.",
+    )
+    parser.add_argument(
+        "--vllm_max_model_len",
+        type=int,
+        default=32768,
+        help="When backend=vllm: max_model_len for vLLM engine (prompt + max_new_tokens).",
+    )
     args = parser.parse_args()
 
-    local_rank, rank, world_size = init_dist()
+    if args.backend == "vllm":
+        configure_cuda_visible_one_gpu_per_rank_for_vllm()
+
+    local_rank, rank, world_size = init_dist(backend=args.backend)
     np.random.seed(args.seed + rank)
     random.seed(args.seed + rank)
     torch.manual_seed(args.seed + rank)
@@ -443,14 +579,29 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
-    torch_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_path,
-        trust_remote_code=True,
-        torch_dtype=torch_dtype,
-        device_map={"": local_rank} if torch.cuda.is_available() else "cpu",
-    )
-    model.eval()
+    model: Any = None
+    llm: Any = None
+    if args.backend == "hf":
+        torch_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_path,
+            trust_remote_code=True,
+            torch_dtype=torch_dtype,
+            device_map={"": local_rank} if torch.cuda.is_available() else "cpu",
+        )
+        model.eval()
+    else:
+        from vllm import LLM
+
+        llm = LLM(
+            model=args.model_path,
+            trust_remote_code=True,
+            dtype="bfloat16",
+            tensor_parallel_size=1,
+            gpu_memory_utilization=float(args.vllm_gpu_memory_utilization),
+            max_model_len=int(args.vllm_max_model_len),
+            enforce_eager=True,
+        )
 
     rows = load_data(args.input_data, args.max_samples, args.seed)
     local_rows = [row for idx, row in enumerate(rows) if idx % world_size == rank]
@@ -491,22 +642,41 @@ def main() -> None:
                 leave=False,
             )
         for rollout_idx in rollout_it:
-            response_ids, scores = generate_rollout(
-                model=model,
-                tokenizer=tokenizer,
-                prompt_text=prompt_text,
-                max_new_tokens=args.max_new_tokens,
-                temperature=args.temperature,
-                top_p=args.top_p,
-            )
+            if args.backend == "vllm":
+                assert llm is not None
+                response_ids, scores = generate_rollout_vllm(
+                    llm=llm,
+                    tokenizer=tokenizer,
+                    prompt_text=prompt_text,
+                    max_new_tokens=args.max_new_tokens,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                    logprobs_k=args.vllm_logprobs_topk,
+                )
+            else:
+                assert model is not None
+                response_ids, scores = generate_rollout(
+                    model=model,
+                    tokenizer=tokenizer,
+                    prompt_text=prompt_text,
+                    max_new_tokens=args.max_new_tokens,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                )
             if not response_ids:
                 continue
             response_text = tokenizer.decode(response_ids, skip_special_tokens=True)
             base_acc, base_eval = evaluate_solution_acc(
                 data_source=data_source, solution_str=response_text, ground_truth=ground_truth
             )
-            entropies = [entropy_from_logits(s) for s in scores[: len(response_ids)]]
-            varentropies = [compute_varentropy(s, h) for s, h in zip(scores[: len(response_ids)], entropies, strict=False)]
+            if args.backend == "vllm":
+                entropies = [entropy_from_logprobs_topk(s) for s in scores[: len(response_ids)]]
+                varentropies = [
+                    varentropy_from_logprobs_topk(scores[i], entropies[i]) for i in range(len(entropies))
+                ]
+            else:
+                entropies = [entropy_from_logits(s) for s in scores[: len(response_ids)]]
+                varentropies = [compute_varentropy(s, h) for s, h in zip(scores[: len(response_ids)], entropies, strict=False)]
             branching = [math.exp(h) for h in entropies]
             deltas = []
             for t in range(len(entropies)):
@@ -533,11 +703,14 @@ def main() -> None:
                     progress_position=(rank * 2 + 2) if args.progress_all_ranks else 2,
                     progress_desc=f"rank{rank} phase2",
                     context_window_tokens=args.context_window_tokens,
+                    backend=args.backend,
+                    llm=llm,
                 )
                 base_acc = bool(base_acc_from_method_b)
             else:
                 importance = [0.0 for _ in range(len(response_ids))]
                 branch_traces = []
+                candidates = []
 
             item = RolloutItem(
                 sample_index=global_idx,
@@ -552,6 +725,12 @@ def main() -> None:
                 varentropies=varentropies,
                 branching_factor=branching,
                 importance_method_b=importance,
+                score_backend=args.backend,
+                entropy_note=(
+                    f"vllm_top{args.vllm_logprobs_topk}_renorm"
+                    if args.backend == "vllm"
+                    else "full_vocab_softmax"
+                ),
             )
             with open(part_file, "a", encoding="utf-8") as f:
                 f.write(json.dumps(item.__dict__, ensure_ascii=False) + "\n")
