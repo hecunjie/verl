@@ -230,13 +230,20 @@ def entropy_from_logits(logits: torch.Tensor) -> float:
     return float((-probs * log_probs).sum().item())
 
 
+def _sanitize_logprob_values(lps: np.ndarray) -> np.ndarray:
+    """vLLM may emit NaN/-inf for missing logits in the top-k dict."""
+    return np.nan_to_num(lps, nan=-1e30, neginf=-1e30, posinf=0.0)
+
+
 def entropy_from_logprobs_topk(logprobs_dict: dict[int, float]) -> float:
     """Entropy over renormalized top-K logprobs (vLLM); not identical to full-vocab softmax."""
     if not logprobs_dict:
         return 0.0
-    lps = np.array(list(logprobs_dict.values()), dtype=np.float64)
+    lps = _sanitize_logprob_values(np.array(list(logprobs_dict.values()), dtype=np.float64))
+    if not np.any(np.isfinite(lps)):
+        return 0.0
     m = float(np.max(lps))
-    p = np.exp(lps - m)
+    p = np.exp(np.clip(lps - m, -80.0, 0.0))
     z = float(p.sum())
     if z <= 0.0 or not np.isfinite(z):
         return 0.0
@@ -248,15 +255,21 @@ def varentropy_from_logprobs_topk(logprobs_dict: dict[int, float], entropy: floa
     """Match HF varentropy form on renormalized top-K: sum q_i (log q_i + H)^2."""
     if not logprobs_dict:
         return 0.0
-    lps = np.array(list(logprobs_dict.values()), dtype=np.float64)
+    if not math.isfinite(entropy):
+        return 0.0
+    lps = _sanitize_logprob_values(np.array(list(logprobs_dict.values()), dtype=np.float64))
+    if not np.any(np.isfinite(lps)):
+        return 0.0
     m = float(np.max(lps))
-    p = np.exp(lps - m)
+    p = np.exp(np.clip(lps - m, -80.0, 0.0))
     z = float(p.sum())
     if z <= 0.0 or not np.isfinite(z):
         return 0.0
     p = p / z
     log_q = (lps - m) - math.log(z + 1e-20)
     center = log_q + entropy
+    if not np.all(np.isfinite(center)):
+        center = np.nan_to_num(center, nan=0.0, posinf=0.0, neginf=0.0)
     return float(np.sum(p * (center**2)))
 
 
@@ -490,9 +503,11 @@ def method_b_importance(
             tk = min(max(2, top_k_alt), len(lp))
             items = sorted(lp.items(), key=lambda x: x[1], reverse=True)[:tk]
             candidates = [tid for tid, _ in items]
-            vals = np.array([v for _, v in items], dtype=np.float64)
+            vals = _sanitize_logprob_values(np.array([v for _, v in items], dtype=np.float64))
+            if not np.any(np.isfinite(vals)):
+                continue
             m = float(np.max(vals))
-            expv = np.exp(vals - m)
+            expv = np.exp(np.clip(vals - m, -80.0, 0.0))
             zsum = float(expv.sum())
             if zsum <= 0.0 or not np.isfinite(zsum):
                 continue
@@ -501,7 +516,12 @@ def method_b_importance(
             if not alt_tokens:
                 continue
             alt_probs = np.array([expv[idx_map[t]] for t in alt_tokens], dtype=np.float64)
-            alt_probs = alt_probs / alt_probs.sum()
+            alt_probs = np.nan_to_num(alt_probs, nan=0.0, posinf=0.0, neginf=0.0)
+            psum = float(np.sum(alt_probs))
+            if not np.isfinite(psum) or psum <= 0.0:
+                alt_probs = np.ones(len(alt_tokens), dtype=np.float64) / float(len(alt_tokens))
+            else:
+                alt_probs = alt_probs / psum
         else:
             logits = step_sc
             tk = min(max(2, top_k_alt), logits.shape[-1])
@@ -530,6 +550,17 @@ def method_b_importance(
                         alt_probs = np.ones(len(alt_tokens), dtype=np.float64) / float(len(alt_tokens))
                     else:
                         alt_probs = alt_probs / total
+
+        tot = float(np.sum(alt_probs))
+        if (
+            not np.all(np.isfinite(alt_probs))
+            or tot <= 0.0
+            or not math.isfinite(tot)
+            or len(alt_probs) != len(alt_tokens)
+        ):
+            alt_probs = np.ones(len(alt_tokens), dtype=np.float64) / float(len(alt_tokens))
+        else:
+            alt_probs = alt_probs / tot
 
         flips = 0
         pos_ctx = build_token_context(tokenizer, response_ids, pos, context_window_tokens)
