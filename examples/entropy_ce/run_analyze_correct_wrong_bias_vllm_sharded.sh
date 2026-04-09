@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # vLLM + 多卡：每 GPU 一个独立 python 进程。与 run_calibrate_mc_variance_vllm_sharded.sh 用法一致。
 #
+# 每个 GPU 进程一条 tqdm（shard0..shardN-1）；关闭：传参 --no_progress 或 export TQDM_DISABLE=1
+#
 # 用法（在 VERL 根目录）:
 #   bash examples/entropy_ce/run_analyze_correct_wrong_bias_vllm_sharded.sh
 #

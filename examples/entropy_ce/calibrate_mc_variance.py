@@ -28,6 +28,11 @@ from entropy_credit_experiment import (
     purge_all_torchrun_like_env_for_vllm_standalone,
 )
 
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # pragma: no cover
+    tqdm = None  # type: ignore[misc, assignment]
+
 
 def parse_int_list(text: str) -> list[int]:
     vals = []
@@ -134,6 +139,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--vllm_shard_rank", type=int, default=None)
     parser.add_argument("--vllm_shard_world_size", type=int, default=None)
+    parser.add_argument("--no_progress", action="store_true", help="Disable tqdm progress bars.")
     args = parser.parse_args()
 
     m_grid = parse_int_list(args.m_grid)
@@ -186,7 +192,25 @@ def main() -> None:
     rows = load_data(args.input_data, args.max_samples, args.seed)
     local_rows = [row for idx, row in enumerate(rows) if idx % world_size == rank]
 
-    for local_i, row in enumerate(local_rows):
+    env_no_tqdm = os.environ.get("TQDM_DISABLE", "").strip().lower() in ("1", "true", "yes")
+    use_tqdm = tqdm is not None and not args.no_progress and not env_no_tqdm
+    # 每个 GPU 进程一条主进度条；position 用 rank 错开，多进程写同一终端时少重叠
+    bar_pos = int(rank) if use_tqdm else 0
+    shard_desc = f"shard{rank}"
+
+    prompt_iter = enumerate(local_rows)
+    if use_tqdm:
+        prompt_iter = tqdm(
+            prompt_iter,
+            total=len(local_rows),
+            desc=f"{shard_desc} prompts",
+            dynamic_ncols=True,
+            position=bar_pos,
+            leave=True,
+            mininterval=0.5,
+        )
+
+    for local_i, row in prompt_iter:
         global_idx = local_i * world_size + rank
         prompt_text = build_prompt_text(tokenizer, row["prompt"])
         prompt_ids = tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False)["input_ids"][0].tolist()
