@@ -28,7 +28,9 @@ CANDIDATE_MAX_K="${CANDIDATE_MAX_K:-5}"
 TOPK_ALT="${TOPK_ALT:-3}"
 TOP_ENTROPY_RATIO="${TOP_ENTROPY_RATIO:-0.10}"
 MAX_POSITIONS_PER_ROLLOUT="${MAX_POSITIONS_PER_ROLLOUT:-20}"
-MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-256}"
+# 与 examples/grpo_trainer/run_grpo_r1_distill_7b_dapo_data.sh 中 data.max_response_length 对齐；
+# R1/Distill 长 CoT 若仍用 256，常在未写出 \\boxed{} 前截断 → 8 条 rollout 同判错 → n_skip_no_mixed 饱和。
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-8192}"
 TEMPERATURE="${TEMPERATURE:-1.0}"
 TOP_P="${TOP_P:-0.95}"
 VLLM_LOGPROBS_TOPK="${VLLM_LOGPROBS_TOPK:-20}"

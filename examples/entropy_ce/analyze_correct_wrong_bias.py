@@ -173,7 +173,13 @@ def main() -> None:
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--max_samples", type=int, default=300)
     parser.add_argument("--rollouts_per_prompt", type=int, default=8)
-    parser.add_argument("--max_new_tokens", type=int, default=256)
+    parser.add_argument(
+        "--max_new_tokens",
+        type=int,
+        default=8192,
+        help="Rollout / continuation length. R1-style models need room for CoT before Answer:\\boxed{}; "
+        "too small → all rollouts truncate similarly → no mixed correct/wrong in 8 samples.",
+    )
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top_p", type=float, default=0.95)
     parser.add_argument("--vllm_logprobs_topk", type=int, default=20)
@@ -532,12 +538,25 @@ def main() -> None:
         if not merged:
             print(
                 "[pair_bias] num_records=0: 请看 OUTPUT_DIR 下 pair_bias_diag_merged.json（各 rank 计数之和）。"
-                " n_empty_ground_truth>0 表示 parquet 里没读到 GT（常见于 reward_model 为 JSON 字符串或字段名不同）；"
-                " n_skip_no_mixed 高表示 8 条 rollout 从未同时对错；n_skip_all_rollouts_empty 表示 vLLM 未生成 token；"
-                " n_skip_empty_step_lp 表示过了对错配对但高熵步无 logprobs。",
+                " n_empty_ground_truth>0 表示 parquet 里没读到 GT；"
+                " n_skip_no_mixed 高表示每条 prompt 上各 rollout 对错标签一致（需同时对错才会写 jsonl）；"
+                " n_skip_all_rollouts_empty 表示 vLLM 未生成 token；"
+                " n_skip_empty_step_lp 表示高熵步无 logprobs。",
                 file=sys.stderr,
                 flush=True,
             )
+            npm = int(diag_merged.get("n_prompts", 0))
+            nmix = int(diag_merged.get("n_skip_no_mixed", 0))
+            if npm > 0 and nmix >= npm and int(args.max_new_tokens) < 2048:
+                print(
+                    f"[pair_bias] 提示: 当前 --max_new_tokens={args.max_new_tokens} 偏小。"
+                    "R1/Distill 长思维链常在很后面才写 Answer:\\boxed{{}}，"
+                    "过短会导致多条 rollout 同样截断、判分结果高度一致（看起来像「全对或全错」）。"
+                    "GRPO 脚本里 data.max_response_length 常为 8192，建议分析时对齐，例如 "
+                    "MAX_NEW_TOKENS=8192 或 --max_new_tokens 8192。",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
 
 if __name__ == "__main__":
