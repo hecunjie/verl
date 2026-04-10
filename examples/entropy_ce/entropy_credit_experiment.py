@@ -536,6 +536,53 @@ def estimate_F_mc_many_prefixes_vllm(
     return [float(np.mean(xs)) if xs else 0.0 for xs in per_pref]
 
 
+def estimate_suffix_return_samples_batched(
+    llm: Any,
+    prefix_ids: list[int],
+    m_max: int,
+    max_new_tokens: int,
+    temperature: float,
+    top_p: float,
+    logprobs_k: int,
+    *,
+    batch_chunk: int = 64,
+    chunk_starts_iter: Any | None = None,
+) -> list[float]:
+    """``m_max`` independent continuations from one prefix; batched ``llm.generate``.
+
+    Returns entropy-sum per sample, order preserved (for MC variance calibration).
+    """
+    from vllm import SamplingParams
+    from vllm.inputs import TokensPrompt
+
+    if m_max < 1:
+        return []
+    k = clamp_vllm_logprobs_topk(logprobs_k)
+    sp = SamplingParams(
+        max_tokens=max_new_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        logprobs=k,
+    )
+    flat_prompts = [TokensPrompt(prompt_token_ids=prefix_ids) for _ in range(m_max)]
+    n_total = m_max
+    returns: list[float] = []
+    if chunk_starts_iter is None:
+        chunk_starts_iter = range(0, n_total, batch_chunk)
+    for start in chunk_starts_iter:
+        end = min(start + batch_chunk, n_total)
+        chunk_prompts = flat_prompts[start:end]
+        outputs = vllm_generate_quiet(llm, chunk_prompts, sp)
+        if len(outputs) != len(chunk_prompts):
+            raise RuntimeError(f"vLLM batch size mismatch: expected {len(chunk_prompts)}, got {len(outputs)}")
+        for out_req in outputs:
+            o = out_req.outputs[0]
+            returns.append(completion_entropy_sum_from_vllm_output(o))
+    if len(returns) != m_max:
+        raise RuntimeError(f"expected {m_max} samples, got {len(returns)}")
+    return returns
+
+
 def generate_rollout_vllm(
     llm: Any,
     tokenizer,

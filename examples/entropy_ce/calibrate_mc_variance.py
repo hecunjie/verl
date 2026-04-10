@@ -20,10 +20,10 @@ from entropy_credit_experiment import (
     _snapshot_and_clear_torchrun_dist_env,
     _restore_torchrun_dist_env,
     build_prompt_text,
-    clamp_vllm_logprobs_topk,
     entropy_from_logprobs_topk,
+    estimate_suffix_return_samples_batched,
     file_sync,
-    generate_rollout_vllm,
+    generate_rollouts_vllm_batched,
     init_dist,
     load_data,
     purge_all_torchrun_like_env_for_vllm_standalone,
@@ -54,41 +54,6 @@ def pick_positions_by_entropy(entropies: list[float], max_positions: int) -> lis
     order = np.argsort(np.array(entropies))
     k = min(max_positions, len(entropies))
     return sorted(int(i) for i in order[-k:].tolist())
-
-
-def estimate_suffix_return_samples(
-    llm: Any,
-    prefix_ids: list[int],
-    m_max: int,
-    max_new_tokens: int,
-    temperature: float,
-    top_p: float,
-    logprobs_k: int,
-    *,
-    m_iter: Any | None = None,
-) -> list[float]:
-    from vllm import SamplingParams
-    from vllm.inputs import TokensPrompt
-    from entropy_credit_experiment import vllm_generate_quiet
-
-    returns: list[float] = []
-    sp = SamplingParams(
-        max_tokens=max_new_tokens,
-        temperature=temperature,
-        top_p=top_p,
-        logprobs=clamp_vllm_logprobs_topk(logprobs_k),
-    )
-    loop = m_iter if m_iter is not None else range(m_max)
-    for _ in loop:
-        out = vllm_generate_quiet(llm, [TokensPrompt(prompt_token_ids=prefix_ids)], sp)
-        o = out[0].outputs[0]
-        step_logprobs = []
-        for step_lp in o.logprobs or []:
-            d = {int(tid): float(info.logprob) for tid, info in step_lp.items()}
-            step_logprobs.append(d)
-        entropies = [entropy_from_logprobs_topk(s) for s in step_logprobs]
-        returns.append(float(sum(entropies)))
-    return returns
 
 
 def summarize_variance_from_samples(samples: list[float], m_grid: list[int]) -> dict[str, Any]:
@@ -135,6 +100,12 @@ def main() -> None:
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top_p", type=float, default=0.95)
     parser.add_argument("--vllm_logprobs_topk", type=int, default=20)
+    parser.add_argument(
+        "--vllm_request_batch_chunk",
+        type=int,
+        default=64,
+        help="每次 llm.generate 最大并发序列数（rollout 与 MC 采样）。",
+    )
     parser.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.9)
     parser.add_argument("--vllm_max_model_len", type=int, default=32768)
     parser.add_argument("--m_grid", type=str, default="2,4,8,12,16")
@@ -158,6 +129,8 @@ def main() -> None:
 
     m_grid = parse_int_list(args.m_grid)
     m_max = m_grid[-1]
+    if int(args.vllm_request_batch_chunk) < 1:
+        raise SystemExit("--vllm_request_batch_chunk must be >= 1.")
 
     vllm_standalone = args.vllm_shard_rank is not None and args.vllm_shard_world_size is not None
     if (args.vllm_shard_rank is None) ^ (args.vllm_shard_world_size is None):
@@ -233,20 +206,26 @@ def main() -> None:
         prompt_text = build_prompt_text(tokenizer, row["prompt"])
         prompt_ids = tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False)["input_ids"][0].tolist()
 
-        rollout_iter = range(args.rollouts_per_prompt)
+        rb_chunk = min(int(args.vllm_request_batch_chunk), int(args.rollouts_per_prompt))
         if use_nested and tqdm is not None:
-            rollout_iter = tqdm(
-                rollout_iter,
-                total=args.rollouts_per_prompt,
-                desc=f"{shard_desc} rollouts",
+            n_rb = (int(args.rollouts_per_prompt) + rb_chunk - 1) // rb_chunk
+            _roll_chunks = tqdm(
+                range(0, int(args.rollouts_per_prompt), rb_chunk),
+                total=n_rb,
+                desc=f"{shard_desc} rollout batches",
                 position=bar_base + 1,
                 leave=False,
                 mininterval=0.2,
                 **_tqdm_kw,
             )
-
-        for rollout_idx in rollout_iter:
-            response_ids, scores = generate_rollout_vllm(
+        else:
+            _roll_chunks = range(0, int(args.rollouts_per_prompt), rb_chunk)
+        rollout_idx = 0
+        for _ in _roll_chunks:
+            bs = min(rb_chunk, int(args.rollouts_per_prompt) - rollout_idx)
+            if bs <= 0:
+                break
+            batch_out = generate_rollouts_vllm_batched(
                 llm=llm,
                 tokenizer=tokenizer,
                 prompt_text=prompt_text,
@@ -254,59 +233,68 @@ def main() -> None:
                 temperature=args.temperature,
                 top_p=args.top_p,
                 logprobs_k=args.vllm_logprobs_topk,
+                n_rollouts=bs,
+                batch_chunk=rb_chunk,
             )
-            if not response_ids:
-                continue
-            entropies = [entropy_from_logprobs_topk(s) for s in scores[: len(response_ids)]]
-            positions = pick_positions_by_entropy(entropies, args.max_positions_per_rollout)
+            for response_ids, scores in batch_out:
+                if not response_ids:
+                    rollout_idx += 1
+                    continue
+                entropies = [entropy_from_logprobs_topk(s) for s in scores[: len(response_ids)]]
+                positions = pick_positions_by_entropy(entropies, args.max_positions_per_rollout)
 
-            pos_iter = positions
-            if use_nested and tqdm is not None:
-                pos_iter = tqdm(
-                    positions,
-                    total=len(positions),
-                    desc=f"{shard_desc} prefixes",
-                    position=bar_base + 2,
-                    leave=False,
-                    mininterval=0.1,
-                    **_tqdm_kw,
-                )
-
-            for pos in pos_iter:
-                # Prefix before token at index pos.
-                prefix_ids = prompt_ids + response_ids[:pos]
-                mc_iter = range(m_max)
+                pos_iter = positions
                 if use_nested and tqdm is not None:
-                    mc_iter = tqdm(
-                        range(m_max),
-                        total=m_max,
-                        desc=f"{shard_desc} MC",
-                        position=bar_base + 3,
+                    pos_iter = tqdm(
+                        positions,
+                        total=len(positions),
+                        desc=f"{shard_desc} prefixes",
+                        position=bar_base + 2,
                         leave=False,
-                        mininterval=0.05,
+                        mininterval=0.1,
                         **_tqdm_kw,
                     )
-                suffix_returns = estimate_suffix_return_samples(
-                    llm=llm,
-                    prefix_ids=prefix_ids,
-                    m_max=m_max,
-                    max_new_tokens=max(1, args.max_new_tokens - pos),
-                    temperature=args.temperature,
-                    top_p=args.top_p,
-                    logprobs_k=args.vllm_logprobs_topk,
-                    m_iter=mc_iter,
-                )
-                stats_by_m = summarize_variance_from_samples(suffix_returns, m_grid)
-                rec = {
-                    "sample_index": global_idx,
-                    "rollout_index": rollout_idx,
-                    "token_index": pos,
-                    "entropy_t": float(entropies[pos]),
-                    "m_grid_stats": stats_by_m,
-                    "recommended_m_local": pick_recommended_m(stats_by_m, m_grid, args.ci95_threshold),
-                }
-                with open(part_path, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+                bc = int(args.vllm_request_batch_chunk)
+                n_mc_chunks = (m_max + bc - 1) // bc
+                for pos in pos_iter:
+                    # Prefix before token at index pos.
+                    prefix_ids = prompt_ids + response_ids[:pos]
+                    chunk_starts = range(0, m_max, bc)
+                    if use_nested and tqdm is not None:
+                        chunk_starts = tqdm(
+                            chunk_starts,
+                            total=n_mc_chunks,
+                            desc=f"{shard_desc} MC batched",
+                            position=bar_base + 3,
+                            leave=False,
+                            mininterval=0.2,
+                            **_tqdm_kw,
+                        )
+                    suffix_returns = estimate_suffix_return_samples_batched(
+                        llm=llm,
+                        prefix_ids=prefix_ids,
+                        m_max=m_max,
+                        max_new_tokens=max(1, args.max_new_tokens - pos),
+                        temperature=args.temperature,
+                        top_p=args.top_p,
+                        logprobs_k=args.vllm_logprobs_topk,
+                        batch_chunk=bc,
+                        chunk_starts_iter=chunk_starts,
+                    )
+                    stats_by_m = summarize_variance_from_samples(suffix_returns, m_grid)
+                    rec = {
+                        "sample_index": global_idx,
+                        "rollout_index": rollout_idx,
+                        "token_index": pos,
+                        "entropy_t": float(entropies[pos]),
+                        "m_grid_stats": stats_by_m,
+                        "recommended_m_local": pick_recommended_m(stats_by_m, m_grid, args.ci95_threshold),
+                    }
+                    with open(part_path, "a", encoding="utf-8") as f:
+                        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+                rollout_idx += 1
 
     file_sync(out_dir=out_dir, rank=rank, world_size=world_size, tag="done_calib")
 
