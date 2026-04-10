@@ -48,11 +48,17 @@ def parse_int_list(text: str) -> list[int]:
     return vals
 
 
-def pick_positions_by_entropy(entropies: list[float], max_positions: int) -> list[int]:
+def pick_top_entropy_positions(entropies: list[float], top_ratio: float, position_cap: int) -> list[int]:
+    """取熵最高的 ``k`` 步，``k = min(position_cap, ceil(len * top_ratio))``（与 analyze_correct_wrong_bias 一致）。"""
     if not entropies:
         return []
+    k_from_ratio = max(1, int(math.ceil(len(entropies) * float(top_ratio))))
+    if position_cap > 0:
+        k = min(int(position_cap), k_from_ratio)
+    else:
+        k = k_from_ratio
+    k = min(k, len(entropies))
     order = np.argsort(np.array(entropies))
-    k = min(max_positions, len(entropies))
     return sorted(int(i) for i in order[-k:].tolist())
 
 
@@ -109,7 +115,18 @@ def main() -> None:
     parser.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.9)
     parser.add_argument("--vllm_max_model_len", type=int, default=32768)
     parser.add_argument("--m_grid", type=str, default="2,4,8,12,16")
-    parser.add_argument("--max_positions_per_rollout", type=int, default=10)
+    parser.add_argument(
+        "--top_entropy_ratio",
+        type=float,
+        default=0.10,
+        help="高熵前缀个数：先取 ceil(ratio * 生成长度)，再与 --max_positions_per_rollout 取 min。",
+    )
+    parser.add_argument(
+        "--max_positions_per_rollout",
+        type=int,
+        default=100,
+        help="高熵位置数上界：实际 k = min(本参数, ceil(top_entropy_ratio * seq_len))。",
+    )
     parser.add_argument("--ci95_threshold", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--vllm_shard_rank", type=int, default=None)
@@ -131,6 +148,10 @@ def main() -> None:
     m_max = m_grid[-1]
     if int(args.vllm_request_batch_chunk) < 1:
         raise SystemExit("--vllm_request_batch_chunk must be >= 1.")
+    if float(args.top_entropy_ratio) <= 0:
+        raise SystemExit("--top_entropy_ratio must be > 0.")
+    if int(args.max_positions_per_rollout) < 1:
+        raise SystemExit("--max_positions_per_rollout must be >= 1.")
 
     vllm_standalone = args.vllm_shard_rank is not None and args.vllm_shard_world_size is not None
     if (args.vllm_shard_rank is None) ^ (args.vllm_shard_world_size is None):
@@ -241,7 +262,9 @@ def main() -> None:
                     rollout_idx += 1
                     continue
                 entropies = [entropy_from_logprobs_topk(s) for s in scores[: len(response_ids)]]
-                positions = pick_positions_by_entropy(entropies, args.max_positions_per_rollout)
+                positions = pick_top_entropy_positions(
+                    entropies, float(args.top_entropy_ratio), int(args.max_positions_per_rollout)
+                )
 
                 pos_iter = positions
                 if use_nested and tqdm is not None:

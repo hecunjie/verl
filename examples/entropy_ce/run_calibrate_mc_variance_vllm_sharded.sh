@@ -5,6 +5,7 @@
 # 嵌套进度（rollout batches→prefixes→MC batched）：PROGRESS_NESTED=1（推荐只看 rank0，否则终端很乱）
 # 关闭：传参 --no_progress 或 export TQDM_DISABLE=1
 # 单次 llm.generate 最大并发序列数（rollout 与 MC）：VLLM_REQUEST_BATCH_CHUNK（默认 64，与 analyze_correct_wrong_bias 一致）
+# 高熵前缀数：k = min(MAX_POSITIONS_PER_ROLLOUT, ceil(TOP_ENTROPY_RATIO * 生成长度))，默认 0.10 与 100 → 即 min(10%*T, 100)
 #
 # 用法（在 VERL 根目录）:
 #   bash examples/entropy_ce/run_calibrate_mc_variance_vllm_sharded.sh
@@ -24,7 +25,8 @@ MAX_SAMPLES="${MAX_SAMPLES:-32}"
 ROLLOUTS_PER_PROMPT="${ROLLOUTS_PER_PROMPT:-8}"
 SEED="${SEED:-42}"
 M_GRID="${M_GRID:-2,4,8,12,16}"
-MAX_POSITIONS_PER_ROLLOUT="${MAX_POSITIONS_PER_ROLLOUT:-10}"
+TOP_ENTROPY_RATIO="${TOP_ENTROPY_RATIO:-0.10}"
+MAX_POSITIONS_PER_ROLLOUT="${MAX_POSITIONS_PER_ROLLOUT:-100}"
 CI95_THRESHOLD="${CI95_THRESHOLD:-1.0}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-256}"
 TEMPERATURE="${TEMPERATURE:-1.0}"
@@ -61,6 +63,7 @@ for ((r = 0; r < NPROC_PER_NODE; r++)); do
     --temperature "${TEMPERATURE}" \
     --top_p "${TOP_P}" \
     --m_grid "${M_GRID}" \
+    --top_entropy_ratio "${TOP_ENTROPY_RATIO}" \
     --max_positions_per_rollout "${MAX_POSITIONS_PER_ROLLOUT}" \
     --ci95_threshold "${CI95_THRESHOLD}" \
     --seed "${SEED}" \
