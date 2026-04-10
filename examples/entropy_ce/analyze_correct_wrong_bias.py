@@ -7,6 +7,7 @@ import math
 import os
 import random
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -224,8 +225,14 @@ def main() -> None:
     )
     parser.add_argument(
         "--progress_nested",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="嵌套 tqdm：rollout → 高熵位置 → 每次 F 估计的 MC（默认开启）。关闭：--no-progress_nested。",
+    )
+    parser.add_argument(
+        "--progress_echo",
         action="store_true",
-        help="Nested tqdm: rollouts → positions → MC samples per F estimate.",
+        help="Rank 0 only: stderr 每处理完一条 prompt 打一行耗时（有 tqdm 时也保留，便于估总时长）。",
     )
     args = parser.parse_args()
     if not (0.0 < float(args.candidate_top_p) <= 1.0):
@@ -299,7 +306,15 @@ def main() -> None:
     use_nested = bool(use_tqdm and args.progress_nested)
     bar_base = (rank * 4) if (use_tqdm and use_nested and args.progress_all_ranks) else (rank if use_tqdm else 0)
     shard_desc = f"shard{rank}"
-    _tqdm_kw = {"file": sys.stderr, "dynamic_ncols": True}
+    _tqdm_bar_fmt = (
+        "{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} "
+        "[{elapsed}<{remaining}, {rate_fmt}]{postfix}"
+    )
+    _tqdm_kw: dict[str, Any] = {
+        "file": sys.stderr,
+        "dynamic_ncols": True,
+        "bar_format": _tqdm_bar_fmt,
+    }
 
     prompt_iter = enumerate(local_rows)
     if use_tqdm:
@@ -309,11 +324,20 @@ def main() -> None:
             desc=f"{shard_desc} prompts",
             position=bar_base,
             leave=True,
-            mininterval=0.5,
+            mininterval=1.0,
             **_tqdm_kw,
         )
 
+    _run_t0 = time.perf_counter()
     for local_i, row in prompt_iter:
+        if rank == 0 and args.progress_echo:
+            gidx = local_i * world_size + rank
+            print(
+                f"[pair_bias] rank0 >>> prompt {local_i + 1}/{len(local_rows)} "
+                f"(global#{gidx}) | cumulative {time.perf_counter() - _run_t0:.0f}s",
+                file=sys.stderr,
+                flush=True,
+            )
         diag["n_prompts"] += 1
         global_idx = local_i * world_size + rank
         prompt_text = build_prompt_text(tokenizer, row["prompt"])

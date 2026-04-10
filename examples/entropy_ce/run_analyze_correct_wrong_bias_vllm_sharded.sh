@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # vLLM + 多卡：每 GPU 一个独立 python 进程。与 run_calibrate_mc_variance_vllm_sharded.sh 用法一致。
 #
-# 默认仅 rank0 显示 tqdm；PROGRESS_ALL_RANKS=1 显示每卡一条
-# 嵌套进度：PROGRESS_NESTED=1（推荐只看 rank0）
-# 关闭：传参 --no_progress 或 export TQDM_DISABLE=1
+# 进度条：
+#   默认 rank0 外层 tqdm + 嵌套 tqdm（rollout / 高熵位置 / MC）；PROGRESS_NESTED=0 可关嵌套（只保留按 prompt 一条杠）
+#   PROGRESS_ALL_RANKS=1：8 卡各一条 tqdm（屏会很乱，一般不推荐）
+#   PROGRESS_ECHO=1：rank0 每进入一条 prompt 在 stderr 打一行累计秒数（便于估总时长）
+# 关闭：--no_progress 或 export TQDM_DISABLE=1
 #
 # 用法（在 VERL 根目录）:
 #   bash examples/entropy_ce/run_analyze_correct_wrong_bias_vllm_sharded.sh
@@ -37,7 +39,8 @@ VLLM_LOGPROBS_TOPK="${VLLM_LOGPROBS_TOPK:-20}"
 VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.9}"
 VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-32768}"
 PROGRESS_ALL_RANKS="${PROGRESS_ALL_RANKS:-0}"
-PROGRESS_NESTED="${PROGRESS_NESTED:-0}"
+PROGRESS_NESTED="${PROGRESS_NESTED:-1}"
+PROGRESS_ECHO="${PROGRESS_ECHO:-0}"
 
 export VLLM_HOST_IP="${VLLM_HOST_IP:-127.0.0.1}"
 unset HOST_IP 2>/dev/null || true
@@ -51,8 +54,11 @@ for ((r = 0; r < NPROC_PER_NODE; r++)); do
   if [ "${PROGRESS_ALL_RANKS}" = "1" ]; then
     EXTRA_ARGS+=(--progress_all_ranks)
   fi
-  if [ "${PROGRESS_NESTED}" = "1" ]; then
-    EXTRA_ARGS+=(--progress_nested)
+  if [ "${PROGRESS_NESTED}" != "1" ]; then
+    EXTRA_ARGS+=(--no-progress_nested)
+  fi
+  if [ "${PROGRESS_ECHO}" = "1" ]; then
+    EXTRA_ARGS+=(--progress_echo)
   fi
   CUDA_VISIBLE_DEVICES="${r}" python3 examples/entropy_ce/analyze_correct_wrong_bias.py \
     --input_data "${INPUT_DATA}" \
