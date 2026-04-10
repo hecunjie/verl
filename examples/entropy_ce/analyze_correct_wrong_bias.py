@@ -96,6 +96,42 @@ def topk_candidates_with_probs(step_logprobs: dict[int, float], k: int) -> tuple
     return tids, [float(x) for x in probs.tolist()]
 
 
+def topp_capped_candidates_with_probs(
+    step_logprobs: dict[int, float],
+    top_p: float,
+    max_k: int,
+) -> tuple[list[int], list[float], dict[str, int]]:
+    """Smallest prefix covering ``top_p`` mass (on dict renormalized), then cap at ``max_k``.
+
+    Mass is computed over **all** tokens returned in ``step_logprobs`` (vLLM truncates to
+    ``logprobs_k``); if the tail is cut off, ``top_p`` is relative to that partial distribution only.
+    """
+    if not step_logprobs:
+        return [], [], {"k_topp": 0, "k_used": 0}
+    items = sorted(step_logprobs.items(), key=lambda x: x[1], reverse=True)
+    tids_all = [int(t) for t, _ in items]
+    lps = np.array([float(v) for _, v in items], dtype=np.float64)
+    m = float(np.max(lps))
+    p_full = np.exp(np.clip(lps - m, -80.0, 0.0))
+    z = float(np.sum(p_full))
+    if z <= 0 or not np.isfinite(z):
+        p_full = np.ones(len(tids_all), dtype=np.float64) / float(len(tids_all))
+    else:
+        p_full = p_full / z
+    cum = np.cumsum(p_full)
+    tp = float(np.clip(top_p, 1e-12, 1.0))
+    idx = int(np.searchsorted(cum, tp, side="left"))
+    k_topp = min(len(p_full), max(1, idx + 1))
+    k_used = min(int(max_k), k_topp)
+    sel_p = p_full[:k_used].copy()
+    z2 = float(np.sum(sel_p))
+    if z2 <= 0 or not np.isfinite(z2):
+        sel_p = np.ones(k_used, dtype=np.float64) / float(max(1, k_used))
+    else:
+        sel_p = sel_p / z2
+    return tids_all[:k_used], [float(x) for x in sel_p.tolist()], {"k_topp": k_topp, "k_used": k_used}
+
+
 def compute_group_stats(values: list[float]) -> dict[str, float]:
     if not values:
         return {"count": 0, "mean": float("nan"), "median": float("nan"), "p25": float("nan"), "p75": float("nan")}
@@ -124,8 +160,32 @@ def main() -> None:
     parser.add_argument("--vllm_max_model_len", type=int, default=32768)
     parser.add_argument("--top_entropy_ratio", type=float, default=0.10)
     parser.add_argument("--max_positions_per_rollout", type=int, default=20)
-    parser.add_argument("--mc_m_samples", type=int, default=4)
-    parser.add_argument("--topk_alt", type=int, default=3)
+    parser.add_argument(
+        "--mc_m_samples",
+        type=int,
+        default=64,
+        help="MC samples per F estimate (suffix entropy sum); higher = lower variance.",
+    )
+    parser.add_argument(
+        "--candidate_mode",
+        choices=["topp", "fixed"],
+        default="topp",
+        help="Alternatives for bar F_t: topp = min(candidate_max_k, smallest k with cum mass>=candidate_top_p) "
+        "on renormalized vLLM logprobs dict; fixed = top-k by logprob with --topk_alt.",
+    )
+    parser.add_argument(
+        "--candidate_top_p",
+        type=float,
+        default=0.9,
+        help="Nucleus mass threshold within the returned logprobs dict (candidate_mode=topp).",
+    )
+    parser.add_argument(
+        "--candidate_max_k",
+        type=int,
+        default=5,
+        help="Max number of alternative tokens (candidate_mode=topp).",
+    )
+    parser.add_argument("--topk_alt", type=int, default=3, help="Top-k alternatives when candidate_mode=fixed.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--vllm_shard_rank", type=int, default=None)
     parser.add_argument("--vllm_shard_world_size", type=int, default=None)
@@ -141,6 +201,12 @@ def main() -> None:
         help="Nested tqdm: rollouts → positions → MC samples per F estimate.",
     )
     args = parser.parse_args()
+    if not (0.0 < float(args.candidate_top_p) <= 1.0):
+        raise SystemExit("--candidate_top_p must be in (0, 1].")
+    if int(args.candidate_max_k) < 1:
+        raise SystemExit("--candidate_max_k must be >= 1.")
+    if args.candidate_mode == "fixed" and int(args.topk_alt) < 1:
+        raise SystemExit("--topk_alt must be >= 1 when candidate_mode=fixed.")
 
     vllm_standalone = args.vllm_shard_rank is not None and args.vllm_shard_world_size is not None
     if (args.vllm_shard_rank is None) ^ (args.vllm_shard_world_size is None):
@@ -285,7 +351,15 @@ def main() -> None:
                 if pos >= len(scores):
                     continue
                 step_lp = scores[pos]
-                tids, probs = topk_candidates_with_probs(step_lp, args.topk_alt)
+                if args.candidate_mode == "fixed":
+                    tids, probs = topk_candidates_with_probs(step_lp, int(args.topk_alt))
+                    cand_meta = {"k_topp": 0, "k_used": len(tids)}
+                else:
+                    tids, probs, cand_meta = topp_capped_candidates_with_probs(
+                        step_lp,
+                        float(args.candidate_top_p),
+                        int(args.candidate_max_k),
+                    )
                 if not tids:
                     continue
 
@@ -345,6 +419,9 @@ def main() -> None:
                     "delta_hat_t": delta_hat,
                     "bias_over_entropy": float(bias_t / (h_t + 1e-8)),
                     "selected_token_id": int(response_ids[pos]),
+                    "candidate_mode": str(args.candidate_mode),
+                    "alt_k_topp": int(cand_meta["k_topp"]),
+                    "alt_k_used": int(cand_meta["k_used"]),
                     "topk_alt_token_ids": [int(t) for t in tids],
                     "topk_alt_probs": [float(p) for p in probs],
                 }

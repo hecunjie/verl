@@ -20,7 +20,11 @@ NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 MAX_SAMPLES="${MAX_SAMPLES:-300}"
 ROLLOUTS_PER_PROMPT="${ROLLOUTS_PER_PROMPT:-8}"
 SEED="${SEED:-42}"
-MC_M_SAMPLES="${MC_M_SAMPLES:-4}"
+MC_M_SAMPLES="${MC_M_SAMPLES:-64}"
+# bar F_t 候选：默认 topp（高熵步自动多取几个，上限 candidate_max_k）；legacy 固定 k 见 CANDIDATE_MODE=fixed
+CANDIDATE_MODE="${CANDIDATE_MODE:-topp}"
+CANDIDATE_TOP_P="${CANDIDATE_TOP_P:-0.9}"
+CANDIDATE_MAX_K="${CANDIDATE_MAX_K:-5}"
 TOPK_ALT="${TOPK_ALT:-3}"
 TOP_ENTROPY_RATIO="${TOP_ENTROPY_RATIO:-0.10}"
 MAX_POSITIONS_PER_ROLLOUT="${MAX_POSITIONS_PER_ROLLOUT:-20}"
@@ -58,6 +62,9 @@ for ((r = 0; r < NPROC_PER_NODE; r++)); do
     --temperature "${TEMPERATURE}" \
     --top_p "${TOP_P}" \
     --mc_m_samples "${MC_M_SAMPLES}" \
+    --candidate_mode "${CANDIDATE_MODE}" \
+    --candidate_top_p "${CANDIDATE_TOP_P}" \
+    --candidate_max_k "${CANDIDATE_MAX_K}" \
     --topk_alt "${TOPK_ALT}" \
     --top_entropy_ratio "${TOP_ENTROPY_RATIO}" \
     --max_positions_per_rollout "${MAX_POSITIONS_PER_ROLLOUT}" \
