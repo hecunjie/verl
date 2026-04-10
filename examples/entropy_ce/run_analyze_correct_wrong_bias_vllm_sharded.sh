@@ -36,6 +36,8 @@ MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-8192}"
 TEMPERATURE="${TEMPERATURE:-1.0}"
 TOP_P="${TOP_P:-0.95}"
 VLLM_LOGPROBS_TOPK="${VLLM_LOGPROBS_TOPK:-20}"
+# 单次 llm.generate 最大并发序列数（rollout 与 MC）；OOM 时改为 8 或 16
+VLLM_REQUEST_BATCH_CHUNK="${VLLM_REQUEST_BATCH_CHUNK:-32}"
 VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.9}"
 VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-32768}"
 PROGRESS_ALL_RANKS="${PROGRESS_ALL_RANKS:-0}"
@@ -78,6 +80,7 @@ for ((r = 0; r < NPROC_PER_NODE; r++)); do
     --max_positions_per_rollout "${MAX_POSITIONS_PER_ROLLOUT}" \
     --seed "${SEED}" \
     --vllm_logprobs_topk "${VLLM_LOGPROBS_TOPK}" \
+    --vllm_request_batch_chunk "${VLLM_REQUEST_BATCH_CHUNK}" \
     --vllm_gpu_memory_utilization "${VLLM_GPU_MEMORY_UTILIZATION}" \
     --vllm_max_model_len "${VLLM_MAX_MODEL_LEN}" \
     --vllm_shard_rank "${r}" \

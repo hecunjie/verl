@@ -20,11 +20,11 @@ from entropy_credit_experiment import (
     _snapshot_and_clear_torchrun_dist_env,
     _restore_torchrun_dist_env,
     build_prompt_text,
-    clamp_vllm_logprobs_topk,
     entropy_from_logprobs_topk,
+    estimate_F_mc_many_prefixes_vllm,
     evaluate_solution_acc,
     file_sync,
-    generate_rollout_vllm,
+    generate_rollouts_vllm_batched,
     init_dist,
     load_data,
     purge_all_torchrun_like_env_for_vllm_standalone,
@@ -65,41 +65,6 @@ def pick_top_entropy_positions(entropies: list[float], top_ratio: float, max_pos
         k = min(k, max_positions)
     order = np.argsort(np.array(entropies))
     return sorted(int(i) for i in order[-k:].tolist())
-
-
-def estimate_F_from_prefix_vllm(
-    llm: Any,
-    prefix_ids: list[int],
-    m_samples: int,
-    max_new_tokens: int,
-    temperature: float,
-    top_p: float,
-    logprobs_k: int,
-    *,
-    m_iter: Any | None = None,
-) -> float:
-    from vllm import SamplingParams
-    from vllm.inputs import TokensPrompt
-    from entropy_credit_experiment import vllm_generate_quiet
-
-    vals = []
-    sp = SamplingParams(
-        max_tokens=max_new_tokens,
-        temperature=temperature,
-        top_p=top_p,
-        logprobs=clamp_vllm_logprobs_topk(logprobs_k),
-    )
-    loop = m_iter if m_iter is not None else range(m_samples)
-    for _ in loop:
-        out = vllm_generate_quiet(llm, [TokensPrompt(prompt_token_ids=prefix_ids)], sp)
-        o = out[0].outputs[0]
-        step_logprobs = []
-        for step_lp in o.logprobs or []:
-            d = {int(tid): float(info.logprob) for tid, info in step_lp.items()}
-            step_logprobs.append(d)
-        entropies = [entropy_from_logprobs_topk(s) for s in step_logprobs]
-        vals.append(float(sum(entropies)))
-    return float(np.mean(vals)) if vals else 0.0
 
 
 def topk_candidates_with_probs(step_logprobs: dict[int, float], k: int) -> tuple[list[int], list[float]]:
@@ -184,6 +149,12 @@ def main() -> None:
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top_p", type=float, default=0.95)
     parser.add_argument("--vllm_logprobs_topk", type=int, default=20)
+    parser.add_argument(
+        "--vllm_request_batch_chunk",
+        type=int,
+        default=32,
+        help="每次 llm.generate 最多并发的序列数（同 prompt 多 rollout、MC 多前缀均按块切分）。显存不够时调小。",
+    )
     parser.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.9)
     parser.add_argument("--vllm_max_model_len", type=int, default=32768)
     parser.add_argument("--top_entropy_ratio", type=float, default=0.10)
@@ -241,6 +212,8 @@ def main() -> None:
         raise SystemExit("--candidate_max_k must be >= 1.")
     if args.candidate_mode == "fixed" and int(args.topk_alt) < 1:
         raise SystemExit("--topk_alt must be >= 1 when candidate_mode=fixed.")
+    if int(args.vllm_request_batch_chunk) < 1:
+        raise SystemExit("--vllm_request_batch_chunk must be >= 1.")
 
     vllm_standalone = args.vllm_shard_rank is not None and args.vllm_shard_world_size is not None
     if (args.vllm_shard_rank is None) ^ (args.vllm_shard_world_size is None):
@@ -348,19 +321,26 @@ def main() -> None:
             diag["n_empty_ground_truth"] += 1
 
         rollouts: list[dict[str, Any]] = []
-        rollout_iter = range(args.rollouts_per_prompt)
+        rb_chunk = min(int(args.vllm_request_batch_chunk), int(args.rollouts_per_prompt))
         if use_nested and tqdm is not None:
-            rollout_iter = tqdm(
-                rollout_iter,
-                total=args.rollouts_per_prompt,
-                desc=f"{shard_desc} rollouts",
+            n_rb = (int(args.rollouts_per_prompt) + rb_chunk - 1) // rb_chunk
+            _roll_chunks = tqdm(
+                range(0, int(args.rollouts_per_prompt), rb_chunk),
+                total=n_rb,
+                desc=f"{shard_desc} rollout batches",
                 position=bar_base + 1,
                 leave=False,
                 mininterval=0.2,
                 **_tqdm_kw,
             )
-        for rollout_idx in rollout_iter:
-            response_ids, scores = generate_rollout_vllm(
+        else:
+            _roll_chunks = range(0, int(args.rollouts_per_prompt), rb_chunk)
+        rollout_idx = 0
+        for _ in _roll_chunks:
+            bs = min(rb_chunk, int(args.rollouts_per_prompt) - rollout_idx)
+            if bs <= 0:
+                break
+            batch_out = generate_rollouts_vllm_batched(
                 llm=llm,
                 tokenizer=tokenizer,
                 prompt_text=prompt_text,
@@ -368,21 +348,28 @@ def main() -> None:
                 temperature=args.temperature,
                 top_p=args.top_p,
                 logprobs_k=args.vllm_logprobs_topk,
+                n_rollouts=bs,
+                batch_chunk=rb_chunk,
             )
-            if not response_ids:
-                continue
-            response_text = tokenizer.decode(response_ids, skip_special_tokens=True)
-            acc, _ = evaluate_solution_acc(data_source=data_source, solution_str=response_text, ground_truth=ground_truth)
-            entropies = [entropy_from_logprobs_topk(s) for s in scores[: len(response_ids)]]
-            rollouts.append(
-                {
-                    "rollout_index": rollout_idx,
-                    "response_ids": response_ids,
-                    "scores": scores,
-                    "entropies": entropies,
-                    "is_correct": bool(acc),
-                }
-            )
+            for response_ids, scores in batch_out:
+                if not response_ids:
+                    rollout_idx += 1
+                    continue
+                response_text = tokenizer.decode(response_ids, skip_special_tokens=True)
+                acc, _ = evaluate_solution_acc(
+                    data_source=data_source, solution_str=response_text, ground_truth=ground_truth
+                )
+                entropies = [entropy_from_logprobs_topk(s) for s in scores[: len(response_ids)]]
+                rollouts.append(
+                    {
+                        "rollout_index": rollout_idx,
+                        "response_ids": response_ids,
+                        "scores": scores,
+                        "entropies": entropies,
+                        "is_correct": bool(acc),
+                    }
+                )
+                rollout_idx += 1
 
         if not rollouts:
             diag["n_skip_all_rollouts_empty"] += 1
@@ -435,47 +422,38 @@ def main() -> None:
                     diag["n_skip_empty_step_lp"] += 1
                     continue
 
-                def _mc_iter() -> Any:
-                    if use_nested and tqdm is not None:
-                        return tqdm(
-                            range(args.mc_m_samples),
-                            total=args.mc_m_samples,
-                            desc=f"{shard_desc} MC",
-                            position=bar_base + 3,
-                            leave=False,
-                            mininterval=0.05,
-                            **_tqdm_kw,
-                        )
-                    return range(args.mc_m_samples)
-
-                # F(x_{<=t}) for actually selected token:
+                mtok = max(1, args.max_new_tokens - pos - 1)
                 prefix_selected = prompt_ids + response_ids[: pos + 1]
-                f_selected = estimate_F_from_prefix_vllm(
-                    llm=llm,
-                    prefix_ids=prefix_selected,
-                    m_samples=args.mc_m_samples,
-                    max_new_tokens=max(1, args.max_new_tokens - pos - 1),
+                prefixes_mc: list[list[int]] = [prefix_selected]
+                for tid in tids:
+                    prefixes_mc.append(prompt_ids + response_ids[:pos] + [int(tid)])
+                bc = int(args.vllm_request_batch_chunk)
+                n_req = len(prefixes_mc) * int(args.mc_m_samples)
+                n_mc_chunks = (n_req + bc - 1) // bc
+                chunk_starts = range(0, n_req, bc)
+                if use_nested and tqdm is not None:
+                    chunk_starts = tqdm(
+                        chunk_starts,
+                        total=n_mc_chunks,
+                        desc=f"{shard_desc} MC batched",
+                        position=bar_base + 3,
+                        leave=False,
+                        mininterval=0.2,
+                        **_tqdm_kw,
+                    )
+                Fs = estimate_F_mc_many_prefixes_vllm(
+                    llm,
+                    prefixes_mc,
+                    int(args.mc_m_samples),
+                    max_new_tokens=mtok,
                     temperature=args.temperature,
                     top_p=args.top_p,
                     logprobs_k=args.vllm_logprobs_topk,
-                    m_iter=_mc_iter(),
+                    batch_chunk=bc,
+                    chunk_starts_iter=chunk_starts,
                 )
-
-                # \bar F_t approx with top-k alternatives
-                f_bar = 0.0
-                for tid, p in zip(tids, probs, strict=False):
-                    prefix_alt = prompt_ids + response_ids[:pos] + [int(tid)]
-                    f_alt = estimate_F_from_prefix_vllm(
-                        llm=llm,
-                        prefix_ids=prefix_alt,
-                        m_samples=args.mc_m_samples,
-                        max_new_tokens=max(1, args.max_new_tokens - pos - 1),
-                        temperature=args.temperature,
-                        top_p=args.top_p,
-                        logprobs_k=args.vllm_logprobs_topk,
-                        m_iter=_mc_iter(),
-                    )
-                    f_bar += float(p) * float(f_alt)
+                f_selected = Fs[0]
+                f_bar = sum(float(pr) * Fs[i + 1] for i, pr in enumerate(probs))
 
                 h_t = float(entropies[pos])
                 bias_t = float(f_bar - f_selected)

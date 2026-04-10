@@ -423,6 +423,119 @@ def vllm_generate_quiet(llm: Any, prompts: list, sampling_params: Any) -> Any:
     return llm.generate(prompts, sampling_params=sampling_params)
 
 
+def completion_entropy_sum_from_vllm_output(o: Any) -> float:
+    """Sum of per-step entropies for one vLLM completion (Method2 / F estimate)."""
+    step_logprobs: list[dict[int, float]] = []
+    for step_lp in o.logprobs or []:
+        d: dict[int, float] = {}
+        for tid, info in step_lp.items():
+            d[int(tid)] = float(info.logprob)
+        step_logprobs.append(d)
+    entropies = [entropy_from_logprobs_topk(s) for s in step_logprobs]
+    return float(sum(entropies))
+
+
+def generate_rollouts_vllm_batched(
+    llm: Any,
+    tokenizer,
+    prompt_text: str,
+    max_new_tokens: int,
+    temperature: float,
+    top_p: float,
+    logprobs_k: int,
+    n_rollouts: int,
+    *,
+    batch_chunk: int = 8,
+) -> list[tuple[list[int], list[dict[int, float]]]]:
+    """``n_rollouts`` independent samples for the same prompt in chunked vLLM batches."""
+    from vllm import SamplingParams
+    from vllm.inputs import TokensPrompt
+
+    if n_rollouts < 1:
+        return []
+    k = clamp_vllm_logprobs_topk(logprobs_k)
+    encoded = tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False)
+    prompt_ids = encoded["input_ids"][0].tolist()
+    sp = SamplingParams(
+        max_tokens=max_new_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        logprobs=k,
+    )
+    out_all: list[tuple[list[int], list[dict[int, float]]]] = []
+    for start in range(0, n_rollouts, batch_chunk):
+        bs = min(batch_chunk, n_rollouts - start)
+        prompts = [TokensPrompt(prompt_token_ids=prompt_ids)] * bs
+        outputs = vllm_generate_quiet(llm, prompts, sp)
+        if len(outputs) != bs:
+            raise RuntimeError(f"vLLM batch size mismatch: expected {bs}, got {len(outputs)}")
+        for i in range(bs):
+            o = outputs[i].outputs[0]
+            gen_ids = list(o.token_ids)
+            logprobs_per_step: list[dict[int, float]] = []
+            for step_lp in o.logprobs or []:
+                d: dict[int, float] = {}
+                for tid, info in step_lp.items():
+                    d[int(tid)] = float(info.logprob)
+                logprobs_per_step.append(d)
+            while len(logprobs_per_step) < len(gen_ids):
+                logprobs_per_step.append({})
+            out_all.append((gen_ids, logprobs_per_step))
+    return out_all
+
+
+def estimate_F_mc_many_prefixes_vllm(
+    llm: Any,
+    prefixes: list[list[int]],
+    m_samples: int,
+    max_new_tokens: int,
+    temperature: float,
+    top_p: float,
+    logprobs_k: int,
+    *,
+    batch_chunk: int = 32,
+    chunk_starts_iter: Any | None = None,
+) -> list[float]:
+    """For each prefix, MC mean of continuation entropy-sum; batched vLLM calls.
+
+    Flat order: prefix[0] repeated ``m_samples`` times, then prefix[1], ...
+    """
+    from vllm import SamplingParams
+    from vllm.inputs import TokensPrompt
+
+    if m_samples < 1 or not prefixes:
+        return [0.0 for _ in prefixes]
+    k = clamp_vllm_logprobs_topk(logprobs_k)
+    sp = SamplingParams(
+        max_tokens=max_new_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        logprobs=k,
+    )
+    flat_prompts: list[TokensPrompt] = []
+    flat_pref_idx: list[int] = []
+    for pi, pref in enumerate(prefixes):
+        for _ in range(m_samples):
+            flat_prompts.append(TokensPrompt(prompt_token_ids=pref))
+            flat_pref_idx.append(pi)
+    n_total = len(flat_prompts)
+    per_pref: list[list[float]] = [[] for _ in range(len(prefixes))]
+    if chunk_starts_iter is None:
+        chunk_starts_iter = range(0, n_total, batch_chunk)
+    for start in chunk_starts_iter:
+        end = min(start + batch_chunk, n_total)
+        chunk_prompts = flat_prompts[start:end]
+        chunk_pi = flat_pref_idx[start:end]
+        outputs = vllm_generate_quiet(llm, chunk_prompts, sp)
+        if len(outputs) != len(chunk_prompts):
+            raise RuntimeError(f"vLLM batch size mismatch: expected {len(chunk_prompts)}, got {len(outputs)}")
+        for j, out_req in enumerate(outputs):
+            o = out_req.outputs[0]
+            val = completion_entropy_sum_from_vllm_output(o)
+            per_pref[chunk_pi[j]].append(val)
+    return [float(np.mean(xs)) if xs else 0.0 for xs in per_pref]
+
+
 def generate_rollout_vllm(
     llm: Any,
     tokenizer,
