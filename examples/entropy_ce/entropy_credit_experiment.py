@@ -329,10 +329,13 @@ def extract_acc(result: Any) -> bool:
 
 
 def evaluate_solution_acc(data_source: str, solution_str: str, ground_truth: str) -> tuple[bool, dict[str, Any]]:
-    """Evaluate correctness with math_dapo boxed-answer logic for math-like sources."""
+    """Evaluate correctness with math_dapo for math-like sources.
+
+    Uses ``strict_box_verify=False`` (Minerva-style), matching ``default_compute_score`` / RL training.
+    """
     if data_source in {"math_dapo", "math", "math_dapo_reasoning"} or data_source.startswith("aime"):
-        res = math_dapo_score.compute_score(solution_str, ground_truth, strict_box_verify=True)
-        return bool(res.get("acc", False)), {"mode": "math_dapo_strict_box", **res}
+        res = math_dapo_score.compute_score(solution_str, ground_truth, strict_box_verify=False)
+        return bool(res.get("acc", False)), {"mode": "math_dapo_minerva", **res}
 
     res = default_compute_score(data_source=data_source, solution_str=solution_str, ground_truth=ground_truth)
     return extract_acc(res), {"mode": "default_compute_score", "raw_result": res}

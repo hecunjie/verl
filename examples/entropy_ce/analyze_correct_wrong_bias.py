@@ -35,6 +35,27 @@ except ImportError:  # pragma: no cover
     tqdm = None  # type: ignore[misc, assignment]
 
 
+def _ground_truth_from_row(row: dict[str, Any]) -> str:
+    """VERL parquet usually has ``reward_model.ground_truth`` (dict). GRPO exports may store
+    ``reward_model`` as a JSON string or use ``label`` — empty GT makes every rollout look wrong.
+    """
+    rm = row.get("reward_model")
+    if isinstance(rm, dict) and rm.get("ground_truth") is not None:
+        return str(rm["ground_truth"])
+    if isinstance(rm, str) and rm.strip():
+        try:
+            obj = json.loads(rm)
+            if isinstance(obj, dict) and obj.get("ground_truth") is not None:
+                return str(obj["ground_truth"])
+        except json.JSONDecodeError:
+            pass
+    if row.get("label") is not None:
+        if isinstance(row["label"], list) and len(row["label"]) == 1:
+            return str(row["label"][0])
+        return str(row["label"])
+    return ""
+
+
 def pick_top_entropy_positions(entropies: list[float], top_ratio: float, max_positions: int) -> list[int]:
     if not entropies:
         return []
@@ -252,6 +273,16 @@ def main() -> None:
     with open(part_path, "w", encoding="utf-8"):
         pass
 
+    diag: dict[str, int] = {
+        "n_prompts": 0,
+        "n_empty_ground_truth": 0,
+        "n_skip_all_rollouts_empty": 0,
+        "n_skip_no_mixed": 0,
+        "n_mixed_pairs_ok": 0,
+        "n_skip_empty_step_lp": 0,
+        "n_jsonl_lines": 0,
+    }
+
     rows = load_data(args.input_data, args.max_samples, args.seed)
     local_rows = [row for idx, row in enumerate(rows) if idx % world_size == rank]
 
@@ -277,11 +308,14 @@ def main() -> None:
         )
 
     for local_i, row in prompt_iter:
+        diag["n_prompts"] += 1
         global_idx = local_i * world_size + rank
         prompt_text = build_prompt_text(tokenizer, row["prompt"])
         prompt_ids = tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False)["input_ids"][0].tolist()
         data_source = row.get("data_source", "math_dapo")
-        ground_truth = str((row.get("reward_model") or {}).get("ground_truth", ""))
+        ground_truth = _ground_truth_from_row(row)
+        if not str(ground_truth).strip():
+            diag["n_empty_ground_truth"] += 1
 
         rollouts: list[dict[str, Any]] = []
         rollout_iter = range(args.rollouts_per_prompt)
@@ -320,10 +354,17 @@ def main() -> None:
                 }
             )
 
+        if not rollouts:
+            diag["n_skip_all_rollouts_empty"] += 1
+            continue
+
         correct = [r for r in rollouts if r["is_correct"]]
         wrong = [r for r in rollouts if not r["is_correct"]]
         if not correct or not wrong:
+            diag["n_skip_no_mixed"] += 1
             continue
+
+        diag["n_mixed_pairs_ok"] += 1
 
         # Deterministic selection: median-length candidate per group.
         def select_median_length(items: list[dict[str, Any]]) -> dict[str, Any]:
@@ -361,6 +402,7 @@ def main() -> None:
                         int(args.candidate_max_k),
                     )
                 if not tids:
+                    diag["n_skip_empty_step_lp"] += 1
                     continue
 
                 def _mc_iter() -> Any:
@@ -427,6 +469,13 @@ def main() -> None:
                 }
                 with open(part_path, "a", encoding="utf-8") as f:
                     f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                    diag["n_jsonl_lines"] += 1
+
+    diag_path = out_dir / f"pair_bias_diag_rank{rank}.json"
+    diag["rank"] = rank
+    diag["world_size"] = world_size
+    with open(diag_path, "w", encoding="utf-8") as f:
+        json.dump(diag, f, ensure_ascii=False, indent=2)
 
     file_sync(out_dir=out_dir, rank=rank, world_size=world_size, tag="done_pair")
 
@@ -462,6 +511,33 @@ def main() -> None:
         with open(out_dir / "pair_bias_summary.json", "w", encoding="utf-8") as f:
             json.dump(summary, f, ensure_ascii=False, indent=2)
         print(json.dumps(summary, ensure_ascii=False, indent=2))
+
+        diag_merged: dict[str, int] = {}
+        for r in range(world_size):
+            dp = out_dir / f"pair_bias_diag_rank{r}.json"
+            if not dp.exists():
+                continue
+            with open(dp, encoding="utf-8") as f:
+                d = json.load(f)
+            for k, v in d.items():
+                if isinstance(v, bool) or k in ("rank", "world_size"):
+                    continue
+                if isinstance(v, (int, float)):
+                    diag_merged[k] = diag_merged.get(k, 0) + int(v)
+        if diag_merged:
+            with open(out_dir / "pair_bias_diag_merged.json", "w", encoding="utf-8") as f:
+                json.dump(diag_merged, f, ensure_ascii=False, indent=2)
+            print(json.dumps({"pair_bias_diag_merged": diag_merged}, ensure_ascii=False, indent=2))
+
+        if not merged:
+            print(
+                "[pair_bias] num_records=0: 请看 OUTPUT_DIR 下 pair_bias_diag_merged.json（各 rank 计数之和）。"
+                " n_empty_ground_truth>0 表示 parquet 里没读到 GT（常见于 reward_model 为 JSON 字符串或字段名不同）；"
+                " n_skip_no_mixed 高表示 8 条 rollout 从未同时对错；n_skip_all_rollouts_empty 表示 vLLM 未生成 token；"
+                " n_skip_empty_step_lp 表示过了对错配对但高熵步无 logprobs。",
+                file=sys.stderr,
+                flush=True,
+            )
 
 
 if __name__ == "__main__":
