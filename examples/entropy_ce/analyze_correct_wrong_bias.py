@@ -20,6 +20,7 @@ from entropy_credit_experiment import (
     _snapshot_and_clear_torchrun_dist_env,
     _restore_torchrun_dist_env,
     build_prompt_text,
+    build_token_context,
     entropy_from_logprobs_topk,
     estimate_F_mc_many_prefixes_vllm,
     evaluate_solution_acc,
@@ -57,12 +58,15 @@ def _ground_truth_from_row(row: dict[str, Any]) -> str:
     return ""
 
 
-def pick_top_entropy_positions(entropies: list[float], top_ratio: float, max_positions: int) -> list[int]:
+def pick_top_entropy_positions(entropies: list[float], top_ratio: float, position_cap: int) -> list[int]:
+    """Take the ``k`` highest-entropy steps with ``k = min(position_cap, ceil(len * top_ratio))`` (at least 1)."""
     if not entropies:
         return []
-    k = max(1, int(math.ceil(len(entropies) * top_ratio)))
-    if max_positions > 0:
-        k = min(k, max_positions)
+    k_from_ratio = max(1, int(math.ceil(len(entropies) * float(top_ratio))))
+    if position_cap > 0:
+        k = min(int(position_cap), k_from_ratio)
+    else:
+        k = k_from_ratio
     order = np.argsort(np.array(entropies))
     return sorted(int(i) for i in order[-k:].tolist())
 
@@ -152,13 +156,40 @@ def main() -> None:
     parser.add_argument(
         "--vllm_request_batch_chunk",
         type=int,
-        default=32,
-        help="每次 llm.generate 最多并发的序列数（同 prompt 多 rollout、MC 多前缀均按块切分）。显存不够时调小。",
+        default=64,
+        help="每次 llm.generate 最多并发的序列数（rollout 与 MC）。显存不够时调小。",
     )
     parser.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.9)
     parser.add_argument("--vllm_max_model_len", type=int, default=32768)
-    parser.add_argument("--top_entropy_ratio", type=float, default=0.10)
-    parser.add_argument("--max_positions_per_rollout", type=int, default=20)
+    parser.add_argument(
+        "--top_entropy_ratio",
+        type=float,
+        default=0.10,
+        help="High-entropy position count uses ceil(ratio * response_length) before cap.",
+    )
+    parser.add_argument(
+        "--max_positions_per_rollout",
+        type=int,
+        default=500,
+        help="Upper cap: number of positions = min(this, ceil(top_entropy_ratio * seq_len)).",
+    )
+    parser.add_argument(
+        "--context_window_tokens",
+        type=int,
+        default=64,
+        help="Half-window (tokens) for context_left/right text around branch token in per-line records.",
+    )
+    parser.add_argument(
+        "--per_sample_jsonl_subdir",
+        type=str,
+        default="per_sample",
+        help="Under output_dir, one sample_{global_idx:06d}.jsonl per prompt (all positions/groups append).",
+    )
+    parser.add_argument(
+        "--no_per_sample_jsonl",
+        action="store_true",
+        help="Do not write per-sample jsonl files (only pair_bias_rank*.jsonl).",
+    )
     parser.add_argument(
         "--mc_m_samples",
         type=int,
@@ -214,6 +245,10 @@ def main() -> None:
         raise SystemExit("--topk_alt must be >= 1 when candidate_mode=fixed.")
     if int(args.vllm_request_batch_chunk) < 1:
         raise SystemExit("--vllm_request_batch_chunk must be >= 1.")
+    if int(args.max_positions_per_rollout) < 1:
+        raise SystemExit("--max_positions_per_rollout must be >= 1 (use large value e.g. 500 for cap).")
+    if int(args.context_window_tokens) < 0:
+        raise SystemExit("--context_window_tokens must be >= 0.")
 
     vllm_standalone = args.vllm_shard_rank is not None and args.vllm_shard_world_size is not None
     if (args.vllm_shard_rank is None) ^ (args.vllm_shard_world_size is None):
@@ -255,6 +290,10 @@ def main() -> None:
 
     out_dir = Path(args.output_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+    per_sample_dir: Path | None = None
+    if not args.no_per_sample_jsonl:
+        per_sample_dir = out_dir / str(args.per_sample_jsonl_subdir).strip().replace("..", "_")
+        per_sample_dir.mkdir(parents=True, exist_ok=True)
     part_path = out_dir / f"pair_bias_rank{rank}.jsonl"
     with open(part_path, "w", encoding="utf-8"):
         pass
@@ -302,17 +341,20 @@ def main() -> None:
         )
 
     _run_t0 = time.perf_counter()
+    _per_sample_cleared: set[int] = set()
     for local_i, row in prompt_iter:
+        diag["n_prompts"] += 1
+        global_idx = local_i * world_size + rank
+        if per_sample_dir is not None and global_idx not in _per_sample_cleared:
+            (per_sample_dir / f"sample_{global_idx:06d}.jsonl").unlink(missing_ok=True)
+            _per_sample_cleared.add(global_idx)
         if rank == 0 and args.progress_echo:
-            gidx = local_i * world_size + rank
             print(
                 f"[pair_bias] rank0 >>> prompt {local_i + 1}/{len(local_rows)} "
-                f"(global#{gidx}) | cumulative {time.perf_counter() - _run_t0:.0f}s",
+                f"(global#{global_idx}) | cumulative {time.perf_counter() - _run_t0:.0f}s",
                 file=sys.stderr,
                 flush=True,
             )
-        diag["n_prompts"] += 1
-        global_idx = local_i * world_size + rank
         prompt_text = build_prompt_text(tokenizer, row["prompt"])
         prompt_ids = tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False)["input_ids"][0].tolist()
         data_source = row.get("data_source", "math_dapo")
@@ -393,7 +435,10 @@ def main() -> None:
             entropies = rr["entropies"]
             response_ids = rr["response_ids"]
             scores = rr["scores"]
-            positions = pick_top_entropy_positions(entropies, args.top_entropy_ratio, args.max_positions_per_rollout)
+            positions = pick_top_entropy_positions(
+                entropies, float(args.top_entropy_ratio), int(args.max_positions_per_rollout)
+            )
+            n_pos_pick = len(positions)
             pos_iter = positions
             if use_nested and tqdm is not None:
                 pos_iter = tqdm(
@@ -454,30 +499,66 @@ def main() -> None:
                 )
                 f_selected = Fs[0]
                 f_bar = sum(float(pr) * Fs[i + 1] for i, pr in enumerate(probs))
+                f_alt_mcs = [float(Fs[i + 1]) for i in range(len(tids))]
 
                 h_t = float(entropies[pos])
                 bias_t = float(f_bar - f_selected)
                 delta_hat = float(h_t + bias_t)
 
+                ctx = build_token_context(
+                    tokenizer, response_ids, int(pos), int(args.context_window_tokens)
+                )
+                alt_candidates: list[dict[str, Any]] = []
+                for i, (tid, pr) in enumerate(zip(tids, probs, strict=False)):
+                    tid_i = int(tid)
+                    alt_candidates.append(
+                        {
+                            "token_id": tid_i,
+                            "prob": float(pr),
+                            "token_text": tokenizer.decode([tid_i], skip_special_tokens=True),
+                            "f_mc": float(f_alt_mcs[i]),
+                        }
+                    )
+
                 rec = {
                     "sample_index": global_idx,
+                    "shard_rank": rank,
                     "group": group_name,
                     "rollout_index": rr["rollout_index"],
                     "token_index": int(pos),
                     "entropy_t": h_t,
+                    "bar_F_t": float(f_bar),
+                    "F_selected_mc": float(f_selected),
+                    "f_alt_mc": f_alt_mcs,
                     "bias_t": bias_t,
                     "delta_hat_t": delta_hat,
                     "bias_over_entropy": float(bias_t / (h_t + 1e-8)),
                     "selected_token_id": int(response_ids[pos]),
+                    "selected_token_text": tokenizer.decode(
+                        [response_ids[pos]], skip_special_tokens=True
+                    ),
                     "candidate_mode": str(args.candidate_mode),
                     "alt_k_topp": int(cand_meta["k_topp"]),
                     "alt_k_used": int(cand_meta["k_used"]),
                     "topk_alt_token_ids": [int(t) for t in tids],
                     "topk_alt_probs": [float(p) for p in probs],
+                    "alt_candidates": alt_candidates,
+                    "context": ctx,
+                    "rollout_response_length": len(response_ids),
+                    "num_picked_entropy_positions": int(n_pos_pick),
+                    "mc_m_samples": int(args.mc_m_samples),
+                    "vllm_request_batch_chunk": int(args.vllm_request_batch_chunk),
+                    "data_source": data_source,
+                    "ground_truth": ground_truth,
+                    "prompt_text": prompt_text,
                 }
                 with open(part_path, "a", encoding="utf-8") as f:
                     f.write(json.dumps(rec, ensure_ascii=False) + "\n")
                     diag["n_jsonl_lines"] += 1
+                if per_sample_dir is not None:
+                    spath = per_sample_dir / f"sample_{global_idx:06d}.jsonl"
+                    with open(spath, "a", encoding="utf-8") as f:
+                        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
     diag_path = out_dir / f"pair_bias_diag_rank{rank}.json"
     diag["rank"] = rank
@@ -519,6 +600,13 @@ def main() -> None:
         with open(out_dir / "pair_bias_summary.json", "w", encoding="utf-8") as f:
             json.dump(summary, f, ensure_ascii=False, indent=2)
         print(json.dumps(summary, ensure_ascii=False, indent=2))
+        if not args.no_per_sample_jsonl:
+            _psd = out_dir / str(args.per_sample_jsonl_subdir).strip().replace("..", "_")
+            print(
+                f"[pair_bias] per-sample jsonl 目录: {_psd} (sample_XXXXXX.jsonl，每行一个 position×group)",
+                file=sys.stderr,
+                flush=True,
+            )
 
         diag_merged: dict[str, int] = {}
         for r in range(world_size):

@@ -29,7 +29,8 @@ CANDIDATE_TOP_P="${CANDIDATE_TOP_P:-0.9}"
 CANDIDATE_MAX_K="${CANDIDATE_MAX_K:-5}"
 TOPK_ALT="${TOPK_ALT:-3}"
 TOP_ENTROPY_RATIO="${TOP_ENTROPY_RATIO:-0.10}"
-MAX_POSITIONS_PER_ROLLOUT="${MAX_POSITIONS_PER_ROLLOUT:-20}"
+# 高熵位置数 = min(本值, ceil(TOP_ENTROPY_RATIO * 序列长度))
+MAX_POSITIONS_PER_ROLLOUT="${MAX_POSITIONS_PER_ROLLOUT:-500}"
 # 与 examples/grpo_trainer/run_grpo_r1_distill_7b_dapo_data.sh 中 data.max_response_length 对齐；
 # R1/Distill 长 CoT 若仍用 256，常在未写出 \\boxed{} 前截断 → 8 条 rollout 同判错 → n_skip_no_mixed 饱和。
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-8192}"
@@ -37,12 +38,15 @@ TEMPERATURE="${TEMPERATURE:-1.0}"
 TOP_P="${TOP_P:-0.95}"
 VLLM_LOGPROBS_TOPK="${VLLM_LOGPROBS_TOPK:-20}"
 # 单次 llm.generate 最大并发序列数（rollout 与 MC）；OOM 时改为 8 或 16
-VLLM_REQUEST_BATCH_CHUNK="${VLLM_REQUEST_BATCH_CHUNK:-32}"
+VLLM_REQUEST_BATCH_CHUNK="${VLLM_REQUEST_BATCH_CHUNK:-64}"
 VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.9}"
 VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-32768}"
 PROGRESS_ALL_RANKS="${PROGRESS_ALL_RANKS:-0}"
 PROGRESS_NESTED="${PROGRESS_NESTED:-1}"
 PROGRESS_ECHO="${PROGRESS_ECHO:-0}"
+CONTEXT_WINDOW_TOKENS="${CONTEXT_WINDOW_TOKENS:-64}"
+PER_SAMPLE_JSONL_SUBDIR="${PER_SAMPLE_JSONL_SUBDIR:-per_sample}"
+NO_PER_SAMPLE_JSONL="${NO_PER_SAMPLE_JSONL:-0}"
 
 export VLLM_HOST_IP="${VLLM_HOST_IP:-127.0.0.1}"
 unset HOST_IP 2>/dev/null || true
@@ -62,6 +66,9 @@ for ((r = 0; r < NPROC_PER_NODE; r++)); do
   if [ "${PROGRESS_ECHO}" = "1" ]; then
     EXTRA_ARGS+=(--progress_echo)
   fi
+  if [ "${NO_PER_SAMPLE_JSONL}" = "1" ]; then
+    EXTRA_ARGS+=(--no_per_sample_jsonl)
+  fi
   CUDA_VISIBLE_DEVICES="${r}" python3 examples/entropy_ce/analyze_correct_wrong_bias.py \
     --input_data "${INPUT_DATA}" \
     --model_path "${MODEL_PATH}" \
@@ -78,6 +85,8 @@ for ((r = 0; r < NPROC_PER_NODE; r++)); do
     --topk_alt "${TOPK_ALT}" \
     --top_entropy_ratio "${TOP_ENTROPY_RATIO}" \
     --max_positions_per_rollout "${MAX_POSITIONS_PER_ROLLOUT}" \
+    --context_window_tokens "${CONTEXT_WINDOW_TOKENS}" \
+    --per_sample_jsonl_subdir "${PER_SAMPLE_JSONL_SUBDIR}" \
     --seed "${SEED}" \
     --vllm_logprobs_topk "${VLLM_LOGPROBS_TOPK}" \
     --vllm_request_batch_chunk "${VLLM_REQUEST_BATCH_CHUNK}" \
