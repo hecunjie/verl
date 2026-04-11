@@ -1,4 +1,4 @@
-"""按「第一句结束」截断续写：避免把英文小数点当句末。
+"""按「第一句结束」截断续写：避免把英文小数点当句末；若文首方向先出现 ``\\n\\n`` 再出现首个有效英文 ``.``，则以 ``\\n\\n`` 为界，否则英文句号仍是一见到有效句点就停。
 
 vLLM 的 ``SamplingParams(stop=...)`` 只能做子串匹配，无法区分 ``3.14`` 与句末 ``.``。
 
@@ -77,6 +77,67 @@ def _ends_with_english_sentence_punct_simple(s: str) -> bool:
     return True
 
 
+def _first_paragraph_break_end(s: str) -> int | None:
+    """首个 ``\\n\\n`` 之后一位的索引（exclusive end）；无则 ``None``。"""
+    p = s.find("\n\n")
+    if p < 0:
+        return None
+    return p + 2
+
+
+def _first_chinese_sentence_punct_end(s: str) -> int | None:
+    for i, ch in enumerate(s):
+        if ch in "。！？":
+            return i + 1
+    return None
+
+
+def _first_english_bang_question_end(s: str) -> int | None:
+    """首个 ``!`` / ``?``（跳过下标 0，避免 ``!Hello`` 类开头误断）。"""
+    for i, ch in enumerate(s):
+        if ch not in "!?":
+            continue
+        if i == 0:
+            continue
+        return i + 1
+    return None
+
+
+def _first_valid_sentence_period_end(s: str) -> int | None:
+    """从左到右第一个可作为句末的 ``.``（小数启发式排除）。"""
+    for i, ch in enumerate(s):
+        if ch != ".":
+            continue
+        prefix = s[: i + 1]
+        p2 = prefix.rstrip()
+        if not p2.endswith("."):
+            continue
+        if _likely_decimal_or_incomplete_number_at_end(p2):
+            continue
+        return i + 1
+    return None
+
+
+def _first_sentence_boundary_end_exclusive(s: str) -> int | None:
+    """首句结束位置（exclusive）：在全文从左到右取最早出现的断点（``\\n\\n``、中文句末、``!?``、有效 ``.`` 中取最小下标）。"""
+    cands: list[int] = []
+    e = _first_paragraph_break_end(s)
+    if e is not None:
+        cands.append(e)
+    e = _first_chinese_sentence_punct_end(s)
+    if e is not None:
+        cands.append(e)
+    e = _first_english_bang_question_end(s)
+    if e is not None:
+        cands.append(e)
+    e = _first_valid_sentence_period_end(s)
+    if e is not None:
+        cands.append(e)
+    if not cands:
+        return None
+    return min(cands)
+
+
 def _segment_with_pysbd(text: str, language: str = "en") -> list[str]:
     try:
         import pysbd  # type: ignore[import-untyped]
@@ -104,13 +165,21 @@ def completion_should_stop_after_first_sentence_simple(
     *,
     min_chars: int = 2,
 ) -> bool:
-    """默认停止条件：中文 ``。！？``；英文 ``.!?`` + 小数末尾启发式（不依赖 pysbd）。"""
+    """默认停止条件：在续写串中从左到右找**最早**的断点——``\\n\\n``、中文 ``。！？``、英文 ``!?``、
+    或小数启发式下的首个有效英文 ``.``；当前缀长度已达到该断点之后即停。
+
+    因此：若首个 ``\\n\\n`` 出现在首个有效英文句号**之前**，首句在 ``\\n\\n`` 处结束；若句号更靠前，
+    则仍是「一碰到有效句点就停」。
+    """
     t = completion_text
     if len(t.strip()) < min_chars:
         return False
-    if _ends_with_chinese_sentence_punct(t):
-        return True
-    return _ends_with_english_sentence_punct_simple(t)
+    end = _first_sentence_boundary_end_exclusive(t)
+    if end is None:
+        return False
+    if len(t) < end:
+        return False
+    return True
 
 
 def make_pysbd_first_sentence_stop_check(
@@ -131,7 +200,7 @@ def make_pysbd_first_sentence_stop_check(
             return True
         sents = _segment_with_pysbd(t, language)
         if not sents:
-            return _ends_with_english_sentence_punct_simple(t)
+            return completion_should_stop_after_first_sentence_simple(t, min_chars=min_chars)
         first = sents[0].strip()
         if len(first) < min_chars:
             return False
@@ -144,7 +213,7 @@ def make_pysbd_first_sentence_stop_check(
         # 或整体已以句末标点结束且 pysbd 切出首句（长 CoT 首句可能很长）
         if ts.endswith(first[-1]) and first in ts:
             return len(sents) == 1 or len(ts) >= len(first)
-        return _ends_with_english_sentence_punct_simple(t)
+        return completion_should_stop_after_first_sentence_simple(t, min_chars=min_chars)
 
     return stop_check
 
