@@ -495,10 +495,19 @@ def estimate_F_mc_many_prefixes_vllm(
     *,
     batch_chunk: int = 32,
     chunk_starts_iter: Any | None = None,
+    f_continuation_mode: str = "full",
+    tokenizer: Any | None = None,
+    sentence_chunk_max_tokens: int = 48,
+    flat_progress_iter: Any | None = None,
+    sentence_stop_check: Any | None = None,
 ) -> list[float]:
     """For each prefix, MC mean of continuation entropy-sum; batched vLLM calls.
 
     Flat order: prefix[0] repeated ``m_samples`` times, then prefix[1], ...
+
+    ``f_continuation_mode="first_sentence"`` uses chunked decode + custom stop (see
+    ``sentence_stop_utils``); much slower than ``full`` but caps F at ~first sentence.
+    Pass ``tokenizer`` and optionally ``sentence_stop_check`` / ``flat_progress_iter``.
     """
     from vllm import SamplingParams
     from vllm.inputs import TokensPrompt
@@ -506,6 +515,46 @@ def estimate_F_mc_many_prefixes_vllm(
     if m_samples < 1 or not prefixes:
         return [0.0 for _ in prefixes]
     k = clamp_vllm_logprobs_topk(logprobs_k)
+
+    if f_continuation_mode == "first_sentence":
+        if tokenizer is None:
+            raise ValueError("tokenizer is required when f_continuation_mode='first_sentence'")
+        from sentence_stop_utils import (
+            completion_should_stop_after_first_sentence_simple,
+            generate_until_sentence_boundary_vllm,
+        )
+
+        stop_fn = sentence_stop_check or completion_should_stop_after_first_sentence_simple
+        pairs: list[tuple[int, list[int]]] = []
+        for pi, pref in enumerate(prefixes):
+            for _ in range(m_samples):
+                pairs.append((pi, pref))
+
+        def sp_factory(chunk: int) -> Any:
+            return SamplingParams(
+                max_tokens=chunk,
+                temperature=temperature,
+                top_p=top_p,
+                logprobs=k,
+            )
+
+        per_pref: list[list[float]] = [[] for _ in range(len(prefixes))]
+        loop = flat_progress_iter if flat_progress_iter is not None else range(len(pairs))
+        for j in loop:
+            pi, pref = pairs[j]
+            _gen_ids, logprobs_per_step, _sent_done = generate_until_sentence_boundary_vllm(
+                llm,
+                tokenizer,
+                pref,
+                sp_factory,
+                chunk_max_tokens=int(sentence_chunk_max_tokens),
+                max_total_new_tokens=int(max_new_tokens),
+                stop_check=stop_fn,
+            )
+            entropies = [entropy_from_logprobs_topk(s) for s in logprobs_per_step]
+            per_pref[pi].append(float(sum(entropies)))
+        return [float(np.mean(xs)) if xs else 0.0 for xs in per_pref]
+
     sp = SamplingParams(
         max_tokens=max_new_tokens,
         temperature=temperature,
