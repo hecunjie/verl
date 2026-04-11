@@ -425,6 +425,12 @@ def vllm_generate_quiet(llm: Any, prompts: list, sampling_params: Any) -> Any:
 
 def completion_entropy_sum_from_vllm_output(o: Any) -> float:
     """Sum of per-step entropies for one vLLM completion (Method2 / F estimate)."""
+    s, _n = completion_entropy_sum_and_len_from_vllm_output(o)
+    return float(s)
+
+
+def completion_entropy_sum_and_len_from_vllm_output(o: Any) -> tuple[float, int]:
+    """``(sum of per-step entropies, number of steps with logprobs)`` for one vLLM completion."""
     step_logprobs: list[dict[int, float]] = []
     for step_lp in o.logprobs or []:
         d: dict[int, float] = {}
@@ -432,7 +438,8 @@ def completion_entropy_sum_from_vllm_output(o: Any) -> float:
             d[int(tid)] = float(info.logprob)
         step_logprobs.append(d)
     entropies = [entropy_from_logprobs_topk(s) for s in step_logprobs]
-    return float(sum(entropies))
+    n = len(entropies)
+    return float(sum(entropies)), max(n, 1)
 
 
 def generate_rollouts_vllm_batched(
@@ -499,8 +506,9 @@ def estimate_F_mc_many_prefixes_vllm(
     tokenizer: Any | None = None,
     f_sentence_max_new_tokens: int = 256,
     sentence_stop_check: Any | None = None,
+    normalize_by_continuation_length: bool = False,
 ) -> list[float]:
-    """For each prefix, MC mean of continuation entropy-sum; batched vLLM calls.
+    """For each prefix, MC mean of continuation entropy-sum (or entropy-rate); batched vLLM calls.
 
     Flat order: prefix[0] repeated ``m_samples`` times, then prefix[1], ...
 
@@ -509,6 +517,10 @@ def estimate_F_mc_many_prefixes_vllm(
     first sentence in **token space** (``sentence_stop_utils.truncate_gen_ids_to_first_sentence``)
     and sum entropies only over kept steps — same batching as ``full``, much faster than chunked stop.
     Requires ``tokenizer``.
+
+    ``normalize_by_continuation_length=True`` (方案 1): each sample uses
+    ``(sum of step entropies) / (number of continuation steps)``, i.e. mean per-token entropy
+    (nats/token), then MC-average — comparable in scale to branch ``h_t``.
     """
     from vllm import SamplingParams
     from vllm.inputs import TokensPrompt
@@ -569,9 +581,15 @@ def estimate_F_mc_many_prefixes_vllm(
                 while len(step_lps) < len(gen_ids):
                     step_lps.append({})
                 keep_k = truncate_gen_ids_to_first_sentence(gen_ids, tokenizer, stop_fn)
-                val = float(sum(entropy_from_logprobs_topk(step_lps[i]) for i in range(keep_k)))
+                raw_sum = float(sum(entropy_from_logprobs_topk(step_lps[i]) for i in range(keep_k)))
+                denom = max(int(keep_k), 1)
+                val = raw_sum / float(denom) if normalize_by_continuation_length else raw_sum
             else:
-                val = completion_entropy_sum_from_vllm_output(o)
+                if normalize_by_continuation_length:
+                    s_len, n_steps = completion_entropy_sum_and_len_from_vllm_output(o)
+                    val = float(s_len) / float(n_steps)
+                else:
+                    val = completion_entropy_sum_from_vllm_output(o)
             per_pref[chunk_pi[j]].append(val)
     return [float(np.mean(xs)) if xs else 0.0 for xs in per_pref]
 

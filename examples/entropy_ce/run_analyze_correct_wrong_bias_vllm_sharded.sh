@@ -19,6 +19,9 @@
 # 全量 rollout 审计（题干 + 每条完整回答，含对错）：默认开启，写入 OUTPUT_DIR/rollouts_archive_merged.jsonl；
 #   关闭：SAVE_ROLLOUTS_ARCHIVE=0
 #
+# bias/F 量纲（方案 1）：BIAS_METRICS_MODE=length_normalized 时，MC 续写为 (熵和)/(续写步数) 再平均，与 entropy_t 同量纲；
+#   默认 raw=续写熵之和。
+#
 # 用法（在 VERL 根目录）:
 #   bash examples/entropy_ce/run_analyze_correct_wrong_bias_vllm_sharded.sh
 #
@@ -71,6 +74,7 @@ CONTEXT_WINDOW_TOKENS="${CONTEXT_WINDOW_TOKENS:-64}"
 PER_SAMPLE_JSONL_SUBDIR="${PER_SAMPLE_JSONL_SUBDIR:-per_sample}"
 NO_PER_SAMPLE_JSONL="${NO_PER_SAMPLE_JSONL:-0}"
 SAVE_ROLLOUTS_ARCHIVE="${SAVE_ROLLOUTS_ARCHIVE:-1}"
+BIAS_METRICS_MODE="${BIAS_METRICS_MODE:-raw}"
 
 export VLLM_HOST_IP="${VLLM_HOST_IP:-127.0.0.1}"
 unset HOST_IP 2>/dev/null || true
@@ -112,6 +116,7 @@ for ((r = 0; r < NPROC_PER_NODE; r++)); do
   if [ "${SAVE_ROLLOUTS_ARCHIVE}" != "1" ]; then
     EXTRA_ARGS+=(--no-save-rollouts-archive)
   fi
+  EXTRA_ARGS+=(--bias_metrics_mode "${BIAS_METRICS_MODE}")
   EXTRA_ARGS+=(--f_continuation_mode "${F_CONTINUATION_MODE}")
   EXTRA_ARGS+=(--f_sentence_max_new_tokens "${F_SENTENCE_MAX_NEW_TOKENS}")
   EXTRA_ARGS+=(--f_sentence_stop "${F_SENTENCE_STOP}")

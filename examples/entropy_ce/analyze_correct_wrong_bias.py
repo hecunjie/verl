@@ -240,6 +240,13 @@ def main() -> None:
         help="句末判定：simple=中英启发式+小数点过滤；pysbd=英文 pysbd（需 pip install pysbd）。",
     )
     parser.add_argument(
+        "--bias_metrics_mode",
+        choices=["raw", "length_normalized"],
+        default="raw",
+        help="bias/F 的量纲：raw=续写熵之和（总长越大和越大）；length_normalized=方案1："
+        "每条 MC 续写为 (熵和)/(续写 token 步数) 后再对 MC 平均，与 entropy_t 同为 nats/token。",
+    )
+    parser.add_argument(
         "--candidate_mode",
         choices=["topp", "fixed"],
         default="topp",
@@ -622,6 +629,7 @@ def main() -> None:
                     tokenizer=tokenizer if args.f_continuation_mode == "first_sentence" else None,
                     f_sentence_max_new_tokens=int(args.f_sentence_max_new_tokens),
                     sentence_stop_check=sentence_stop_check,
+                    normalize_by_continuation_length=(args.bias_metrics_mode == "length_normalized"),
                 )
                 f_selected = Fs[0]
                 f_bar = sum(float(pr) * Fs[i + 1] for i, pr in enumerate(probs))
@@ -652,6 +660,7 @@ def main() -> None:
                     "group": group_name,
                     "rollout_index": rr["rollout_index"],
                     "token_index": int(pos),
+                    "bias_metrics_mode": str(args.bias_metrics_mode),
                     "entropy_t": h_t,
                     "bar_F_t": float(f_bar),
                     "F_selected_mc": float(f_selected),
@@ -745,6 +754,7 @@ def main() -> None:
 
         summary = {
             "num_records": len(merged),
+            "bias_metrics_mode": str(args.bias_metrics_mode),
             "correct_bias": compute_group_stats(corr_bias),
             "wrong_bias": compute_group_stats(wrong_bias),
             "correct_delta_hat": compute_group_stats(corr_delta),
