@@ -16,6 +16,9 @@
 #   PROGRESS_ECHO=1：rank0 每进入一条 prompt 在 stderr 打一行累计秒数（便于估总时长）
 # 关闭：--no_progress 或 export TQDM_DISABLE=1
 #
+# 全量 rollout 审计（题干 + 每条完整回答，含对错）：默认开启，写入 OUTPUT_DIR/rollouts_archive_merged.jsonl；
+#   关闭：SAVE_ROLLOUTS_ARCHIVE=0
+#
 # 用法（在 VERL 根目录）:
 #   bash examples/entropy_ce/run_analyze_correct_wrong_bias_vllm_sharded.sh
 #
@@ -67,6 +70,7 @@ PROGRESS_ECHO="${PROGRESS_ECHO:-0}"
 CONTEXT_WINDOW_TOKENS="${CONTEXT_WINDOW_TOKENS:-64}"
 PER_SAMPLE_JSONL_SUBDIR="${PER_SAMPLE_JSONL_SUBDIR:-per_sample}"
 NO_PER_SAMPLE_JSONL="${NO_PER_SAMPLE_JSONL:-0}"
+SAVE_ROLLOUTS_ARCHIVE="${SAVE_ROLLOUTS_ARCHIVE:-1}"
 
 export VLLM_HOST_IP="${VLLM_HOST_IP:-127.0.0.1}"
 unset HOST_IP 2>/dev/null || true
@@ -104,6 +108,9 @@ for ((r = 0; r < NPROC_PER_NODE; r++)); do
   fi
   if [ "${NO_PER_SAMPLE_JSONL}" = "1" ]; then
     EXTRA_ARGS+=(--no_per_sample_jsonl)
+  fi
+  if [ "${SAVE_ROLLOUTS_ARCHIVE}" != "1" ]; then
+    EXTRA_ARGS+=(--no-save-rollouts-archive)
   fi
   EXTRA_ARGS+=(--f_continuation_mode "${F_CONTINUATION_MODE}")
   EXTRA_ARGS+=(--f_sentence_max_new_tokens "${F_SENTENCE_MAX_NEW_TOKENS}")

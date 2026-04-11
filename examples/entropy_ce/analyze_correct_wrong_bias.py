@@ -210,6 +210,12 @@ def main() -> None:
         help="Do not write per-sample jsonl files (only pair_bias_rank*.jsonl).",
     )
     parser.add_argument(
+        "--save_rollouts_archive",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="每条 prompt 将题干、ground_truth 与全部 rollout 的完整回答写入 rollouts_archive_rank*.jsonl；rank0 合并为 rollouts_archive_merged.jsonl。关闭：--no-save-rollouts-archive。",
+    )
+    parser.add_argument(
         "--mc_m_samples",
         type=int,
         default=64,
@@ -346,6 +352,10 @@ def main() -> None:
     part_path = out_dir / f"pair_bias_rank{rank}.jsonl"
     with open(part_path, "w", encoding="utf-8"):
         pass
+    rollouts_archive_path: Path | None = None
+    if args.save_rollouts_archive:
+        rollouts_archive_path = out_dir / f"rollouts_archive_rank{rank}.jsonl"
+        rollouts_archive_path.write_text("", encoding="utf-8")
 
     diag: dict[str, int] = {
         "n_prompts": 0,
@@ -462,9 +472,39 @@ def main() -> None:
                         "scores": scores,
                         "entropies": entropies,
                         "is_correct": bool(acc),
+                        "response_text": response_text,
                     }
                 )
                 rollout_idx += 1
+
+        if rollouts_archive_path is not None:
+            has_mixed = (
+                len(rollouts) > 0
+                and any(r["is_correct"] for r in rollouts)
+                and any(not r["is_correct"] for r in rollouts)
+            )
+            arch_rec = {
+                "sample_index": int(global_idx),
+                "shard_rank": int(rank),
+                "world_size": int(world_size),
+                "data_source": data_source,
+                "ground_truth": ground_truth,
+                "prompt_text": prompt_text,
+                "rollouts_per_prompt_config": int(args.rollouts_per_prompt),
+                "n_rollouts_collected": len(rollouts),
+                "has_mixed_correct_wrong": bool(has_mixed),
+                "rollouts": [
+                    {
+                        "rollout_index": int(r["rollout_index"]),
+                        "is_correct": bool(r["is_correct"]),
+                        "response_text": r["response_text"],
+                        "response_length_tokens": len(r["response_ids"]),
+                    }
+                    for r in rollouts
+                ],
+            }
+            with open(rollouts_archive_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(arch_rec, ensure_ascii=False) + "\n")
 
         if not rollouts:
             diag["n_skip_all_rollouts_empty"] += 1
@@ -676,6 +716,27 @@ def main() -> None:
         with open(out_dir / "pair_bias_merged.jsonl", "w", encoding="utf-8") as f:
             for rec in merged:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+        arch_all: list[dict[str, Any]] = []
+        for r in range(world_size):
+            ap = out_dir / f"rollouts_archive_rank{r}.jsonl"
+            if not ap.exists():
+                continue
+            with open(ap, encoding="utf-8") as f:
+                for line in f:
+                    if line.strip():
+                        arch_all.append(json.loads(line))
+        if arch_all:
+            arch_all.sort(key=lambda x: int(x.get("sample_index", 0)))
+            with open(out_dir / "rollouts_archive_merged.jsonl", "w", encoding="utf-8") as f:
+                for rec in arch_all:
+                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            print(
+                f"[pair_bias] 全量 rollout 审计 jsonl: {out_dir / 'rollouts_archive_merged.jsonl'} "
+                f"（{len(arch_all)} 条 prompt，含对错每条完整回答）",
+                file=sys.stderr,
+                flush=True,
+            )
 
         corr_bias = [float(r["bias_t"]) for r in merged if r["group"] == "correct"]
         wrong_bias = [float(r["bias_t"]) for r in merged if r["group"] == "wrong"]
