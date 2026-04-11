@@ -58,17 +58,36 @@ def _ground_truth_from_row(row: dict[str, Any]) -> str:
     return ""
 
 
-def pick_top_entropy_positions(entropies: list[float], top_ratio: float, position_cap: int) -> list[int]:
-    """Take the ``k`` highest-entropy steps with ``k = min(position_cap, ceil(len * top_ratio))`` (at least 1)."""
+def pick_top_entropy_positions(
+    entropies: list[float],
+    scores: list[dict[int, float]],
+    top_ratio: float,
+    position_cap: int,
+) -> list[int]:
+    """Take ``k`` highest-entropy steps among indices with **non-empty** vLLM logprobs.
+
+    ``k = min(position_cap, ceil(len(entropies) * top_ratio))`` capped by number of viable steps.
+
+    Rationale: vLLM may return empty ``logprobs`` dicts on some steps (e.g. long generations). Those
+    indices were still given entropy 0 in ``entropies``; taking ``argsort`` could mix them into the
+    top-``k`` bucket, then ``topp`` sees ``{}`` and skips — often wiping the entire ``wrong`` branch
+    while ``correct`` still writes lines.
+    """
     if not entropies:
+        return []
+    n = min(len(entropies), len(scores))
+    viable = [i for i in range(n) if scores[i]]
+    if not viable:
         return []
     k_from_ratio = max(1, int(math.ceil(len(entropies) * float(top_ratio))))
     if position_cap > 0:
-        k = min(int(position_cap), k_from_ratio)
+        k_budget = min(int(position_cap), k_from_ratio)
     else:
-        k = k_from_ratio
-    order = np.argsort(np.array(entropies))
-    return sorted(int(i) for i in order[-k:].tolist())
+        k_budget = k_from_ratio
+    k_use = min(k_budget, len(viable))
+    viable_sorted = sorted(viable, key=lambda i: entropies[i])
+    chosen = viable_sorted[-k_use:]
+    return sorted(int(i) for i in chosen)
 
 
 def topk_candidates_with_probs(step_logprobs: dict[int, float], k: int) -> tuple[list[int], list[float]]:
@@ -306,6 +325,10 @@ def main() -> None:
         "n_mixed_pairs_ok": 0,
         "n_skip_empty_step_lp": 0,
         "n_jsonl_lines": 0,
+        "n_jsonl_lines_correct": 0,
+        "n_jsonl_lines_wrong": 0,
+        "n_group_zero_viable_positions_correct": 0,
+        "n_group_zero_viable_positions_wrong": 0,
     }
 
     rows = load_data(args.input_data, args.max_samples, args.seed)
@@ -435,10 +458,33 @@ def main() -> None:
             entropies = rr["entropies"]
             response_ids = rr["response_ids"]
             scores = rr["scores"]
+            n_ent = len(entropies)
+            n_via = sum(
+                1
+                for i in range(min(n_ent, len(scores)))
+                if scores[i]
+            )
+            k_ratio = max(1, int(math.ceil(n_ent * float(args.top_entropy_ratio))))
+            k_cap = int(args.max_positions_per_rollout)
+            k_budget = min(k_cap, k_ratio) if k_cap > 0 else k_ratio
             positions = pick_top_entropy_positions(
-                entropies, float(args.top_entropy_ratio), int(args.max_positions_per_rollout)
+                entropies, scores, float(args.top_entropy_ratio), int(args.max_positions_per_rollout)
             )
             n_pos_pick = len(positions)
+            position_pick_meta = {
+                "entropy_seq_len": int(n_ent),
+                "viable_logprob_steps": int(n_via),
+                "k_from_ratio_ceil": int(k_ratio),
+                "k_budget_min_cap": int(k_budget),
+                "k_effective_picked": int(n_pos_pick),
+                "top_entropy_ratio": float(args.top_entropy_ratio),
+                "max_positions_cap": int(k_cap),
+            }
+            if not positions:
+                if group_name == "correct":
+                    diag["n_group_zero_viable_positions_correct"] += 1
+                else:
+                    diag["n_group_zero_viable_positions_wrong"] += 1
             pos_iter = positions
             if use_nested and tqdm is not None:
                 pos_iter = tqdm(
@@ -551,10 +597,15 @@ def main() -> None:
                     "data_source": data_source,
                     "ground_truth": ground_truth,
                     "prompt_text": prompt_text,
+                    "position_pick_meta": position_pick_meta,
                 }
                 with open(part_path, "a", encoding="utf-8") as f:
                     f.write(json.dumps(rec, ensure_ascii=False) + "\n")
                     diag["n_jsonl_lines"] += 1
+                    if group_name == "correct":
+                        diag["n_jsonl_lines_correct"] += 1
+                    else:
+                        diag["n_jsonl_lines_wrong"] += 1
                 if per_sample_dir is not None:
                     spath = per_sample_dir / f"sample_{global_idx:06d}.jsonl"
                     with open(spath, "a", encoding="utf-8") as f:

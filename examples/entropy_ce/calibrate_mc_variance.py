@@ -48,18 +48,28 @@ def parse_int_list(text: str) -> list[int]:
     return vals
 
 
-def pick_top_entropy_positions(entropies: list[float], top_ratio: float, position_cap: int) -> list[int]:
-    """取熵最高的 ``k`` 步，``k = min(position_cap, ceil(len * top_ratio))``（与 analyze_correct_wrong_bias 一致）。"""
+def pick_top_entropy_positions(
+    entropies: list[float],
+    scores: list[dict[int, float]],
+    top_ratio: float,
+    position_cap: int,
+) -> list[int]:
+    """在 ``scores[i]`` 非空的步上取熵最高的 ``k`` 步（与 analyze_correct_wrong_bias 一致）。"""
     if not entropies:
+        return []
+    n = min(len(entropies), len(scores))
+    viable = [i for i in range(n) if scores[i]]
+    if not viable:
         return []
     k_from_ratio = max(1, int(math.ceil(len(entropies) * float(top_ratio))))
     if position_cap > 0:
-        k = min(int(position_cap), k_from_ratio)
+        k_budget = min(int(position_cap), k_from_ratio)
     else:
-        k = k_from_ratio
-    k = min(k, len(entropies))
-    order = np.argsort(np.array(entropies))
-    return sorted(int(i) for i in order[-k:].tolist())
+        k_budget = k_from_ratio
+    k_use = min(k_budget, len(viable))
+    viable_sorted = sorted(viable, key=lambda i: entropies[i])
+    chosen = viable_sorted[-k_use:]
+    return sorted(int(i) for i in chosen)
 
 
 def summarize_variance_from_samples(samples: list[float], m_grid: list[int]) -> dict[str, Any]:
@@ -263,7 +273,10 @@ def main() -> None:
                     continue
                 entropies = [entropy_from_logprobs_topk(s) for s in scores[: len(response_ids)]]
                 positions = pick_top_entropy_positions(
-                    entropies, float(args.top_entropy_ratio), int(args.max_positions_per_rollout)
+                    entropies,
+                    scores,
+                    float(args.top_entropy_ratio),
+                    int(args.max_positions_per_rollout),
                 )
 
                 pos_iter = positions
