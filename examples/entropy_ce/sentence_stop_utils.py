@@ -1,10 +1,13 @@
-"""按「第一句结束」停止 vLLM 续写：自定义停止逻辑，避免把英文小数点当句末。
+"""按「第一句结束」截断续写：避免把英文小数点当句末。
 
 vLLM 的 ``SamplingParams(stop=...)`` 只能做子串匹配，无法区分 ``3.14`` 与句末 ``.``。
-本模块用 **分块 generate**（每块最多 ``chunk_max_tokens`` token），每块后 **decode 已生成后缀**
-再判断是否应停；熵沿 **实际保留的 token** 累加。
 
-可选：``pip install pysbd`` 后使用 ``make_pysbd_first_sentence_stop_check()`` 得到更稳的英文句界。
+**快速路径（``estimate_F_mc_many_prefixes_vllm`` 的 first_sentence）**：单次 ``generate`` 最多 ``N`` token，
+再 ``truncate_gen_ids_to_first_sentence`` 按 decode 前缀找首句边界，熵只累加到该 token。
+
+**慢路径**：``generate_until_sentence_boundary_vllm`` —— 多次分块 ``generate`` 直到句末。
+
+可选：``pip install pysbd`` 与 ``make_pysbd_first_sentence_stop_check()``。
 
 使用示例
 --------
@@ -81,6 +84,19 @@ def _segment_with_pysbd(text: str, language: str = "en") -> list[str]:
         return []
     seg = pysbd.Segmenter(language=language, clean=False)
     return list(seg.segment(text.strip()))
+
+
+def truncate_gen_ids_to_first_sentence(
+    gen_ids: list[int],
+    tokenizer: Any,
+    stop_check: Callable[[str], bool],
+) -> int:
+    """返回 ``k``：在 ``1..len(gen_ids)`` 中第一个使 ``stop_check(decode(gen_ids[:k]))`` 为真的 ``k``；若始终假则 ``len(gen_ids)``。"""
+    for k in range(1, len(gen_ids) + 1):
+        frag = tokenizer.decode(gen_ids[:k], skip_special_tokens=True)
+        if stop_check(frag):
+            return k
+    return len(gen_ids)
 
 
 def completion_should_stop_after_first_sentence_simple(

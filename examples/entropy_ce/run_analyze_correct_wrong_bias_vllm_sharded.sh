@@ -38,9 +38,9 @@ MAX_SAMPLES="${MAX_SAMPLES:-300}"
 ROLLOUTS_PER_PROMPT="${ROLLOUTS_PER_PROMPT:-8}"
 SEED="${SEED:-42}"
 MC_M_SAMPLES="${MC_M_SAMPLES:-64}"
-# F 续写：full=一次续写到 MAX_NEW_TOKENS；first_sentence=分块续写到句末（慢，见 sentence_stop_utils）
+# F 续写：full=一次续写到 MAX_NEW_TOKENS；first_sentence=单次最多 F_SENTENCE_MAX_NEW_TOKENS 再截断到首句（可批量）
 F_CONTINUATION_MODE="${F_CONTINUATION_MODE:-full}"
-F_SENTENCE_CHUNK_MAX_TOKENS="${F_SENTENCE_CHUNK_MAX_TOKENS:-48}"
+F_SENTENCE_MAX_NEW_TOKENS="${F_SENTENCE_MAX_NEW_TOKENS:-256}"
 # 句末判定：simple | pysbd（需 pip install pysbd）
 F_SENTENCE_STOP="${F_SENTENCE_STOP:-simple}"
 # bar F_t 候选：默认 topp（高熵步自动多取几个，上限 candidate_max_k）；legacy 固定 k 见 CANDIDATE_MODE=fixed
@@ -106,7 +106,7 @@ for ((r = 0; r < NPROC_PER_NODE; r++)); do
     EXTRA_ARGS+=(--no_per_sample_jsonl)
   fi
   EXTRA_ARGS+=(--f_continuation_mode "${F_CONTINUATION_MODE}")
-  EXTRA_ARGS+=(--f_sentence_chunk_max_tokens "${F_SENTENCE_CHUNK_MAX_TOKENS}")
+  EXTRA_ARGS+=(--f_sentence_max_new_tokens "${F_SENTENCE_MAX_NEW_TOKENS}")
   EXTRA_ARGS+=(--f_sentence_stop "${F_SENTENCE_STOP}")
   GLOBAL_RANK=$((NODE_RANK * NPROC_PER_NODE + r))
   CUDA_VISIBLE_DEVICES="${r}" python3 examples/entropy_ce/analyze_correct_wrong_bias.py \

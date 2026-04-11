@@ -219,13 +219,13 @@ def main() -> None:
         "--f_continuation_mode",
         choices=["full", "first_sentence"],
         default="full",
-        help="full: 一次 generate 续写至 max_new_tokens；first_sentence: 分块生成并在句末停（见 sentence_stop_utils，较慢）。",
+        help="full: 一次 generate 续写至 max_new_tokens；first_sentence: 单次 generate 最多 f_sentence_max_new_tokens，再在输出上截断到首句（可批量，快）。",
     )
     parser.add_argument(
-        "--f_sentence_chunk_max_tokens",
+        "--f_sentence_max_new_tokens",
         type=int,
-        default=48,
-        help="f_continuation_mode=first_sentence 时每轮 vLLM.generate 的 max_tokens 上限。",
+        default=256,
+        help="first_sentence：单次 vLLM 续写上限，并与 (max_new_tokens-pos) 取 min；再在 token 前缀上找首句末。",
     )
     parser.add_argument(
         "--f_sentence_stop",
@@ -296,8 +296,8 @@ def main() -> None:
         raise SystemExit("--max_positions_per_rollout must be >= 1 (use large value e.g. 500 for cap).")
     if int(args.context_window_tokens) < 0:
         raise SystemExit("--context_window_tokens must be >= 0.")
-    if int(args.f_sentence_chunk_max_tokens) < 1:
-        raise SystemExit("--f_sentence_chunk_max_tokens must be >= 1.")
+    if int(args.f_sentence_max_new_tokens) < 1:
+        raise SystemExit("--f_sentence_max_new_tokens must be >= 1.")
 
     vllm_standalone = args.vllm_shard_rank is not None and args.vllm_shard_world_size is not None
     if (args.vllm_shard_rank is None) ^ (args.vllm_shard_world_size is None):
@@ -557,57 +557,32 @@ def main() -> None:
 
                     sentence_stop_check = make_pysbd_first_sentence_stop_check()
 
-                if args.f_continuation_mode == "first_sentence":
-                    mc_prog = range(n_req)
-                    if use_nested and tqdm is not None:
-                        mc_prog = tqdm(
-                            mc_prog,
-                            total=n_req,
-                            desc=f"{shard_desc} MC sentence",
-                            position=bar_base + 3,
-                            leave=False,
-                            mininterval=0.2,
-                            **_tqdm_kw,
-                        )
-                    Fs = estimate_F_mc_many_prefixes_vllm(
-                        llm,
-                        prefixes_mc,
-                        int(args.mc_m_samples),
-                        max_new_tokens=mtok,
-                        temperature=args.temperature,
-                        top_p=args.top_p,
-                        logprobs_k=args.vllm_logprobs_topk,
-                        batch_chunk=bc,
-                        chunk_starts_iter=None,
-                        f_continuation_mode="first_sentence",
-                        tokenizer=tokenizer,
-                        sentence_chunk_max_tokens=int(args.f_sentence_chunk_max_tokens),
-                        flat_progress_iter=mc_prog,
-                        sentence_stop_check=sentence_stop_check,
+                chunk_starts = range(0, n_req, bc)
+                if use_nested and tqdm is not None:
+                    chunk_starts = tqdm(
+                        chunk_starts,
+                        total=n_mc_chunks,
+                        desc=f"{shard_desc} MC batched",
+                        position=bar_base + 3,
+                        leave=False,
+                        mininterval=0.2,
+                        **_tqdm_kw,
                     )
-                else:
-                    chunk_starts = range(0, n_req, bc)
-                    if use_nested and tqdm is not None:
-                        chunk_starts = tqdm(
-                            chunk_starts,
-                            total=n_mc_chunks,
-                            desc=f"{shard_desc} MC batched",
-                            position=bar_base + 3,
-                            leave=False,
-                            mininterval=0.2,
-                            **_tqdm_kw,
-                        )
-                    Fs = estimate_F_mc_many_prefixes_vllm(
-                        llm,
-                        prefixes_mc,
-                        int(args.mc_m_samples),
-                        max_new_tokens=mtok,
-                        temperature=args.temperature,
-                        top_p=args.top_p,
-                        logprobs_k=args.vllm_logprobs_topk,
-                        batch_chunk=bc,
-                        chunk_starts_iter=chunk_starts,
-                    )
+                Fs = estimate_F_mc_many_prefixes_vllm(
+                    llm,
+                    prefixes_mc,
+                    int(args.mc_m_samples),
+                    max_new_tokens=mtok,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                    logprobs_k=args.vllm_logprobs_topk,
+                    batch_chunk=bc,
+                    chunk_starts_iter=chunk_starts,
+                    f_continuation_mode=str(args.f_continuation_mode),
+                    tokenizer=tokenizer if args.f_continuation_mode == "first_sentence" else None,
+                    f_sentence_max_new_tokens=int(args.f_sentence_max_new_tokens),
+                    sentence_stop_check=sentence_stop_check,
+                )
                 f_selected = Fs[0]
                 f_bar = sum(float(pr) * Fs[i + 1] for i, pr in enumerate(probs))
                 f_alt_mcs = [float(Fs[i + 1]) for i in range(len(tids))]
@@ -659,7 +634,7 @@ def main() -> None:
                     "num_picked_entropy_positions": int(n_pos_pick),
                     "mc_m_samples": int(args.mc_m_samples),
                     "f_continuation_mode": str(args.f_continuation_mode),
-                    "f_sentence_chunk_max_tokens": int(args.f_sentence_chunk_max_tokens),
+                    "f_sentence_max_new_tokens": int(args.f_sentence_max_new_tokens),
                     "f_sentence_stop": str(args.f_sentence_stop),
                     "vllm_request_batch_chunk": int(args.vllm_request_batch_chunk),
                     "data_source": data_source,

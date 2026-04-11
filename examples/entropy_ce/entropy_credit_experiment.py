@@ -497,69 +497,46 @@ def estimate_F_mc_many_prefixes_vllm(
     chunk_starts_iter: Any | None = None,
     f_continuation_mode: str = "full",
     tokenizer: Any | None = None,
-    sentence_chunk_max_tokens: int = 48,
-    flat_progress_iter: Any | None = None,
+    f_sentence_max_new_tokens: int = 256,
     sentence_stop_check: Any | None = None,
 ) -> list[float]:
     """For each prefix, MC mean of continuation entropy-sum; batched vLLM calls.
 
     Flat order: prefix[0] repeated ``m_samples`` times, then prefix[1], ...
 
-    ``f_continuation_mode="first_sentence"`` uses chunked decode + custom stop (see
-    ``sentence_stop_utils``); much slower than ``full`` but caps F at ~first sentence.
-    Pass ``tokenizer`` and optionally ``sentence_stop_check`` / ``flat_progress_iter``.
+    ``f_continuation_mode="first_sentence"``: one ``generate`` per sequence with
+    ``max_tokens=min(f_sentence_max_new_tokens, max_new_tokens)``, then truncate to
+    first sentence in **token space** (``sentence_stop_utils.truncate_gen_ids_to_first_sentence``)
+    and sum entropies only over kept steps — same batching as ``full``, much faster than chunked stop.
+    Requires ``tokenizer``.
     """
     from vllm import SamplingParams
     from vllm.inputs import TokensPrompt
 
     if m_samples < 1 or not prefixes:
         return [0.0 for _ in prefixes]
-    k = clamp_vllm_logprobs_topk(logprobs_k)
+    k_lp = clamp_vllm_logprobs_topk(logprobs_k)
 
     if f_continuation_mode == "first_sentence":
         if tokenizer is None:
             raise ValueError("tokenizer is required when f_continuation_mode='first_sentence'")
         from sentence_stop_utils import (
             completion_should_stop_after_first_sentence_simple,
-            generate_until_sentence_boundary_vllm,
+            truncate_gen_ids_to_first_sentence,
         )
 
         stop_fn = sentence_stop_check or completion_should_stop_after_first_sentence_simple
-        pairs: list[tuple[int, list[int]]] = []
-        for pi, pref in enumerate(prefixes):
-            for _ in range(m_samples):
-                pairs.append((pi, pref))
-
-        def sp_factory(chunk: int) -> Any:
-            return SamplingParams(
-                max_tokens=chunk,
-                temperature=temperature,
-                top_p=top_p,
-                logprobs=k,
-            )
-
-        per_pref: list[list[float]] = [[] for _ in range(len(prefixes))]
-        loop = flat_progress_iter if flat_progress_iter is not None else range(len(pairs))
-        for j in loop:
-            pi, pref = pairs[j]
-            _gen_ids, logprobs_per_step, _sent_done = generate_until_sentence_boundary_vllm(
-                llm,
-                tokenizer,
-                pref,
-                sp_factory,
-                chunk_max_tokens=int(sentence_chunk_max_tokens),
-                max_total_new_tokens=int(max_new_tokens),
-                stop_check=stop_fn,
-            )
-            entropies = [entropy_from_logprobs_topk(s) for s in logprobs_per_step]
-            per_pref[pi].append(float(sum(entropies)))
-        return [float(np.mean(xs)) if xs else 0.0 for xs in per_pref]
+        gen_cap = min(int(f_sentence_max_new_tokens), int(max_new_tokens))
+        gen_cap = max(1, gen_cap)
+    else:
+        stop_fn = None
+        gen_cap = int(max_new_tokens)
 
     sp = SamplingParams(
-        max_tokens=max_new_tokens,
+        max_tokens=gen_cap,
         temperature=temperature,
         top_p=top_p,
-        logprobs=k,
+        logprobs=k_lp,
     )
     flat_prompts: list[TokensPrompt] = []
     flat_pref_idx: list[int] = []
@@ -580,7 +557,21 @@ def estimate_F_mc_many_prefixes_vllm(
             raise RuntimeError(f"vLLM batch size mismatch: expected {len(chunk_prompts)}, got {len(outputs)}")
         for j, out_req in enumerate(outputs):
             o = out_req.outputs[0]
-            val = completion_entropy_sum_from_vllm_output(o)
+            if f_continuation_mode == "first_sentence":
+                assert stop_fn is not None
+                gen_ids = list(o.token_ids)
+                step_lps: list[dict[int, float]] = []
+                for step_lp in o.logprobs or []:
+                    d: dict[int, float] = {}
+                    for tid, info in step_lp.items():
+                        d[int(tid)] = float(info.logprob)
+                    step_lps.append(d)
+                while len(step_lps) < len(gen_ids):
+                    step_lps.append({})
+                keep_k = truncate_gen_ids_to_first_sentence(gen_ids, tokenizer, stop_fn)
+                val = float(sum(entropy_from_logprobs_topk(step_lps[i]) for i in range(keep_k)))
+            else:
+                val = completion_entropy_sum_from_vllm_output(o)
             per_pref[chunk_pi[j]].append(val)
     return [float(np.mean(xs)) if xs else 0.0 for xs in per_pref]
 
