@@ -236,8 +236,18 @@ def main() -> None:
     )
     parser.add_argument("--topk_alt", type=int, default=3, help="Top-k alternatives when candidate_mode=fixed.")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--vllm_shard_rank", type=int, default=None)
-    parser.add_argument("--vllm_shard_world_size", type=int, default=None)
+    parser.add_argument(
+        "--vllm_shard_rank",
+        type=int,
+        default=None,
+        help="Data shard index in [0, world_size). Multi-node: global rank = NODE_RANK * local_gpu_count + gpu_index.",
+    )
+    parser.add_argument(
+        "--vllm_shard_world_size",
+        type=int,
+        default=None,
+        help="Total vLLM worker count across all nodes (e.g. NNODES * NPROC_PER_NODE).",
+    )
     parser.add_argument("--no_progress", action="store_true", help="Disable tqdm progress bars.")
     parser.add_argument(
         "--progress_all_ranks",

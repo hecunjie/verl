@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 # vLLM + 多卡：每 GPU 一个独立 python 进程。与 run_calibrate_mc_variance_vllm_sharded.sh 用法一致。
 #
+# 单机（默认）：NNODES=1, NODE_RANK=0，world_size=NPROC_PER_NODE，rank=0..NPROC_PER_NODE-1。
+#
+# 多机：各节点挂载同一 OUTPUT_DIR（NFS/共享盘），在每台上用相同 MAX_SAMPLES/SEED/INPUT_DATA 等启动；
+#   NNODES=节点总数，NODE_RANK=本机编号（0 起，每台不同）。
+#   全局 rank = NODE_RANK * NPROC_PER_NODE + 本机 GPU 下标，world_size = NNODES * NPROC_PER_NODE。
+#   合并 jsonl / summary 仅「全局 rank 0」进程执行（第一台机器上的 GPU0）。
+# 多机时建议显式设置本机可被访问的 IP（部分 vLLM 版本会用到）:
+#   export VLLM_HOST_IP=$(hostname -I | awk '{print $1}')
+#
 # 进度条：
 #   默认 rank0 外层 tqdm + 嵌套 tqdm（rollout / 高熵位置 / MC）；PROGRESS_NESTED=0 可关嵌套（只保留按 prompt 一条杠）
 #   PROGRESS_ALL_RANKS=1：8 卡各一条 tqdm（屏会很乱，一般不推荐）
@@ -9,6 +18,10 @@
 #
 # 用法（在 VERL 根目录）:
 #   bash examples/entropy_ce/run_analyze_correct_wrong_bias_vllm_sharded.sh
+#
+# 多机示例（2 台 × 8 卡，共享 OUTPUT_DIR）:
+#   节点0: NNODES=2 NODE_RANK=0 OUTPUT_DIR=/nfs/exp1 ... bash examples/entropy_ce/run_analyze_correct_wrong_bias_vllm_sharded.sh
+#   节点1: NNODES=2 NODE_RANK=1 OUTPUT_DIR=/nfs/exp1 ... bash examples/entropy_ce/run_analyze_correct_wrong_bias_vllm_sharded.sh
 #
 set -euo pipefail
 
@@ -19,6 +32,8 @@ MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3-8B}"
 INPUT_DATA="${INPUT_DATA:-${HOME}/data/math_rl/dapo_math_17k_processed_train.parquet}"
 OUTPUT_DIR="${OUTPUT_DIR:-${HOME}/entropy_check/pair_bias}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
+NNODES="${NNODES:-1}"
+NODE_RANK="${NODE_RANK:-0}"
 MAX_SAMPLES="${MAX_SAMPLES:-300}"
 ROLLOUTS_PER_PROMPT="${ROLLOUTS_PER_PROMPT:-8}"
 SEED="${SEED:-42}"
@@ -51,6 +66,22 @@ NO_PER_SAMPLE_JSONL="${NO_PER_SAMPLE_JSONL:-0}"
 export VLLM_HOST_IP="${VLLM_HOST_IP:-127.0.0.1}"
 unset HOST_IP 2>/dev/null || true
 
+if ! [[ "${NNODES}" =~ ^[0-9]+$ ]] || [ "${NNODES}" -lt 1 ]; then
+  echo "Invalid NNODES=${NNODES} (must be a positive integer)" >&2
+  exit 1
+fi
+if ! [[ "${NODE_RANK}" =~ ^[0-9]+$ ]] || [ "${NODE_RANK}" -ge "${NNODES}" ]; then
+  echo "Invalid NODE_RANK=${NODE_RANK} (must satisfy 0 <= NODE_RANK < NNODES, NNODES=${NNODES})" >&2
+  exit 1
+fi
+if ! [[ "${NPROC_PER_NODE}" =~ ^[0-9]+$ ]] || [ "${NPROC_PER_NODE}" -lt 1 ]; then
+  echo "Invalid NPROC_PER_NODE=${NPROC_PER_NODE}" >&2
+  exit 1
+fi
+
+WORLD_SIZE=$((NNODES * NPROC_PER_NODE))
+echo "[run_analyze_correct_wrong_bias] NODE_RANK=${NODE_RANK}/${NNODES} NPROC_PER_NODE=${NPROC_PER_NODE} WORLD_SIZE=${WORLD_SIZE}" >&2
+
 mkdir -p "${OUTPUT_DIR}"
 # 如需 legacy vLLM engine：在运行前 export VLLM_USE_V1=0
 
@@ -69,6 +100,7 @@ for ((r = 0; r < NPROC_PER_NODE; r++)); do
   if [ "${NO_PER_SAMPLE_JSONL}" = "1" ]; then
     EXTRA_ARGS+=(--no_per_sample_jsonl)
   fi
+  GLOBAL_RANK=$((NODE_RANK * NPROC_PER_NODE + r))
   CUDA_VISIBLE_DEVICES="${r}" python3 examples/entropy_ce/analyze_correct_wrong_bias.py \
     --input_data "${INPUT_DATA}" \
     --model_path "${MODEL_PATH}" \
@@ -92,8 +124,8 @@ for ((r = 0; r < NPROC_PER_NODE; r++)); do
     --vllm_request_batch_chunk "${VLLM_REQUEST_BATCH_CHUNK}" \
     --vllm_gpu_memory_utilization "${VLLM_GPU_MEMORY_UTILIZATION}" \
     --vllm_max_model_len "${VLLM_MAX_MODEL_LEN}" \
-    --vllm_shard_rank "${r}" \
-    --vllm_shard_world_size "${NPROC_PER_NODE}" \
+    --vllm_shard_rank "${GLOBAL_RANK}" \
+    --vllm_shard_world_size "${WORLD_SIZE}" \
     "${EXTRA_ARGS[@]}" \
     "$@" &
   PIDS+=("$!")
