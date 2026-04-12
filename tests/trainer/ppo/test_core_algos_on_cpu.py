@@ -14,6 +14,7 @@
 
 import random
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -22,6 +23,7 @@ import torch
 import verl.trainer.ppo.core_algos
 from verl.trainer.ppo.core_algos import (
     compute_gae_advantage_return,
+    compute_grpo_gtpo_outcome_advantage,
     compute_grpo_outcome_advantage,
     compute_grpo_vectorized_outcome_advantage,
     compute_rloo_outcome_advantage,
@@ -311,6 +313,72 @@ def test_grpo_and_vectorized_equivalence(batch_size: int, seq_len: int, num_grou
     assert ret1.shape == ret2.shape == (batch_size, seq_len)
     assert torch.allclose(adv1, adv2, rtol=1e-5, atol=1e-6)
     assert torch.allclose(ret1, ret2, rtol=1e-5, atol=1e-6)
+
+
+def test_grpo_gtpo_total_advantage_matches_grpo_broadcast_mass():
+    """GTPO (default): per-sequence sum of token advantages equals GRPO uniform broadcast (n * scalar)."""
+    torch.manual_seed(0)
+    random.seed(0)
+    np.random.seed(0)
+    batch_size, seq_len, num_groups = 32, 64, 4
+    index = _make_group_index(batch_size, num_groups)
+    response_mask = _rand_mask(batch_size, seq_len)
+    base_rewards = torch.randn(batch_size, seq_len, dtype=torch.float32)
+    token_level_rewards = base_rewards * response_mask
+    token_entropy = torch.rand(batch_size, seq_len, dtype=torch.float32) * response_mask
+
+    adv_grpo, _ = compute_grpo_vectorized_outcome_advantage(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        index=index,
+    )
+    adv_gtpo, _ = compute_grpo_gtpo_outcome_advantage(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        index=index,
+        token_entropy=token_entropy,
+    )
+    for i in range(batch_size):
+        m = response_mask[i].bool()
+        if not m.any():
+            continue
+        scalar_i = adv_grpo[i, m][0]
+        n_i = m.sum().item()
+        expected_sum = scalar_i * n_i
+        assert torch.isclose(adv_gtpo[i, m].sum(), expected_sum, rtol=1e-5, atol=1e-5)
+
+
+def test_grpo_gtpo_legacy_sum_matches_group_scalar():
+    """GTPO (gtpo_scale_advantage_by_seq_len=False): sum of token advantages equals the GRPO scalar."""
+    torch.manual_seed(0)
+    random.seed(0)
+    np.random.seed(0)
+    batch_size, seq_len, num_groups = 32, 64, 4
+    index = _make_group_index(batch_size, num_groups)
+    response_mask = _rand_mask(batch_size, seq_len)
+    base_rewards = torch.randn(batch_size, seq_len, dtype=torch.float32)
+    token_level_rewards = base_rewards * response_mask
+    token_entropy = torch.rand(batch_size, seq_len, dtype=torch.float32) * response_mask
+
+    adv_grpo, _ = compute_grpo_vectorized_outcome_advantage(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        index=index,
+    )
+    cfg = SimpleNamespace(gtpo_scale_advantage_by_seq_len=False)
+    adv_gtpo, _ = compute_grpo_gtpo_outcome_advantage(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        index=index,
+        token_entropy=token_entropy,
+        config=cfg,
+    )
+    for i in range(batch_size):
+        m = response_mask[i].bool()
+        if not m.any():
+            continue
+        scalar_i = adv_grpo[i, m][0]
+        assert torch.isclose(adv_gtpo[i, m].sum(), scalar_i, rtol=1e-5, atol=1e-5)
 
 
 if __name__ == "__main__":

@@ -638,6 +638,7 @@ algorithm:
   lam: 1.0
   adv_estimator: gae
   norm_adv_by_std_in_grpo: true
+  gtpo_scale_advantage_by_seq_len: true
   use_kl_in_reward: false
   kl_penalty: kl
   kl_ctrl:

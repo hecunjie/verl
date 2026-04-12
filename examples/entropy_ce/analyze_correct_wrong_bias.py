@@ -27,6 +27,7 @@ from entropy_credit_experiment import (
     evaluate_solution_acc,
     file_sync,
     generate_rollouts_vllm_batched,
+    gtpo_entropy_weights,
     init_dist,
     load_data,
     purge_all_torchrun_like_env_for_vllm_standalone,
@@ -251,6 +252,13 @@ def main() -> None:
         choices=["simple", "pysbd"],
         default="simple",
         help="句末判定：simple=中英启发式+小数点过滤；pysbd=英文 pysbd（需 pip install pysbd）。",
+    )
+    parser.add_argument(
+        "--credit_assignment",
+        choices=["method2", "gtpo"],
+        default="method2",
+        help="method2=估计 F 与 bias_t、delta_hat（需 beam/MC）；gtpo=仅 GTPO 熵权重 w_t=H_t/sum_k H_k，"
+        "不做续写 F 估计（快，作 baseline）。",
     )
     parser.add_argument(
         "--bias_metrics_mode",
@@ -577,6 +585,7 @@ def main() -> None:
                     diag["n_group_zero_viable_positions_correct"] += 1
                 else:
                     diag["n_group_zero_viable_positions_wrong"] += 1
+            gtpo_weights, sum_entropy_response = gtpo_entropy_weights(entropies)
             pos_iter = positions
             if use_nested and tqdm is not None:
                 pos_iter = tqdm(
@@ -591,6 +600,69 @@ def main() -> None:
             for pos in pos_iter:
                 if pos >= len(scores):
                     continue
+                h_t = float(entropies[pos]) if pos < len(entropies) else 0.0
+                gtpo_w = float(gtpo_weights[pos]) if pos < len(gtpo_weights) else 0.0
+
+                if args.credit_assignment == "gtpo":
+                    ctx = build_token_context(
+                        tokenizer, response_ids, int(pos), int(args.context_window_tokens)
+                    )
+                    rec_gtpo = {
+                        "sample_index": global_idx,
+                        "shard_rank": rank,
+                        "group": group_name,
+                        "rollout_index": rr["rollout_index"],
+                        "token_index": int(pos),
+                        "credit_assignment": "gtpo",
+                        "bias_metrics_mode": str(args.bias_metrics_mode),
+                        "entropy_t": h_t,
+                        "gtpo_weight_t": gtpo_w,
+                        "sum_entropy_response": float(sum_entropy_response),
+                        "gtpo_response_length_tokens": len(entropies),
+                        "F_selected_mc": None,
+                        "bar_F_t": None,
+                        "f_alt_mc": None,
+                        "bias_t": None,
+                        "delta_hat_t": None,
+                        "bias_over_entropy": None,
+                        "selected_token_id": int(response_ids[pos]),
+                        "selected_token_text": tokenizer.decode(
+                            [response_ids[pos]], skip_special_tokens=True
+                        ),
+                        "candidate_mode": None,
+                        "alt_k_topp": None,
+                        "alt_k_used": None,
+                        "topk_alt_token_ids": None,
+                        "topk_alt_probs": None,
+                        "alt_candidates": None,
+                        "context": ctx,
+                        "rollout_response_length": len(response_ids),
+                        "num_picked_entropy_positions": int(n_pos_pick),
+                        "f_estimator": None,
+                        "f_beam_width": None,
+                        "mc_m_samples": None,
+                        "f_continuation_mode": None,
+                        "f_sentence_max_new_tokens": None,
+                        "f_sentence_stop": None,
+                        "vllm_request_batch_chunk": int(args.vllm_request_batch_chunk),
+                        "data_source": data_source,
+                        "ground_truth": ground_truth,
+                        "prompt_text": prompt_text,
+                        "position_pick_meta": position_pick_meta,
+                    }
+                    with open(part_path, "a", encoding="utf-8") as f:
+                        f.write(json.dumps(rec_gtpo, ensure_ascii=False) + "\n")
+                        diag["n_jsonl_lines"] += 1
+                        if group_name == "correct":
+                            diag["n_jsonl_lines_correct"] += 1
+                        else:
+                            diag["n_jsonl_lines_wrong"] += 1
+                    if per_sample_dir is not None:
+                        spath = per_sample_dir / f"sample_{global_idx:06d}.jsonl"
+                        with open(spath, "a", encoding="utf-8") as f:
+                            f.write(json.dumps(rec_gtpo, ensure_ascii=False) + "\n")
+                    continue
+
                 step_lp = scores[pos]
                 if args.candidate_mode == "fixed":
                     tids, probs = topk_candidates_with_probs(step_lp, int(args.topk_alt))
@@ -678,7 +750,6 @@ def main() -> None:
                 f_bar = sum(float(pr) * Fs[i + 1] for i, pr in enumerate(probs))
                 f_alt_mcs = [float(Fs[i + 1]) for i in range(len(tids))]
 
-                h_t = float(entropies[pos])
                 bias_t = float(f_bar - f_selected)
                 delta_hat = float(h_t + bias_t)
 
@@ -703,8 +774,11 @@ def main() -> None:
                     "group": group_name,
                     "rollout_index": rr["rollout_index"],
                     "token_index": int(pos),
+                    "credit_assignment": "method2",
                     "bias_metrics_mode": str(args.bias_metrics_mode),
                     "entropy_t": h_t,
+                    "gtpo_weight_t": gtpo_w,
+                    "sum_entropy_response": float(sum_entropy_response),
                     "bar_F_t": float(f_bar),
                     "F_selected_mc": float(f_selected),
                     "f_alt_mc": f_alt_mcs,

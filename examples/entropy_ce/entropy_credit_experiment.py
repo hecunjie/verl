@@ -273,6 +273,37 @@ def varentropy_from_logprobs_topk(logprobs_dict: dict[int, float], entropy: floa
     return float(np.sum(p * (center**2)))
 
 
+def gtpo_entropy_weights(
+    entropies: list[float],
+    *,
+    eps: float = 1e-12,
+) -> tuple[list[float], float]:
+    """GTPO (Group Token Policy Optimization) dynamic entropy weights over a sequence.
+
+    Per decoding step ``t``, weight ``w_t = H_t / \\sum_k H_k`` where ``H_t`` is policy entropy
+    at that step (here: top-``k`` vLLM logprobs entropy, same as ``entropy_t`` in analysis).
+
+    Returns ``(weights, sum_entropy)``. Weights sum to 1 when ``sum_entropy > eps``; if all
+    entropies are (near) zero, falls back to uniform over positions.
+
+    Reference: GTPO / dynamic entropy weighting for token-level reward redistribution (e.g.
+    arXiv:2508.04349).
+    """
+    arr = np.array(
+        [max(0.0, float(h)) if math.isfinite(float(h)) else 0.0 for h in entropies],
+        dtype=np.float64,
+    )
+    n = int(arr.size)
+    if n == 0:
+        return [], 0.0
+    s = float(np.sum(arr))
+    if s <= eps:
+        u = 1.0 / float(n)
+        return [u] * n, 0.0
+    w = (arr / s).tolist()
+    return w, s
+
+
 def suffix_avg(values: list[float], start: int) -> float:
     if start >= len(values):
         return 0.0

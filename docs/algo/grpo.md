@@ -50,6 +50,21 @@ Instead of adding KL penalty in the reward, GRPO regularizes by directly adding 
 
 ## Advanced Extensions
 
+### GTPO (Group Token Policy Optimization)
+
+[GTPO and GRPO-S: Token and Sequence-Level Reward Shaping with Policy Entropy](https://arxiv.org/abs/2508.04349) uses **dynamic entropy weighting**: within each response, token-level advantage is scaled by \(w_t = H_t / \sum_k H_k\) where \(H_t\) is the policy entropy at step \(t\). Group-relative scalars are the same as GRPO; only the distribution across tokens changes (high-entropy steps receive a larger share).
+
+By default, advantages are **`w_t` times the sequence length** so that \(\sum_t A_t = \hat{A}_i \cdot n\) for \(n\) valid response tokens, matching the **total advantage mass** of GRPO’s uniform broadcast. Set `algorithm.gtpo_scale_advantage_by_seq_len=False` for the legacy behavior \(\sum_t A_t = \hat{A}_i\).
+
+Configure:
+
+- `algorithm.adv_estimator`: set to **`grpo_gtpo`**
+- `algorithm.norm_adv_by_std_in_grpo`: same meaning as GRPO (typically `True`)
+- `algorithm.gtpo_scale_advantage_by_seq_len`: default **`True`** (fair total mass vs GRPO); **`False`** for legacy scaling
+- **Do not** use `rollout_correction` **bypass_mode**: GTPO needs per-token entropy from the recomputed `old_log_prob` path; bypass mode does not provide `token_entropy`.
+
+Other settings match the GRPO example scripts (e.g. `examples/grpo_trainer/run_grpo_gtpo_r1_distill_7b_dapo_data.sh`).
+
 ### DrGRPO
 
 [Understanding R1-Zero-Like Training: A Critical Perspective](https://arxiv.org/pdf/2503.20783) claims there's optimization bias in GRPO, which leads to artificially longer responses, especially for incorrect outputs. This inefficiency stems from the way GRPO calculates advantages using group-based reward normalization. Instead, DrGRPO aggregates token-level losses by normalizing with a global constant to eliminate length bias.

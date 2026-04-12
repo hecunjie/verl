@@ -105,6 +105,7 @@ class AdvantageEstimator(str, Enum):
     GPG = "gpg"
     RLOO_VECTORIZED = "rloo_vectorized"
     GRPO_VECTORIZED = "grpo_vectorized"
+    GRPO_GTPO = "grpo_gtpo"
     OPTIMAL_TOKEN_BASELINE = "optimal_token_baseline"
     TIR_OPTIMAL_TOKEN_BASELINE = "tir_optimal_token_baseline"
 
@@ -354,6 +355,60 @@ def compute_grpo_vectorized_outcome_advantage(
         else:
             scalars = scores - mean_g[g]
         advantages = scalars.unsqueeze(-1) * response_mask
+        return advantages, advantages
+
+
+@register_adv_est(AdvantageEstimator.GRPO_GTPO)  # or simply: @register_adv_est("grpo_gtpo")
+def compute_grpo_gtpo_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    token_entropy: torch.Tensor,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Optional[AlgoConfig] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """GTPO-style group advantage with **dynamic entropy weighting** (arXiv:2508.04349).
+
+    Same group-relative scalar :math:`\\hat{A}_i` as GRPO / ``compute_grpo_vectorized_outcome_advantage``,
+    with per-token weights :math:`w_t = H_t / \\sum_{k \\in \\text{resp}} H_k` (masked positions only).
+
+    If ``gtpo_scale_advantage_by_seq_len`` is True (default), each token receives
+    :math:`\\hat{A}_i \\, w_t \\, n_i` where :math:`n_i` is the number of valid response tokens, so
+    :math:`\\sum_t \\hat{A}_{i,t} = \\hat{A}_i \\, n_i`, matching the total advantage mass of GRPO's
+    uniform broadcast. If False (legacy), :math:`\\hat{A}_{i,t} = \\hat{A}_i \\, w_t` and
+    :math:`\\sum_t \\hat{A}_{i,t} = \\hat{A}_i`.
+
+    Args:
+        token_level_rewards: (bs, response_length) — typically sparse outcome reward on last token(s).
+        response_mask: (bs, response_length)
+        index: (bs,) group id per sample (same as GRPO).
+        token_entropy: (bs, response_length) per-step policy entropy (e.g. from ``compute_log_prob``).
+        config: Optional; reads ``gtpo_scale_advantage_by_seq_len`` (default True when omitted).
+    """
+    with torch.no_grad():
+        scores = token_level_rewards.sum(dim=-1)
+        g = as_torch_index(index, device=scores.device)
+        mean_g, std_g, _ = group_mean_std(scores, g, eps=epsilon, device=scores.device)
+        if norm_adv_by_std_in_grpo:
+            scalars = (scores - mean_g[g]) / (std_g[g] + epsilon)
+        else:
+            scalars = scores - mean_g[g]
+
+        mask_f = response_mask.float()
+        sum_mask = mask_f.sum(dim=-1, keepdim=True).clamp(min=1.0)
+        uniform_w = mask_f / sum_mask
+        H = (token_entropy.float() * mask_f).clamp(min=0.0)
+        sum_H = H.sum(dim=-1, keepdim=True)
+        w = torch.where(sum_H > epsilon, H / (sum_H + epsilon), uniform_w)
+
+        scale_by_seq_len = True
+        if config is not None:
+            scale_by_seq_len = config.get("gtpo_scale_advantage_by_seq_len", True)
+
+        advantages = scalars.unsqueeze(-1) * w
+        if scale_by_seq_len:
+            advantages = advantages * sum_mask
         return advantages, advantages
 
 

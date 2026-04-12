@@ -573,8 +573,13 @@ class AlgoConfig(BaseConfig):
     Args:
         gamma (float): Discount factor for future rewards.
         lam (float): Trade-off between bias and variance in the GAE estimator.
-        adv_estimator (str): Advantage estimator type: "gae", "grpo", "reinforce_plus_plus", etc.
+        adv_estimator (str): Advantage estimator type: "gae", "grpo", "grpo_gtpo" (GTPO entropy
+            weighting; arXiv:2508.04349), "reinforce_plus_plus", etc.
         norm_adv_by_std_in_grpo (bool): Whether to normalize advantages by std (specific to GRPO).
+        gtpo_scale_advantage_by_seq_len (bool): GTPO only. If True (default), multiply entropy
+            weights by the number of valid response tokens so ``sum_t A_t = n * \\hat{A}_i``, matching
+            the total advantage mass of GRPO's per-token broadcast. If False, ``sum_t A_t = \\hat{A}_i``
+            (legacy behavior).
         use_kl_in_reward (bool): Whether to enable in-reward KL penalty.
         kl_penalty (str): How to estimate KL divergence: "kl", "abs", "mse", "low_var_kl", or "full".
         kl_ctrl (KLControlConfig): KL control configuration.
@@ -603,6 +608,7 @@ class AlgoConfig(BaseConfig):
     lam: float = 1.0
     adv_estimator: str = "gae"
     norm_adv_by_std_in_grpo: bool = True
+    gtpo_scale_advantage_by_seq_len: bool = True
     use_kl_in_reward: bool = False
     kl_penalty: str = "kl"
     kl_ctrl: KLControlConfig = field(default_factory=KLControlConfig)

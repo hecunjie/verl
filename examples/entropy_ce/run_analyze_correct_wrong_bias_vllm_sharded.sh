@@ -47,6 +47,8 @@ MC_M_SAMPLES="${MC_M_SAMPLES:-64}"
 # F 估计：默认 beam（与 analyze 脚本默认一致）；改 MC 时设 F_ESTIMATOR=mc
 F_ESTIMATOR="${F_ESTIMATOR:-beam}"
 F_BEAM_WIDTH="${F_BEAM_WIDTH:-10}"
+# GTPO baseline（无 F 估计）：CREDIT_ASSIGNMENT=gtpo；默认 method2 与原先一致
+CREDIT_ASSIGNMENT="${CREDIT_ASSIGNMENT:-method2}"
 # F 续写：full=一次续写到 MAX_NEW_TOKENS；first_sentence=单次最多 F_SENTENCE_MAX_NEW_TOKENS 再截断到首句（可批量）
 F_CONTINUATION_MODE="${F_CONTINUATION_MODE:-full}"
 F_SENTENCE_MAX_NEW_TOKENS="${F_SENTENCE_MAX_NEW_TOKENS:-256}"
@@ -120,6 +122,7 @@ for ((r = 0; r < NPROC_PER_NODE; r++)); do
     EXTRA_ARGS+=(--no-save-rollouts-archive)
   fi
   EXTRA_ARGS+=(--bias_metrics_mode "${BIAS_METRICS_MODE}")
+  EXTRA_ARGS+=(--credit_assignment "${CREDIT_ASSIGNMENT}")
   EXTRA_ARGS+=(--f_continuation_mode "${F_CONTINUATION_MODE}")
   EXTRA_ARGS+=(--f_sentence_max_new_tokens "${F_SENTENCE_MAX_NEW_TOKENS}")
   EXTRA_ARGS+=(--f_sentence_stop "${F_SENTENCE_STOP}")
