@@ -1,0 +1,509 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import random
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+from transformers import AutoTokenizer
+
+from entropy_credit_experiment import (
+    _configure_vllm_ipc_for_single_node,
+    _configure_vllm_multiprocessing_spawn,
+    _restore_torchrun_dist_env,
+    _snapshot_and_clear_torchrun_dist_env,
+    build_prompt_text,
+    clamp_vllm_logprobs_topk,
+    entropy_from_logprobs_topk,
+    estimate_F_mc_many_prefixes_vllm,
+    evaluate_solution_acc,
+    file_sync,
+    init_dist,
+    load_data,
+    purge_all_torchrun_like_env_for_vllm_standalone,
+    vllm_generate_quiet,
+)
+
+
+def _ground_truth_from_row(row: dict[str, Any]) -> str:
+    rm = row.get("reward_model")
+    if isinstance(rm, dict) and rm.get("ground_truth") is not None:
+        return str(rm["ground_truth"])
+    if isinstance(rm, str) and rm.strip():
+        try:
+            obj = json.loads(rm)
+            if isinstance(obj, dict) and obj.get("ground_truth") is not None:
+                return str(obj["ground_truth"])
+        except json.JSONDecodeError:
+            pass
+    if row.get("label") is not None:
+        if isinstance(row["label"], list) and len(row["label"]) == 1:
+            return str(row["label"][0])
+        return str(row["label"])
+    return ""
+
+
+def _step_logprobs_vllm(llm: Any, prefix_ids: list[int], logprobs_k: int) -> tuple[int | None, dict[int, float]]:
+    from vllm import SamplingParams
+    from vllm.inputs import TokensPrompt
+
+    k = clamp_vllm_logprobs_topk(logprobs_k)
+    sp = SamplingParams(max_tokens=1, temperature=0.0, top_p=1.0, logprobs=k)
+    out = vllm_generate_quiet(llm, [TokensPrompt(prompt_token_ids=prefix_ids)], sp)
+    o = out[0].outputs[0]
+    if not o.token_ids:
+        return None, {}
+    token_id = int(o.token_ids[0])
+    if not o.logprobs:
+        return token_id, {}
+    step_lp_raw = o.logprobs[0]
+    step_lp: dict[int, float] = {}
+    for tid, info in step_lp_raw.items():
+        step_lp[int(tid)] = float(info.logprob)
+    return token_id, step_lp
+
+
+def _topk_from_step_logprobs(step_logprobs: dict[int, float], topk: int) -> tuple[list[int], list[float]]:
+    if not step_logprobs:
+        return [], []
+    items = sorted(step_logprobs.items(), key=lambda x: x[1], reverse=True)[: max(1, topk)]
+    tids = [int(tid) for tid, _ in items]
+    lps = np.array([float(lp) for _, lp in items], dtype=np.float64)
+    m = float(np.max(lps))
+    p = np.exp(np.clip(lps - m, -80.0, 0.0))
+    z = float(np.sum(p))
+    if z <= 0.0 or not np.isfinite(z):
+        probs = np.ones(len(tids), dtype=np.float64) / float(len(tids))
+    else:
+        probs = p / z
+    return tids, [float(x) for x in probs.tolist()]
+
+
+def _topp_capped_from_step_logprobs(
+    step_logprobs: dict[int, float],
+    top_p: float,
+    max_k: int,
+) -> tuple[list[int], list[float]]:
+    if not step_logprobs:
+        return [], []
+    items = sorted(step_logprobs.items(), key=lambda x: x[1], reverse=True)
+    tids_all = [int(tid) for tid, _ in items]
+    lps = np.array([float(lp) for _, lp in items], dtype=np.float64)
+    m = float(np.max(lps))
+    p = np.exp(np.clip(lps - m, -80.0, 0.0))
+    z = float(np.sum(p))
+    if z <= 0.0 or not np.isfinite(z):
+        p = np.ones(len(tids_all), dtype=np.float64) / float(len(tids_all))
+    else:
+        p = p / z
+    tp = float(np.clip(top_p, 1e-12, 1.0))
+    cum = np.cumsum(p)
+    idx = int(np.searchsorted(cum, tp, side="left"))
+    k_topp = max(1, idx + 1)
+    k_used = min(max(1, int(max_k)), k_topp)
+    sel_tids = tids_all[:k_used]
+    sel_p = p[:k_used]
+    z2 = float(np.sum(sel_p))
+    if z2 <= 0.0 or not np.isfinite(z2):
+        sel_p = np.ones(len(sel_tids), dtype=np.float64) / float(len(sel_tids))
+    else:
+        sel_p = sel_p / z2
+    return sel_tids, [float(x) for x in sel_p.tolist()]
+
+
+def _decode_one_policy(
+    *,
+    llm: Any,
+    tokenizer: Any,
+    prompt_ids: list[int],
+    policy: str,
+    entropy_threshold: float,
+    candidate_top_p: float,
+    candidate_max_k: int,
+    max_new_tokens: int,
+    mc_m_samples: int,
+    mc_temperature: float,
+    mc_top_p: float,
+    vllm_logprobs_topk: int,
+    vllm_request_batch_chunk: int,
+    f_continuation_mode: str,
+    f_sentence_max_new_tokens: int,
+    f_sentence_stop: str,
+    normalize_by_continuation_length: bool,
+    max_branch_steps: int,
+    rng: random.Random,
+    eos_token_id: int | None,
+) -> tuple[list[int], list[dict[str, Any]]]:
+    response_ids: list[int] = []
+    branch_records: list[dict[str, Any]] = []
+    branch_count = 0
+    sentence_stop_check = None
+    if f_sentence_stop == "pysbd":
+        from sentence_stop_utils import make_pysbd_first_sentence_stop_check
+
+        sentence_stop_check = make_pysbd_first_sentence_stop_check()
+
+    for step_idx in range(max_new_tokens):
+        prefix = prompt_ids + response_ids
+        greedy_token, step_lp = _step_logprobs_vllm(
+            llm=llm,
+            prefix_ids=prefix,
+            logprobs_k=max(vllm_logprobs_topk, candidate_max_k),
+        )
+        if greedy_token is None:
+            break
+
+        entropy_t = entropy_from_logprobs_topk(step_lp)
+        cands, cand_probs = _topp_capped_from_step_logprobs(
+            step_lp,
+            top_p=candidate_top_p,
+            max_k=candidate_max_k,
+        )
+        if not cands:
+            cands = [greedy_token]
+            cand_probs = [1.0]
+
+        should_branch = (
+            entropy_t >= entropy_threshold
+            and len(cands) >= 2
+            and (max_branch_steps <= 0 or branch_count < max_branch_steps)
+        )
+
+        chosen_token = greedy_token
+        f_values: list[float] = []
+        if should_branch:
+            if policy == "random_topk":
+                chosen_token = int(rng.choice(cands))
+            elif policy == "min_f_mc":
+                remaining = max_new_tokens - step_idx - 1
+                if remaining <= 0:
+                    chosen_token = int(cands[0])
+                else:
+                    prefixes = [(prompt_ids + response_ids + [int(t)]) for t in cands]
+                    f_values = estimate_F_mc_many_prefixes_vllm(
+                        llm=llm,
+                        prefixes=prefixes,
+                        m_samples=mc_m_samples,
+                        max_new_tokens=remaining,
+                        temperature=mc_temperature,
+                        top_p=mc_top_p,
+                        logprobs_k=vllm_logprobs_topk,
+                        batch_chunk=vllm_request_batch_chunk,
+                        f_continuation_mode=f_continuation_mode,
+                        tokenizer=tokenizer if f_continuation_mode == "first_sentence" else None,
+                        f_sentence_max_new_tokens=f_sentence_max_new_tokens,
+                        sentence_stop_check=sentence_stop_check,
+                        normalize_by_continuation_length=normalize_by_continuation_length,
+                    )
+                    if not f_values or len(f_values) != len(cands):
+                        chosen_token = int(cands[0])
+                    else:
+                        best_i = int(np.argmin(np.array(f_values, dtype=np.float64)))
+                        chosen_token = int(cands[best_i])
+            else:
+                raise ValueError(f"unsupported policy: {policy}")
+
+            branch_count += 1
+            branch_records.append(
+                {
+                    "step_index": int(step_idx),
+                    "entropy_t": float(entropy_t),
+                    "candidates": [int(x) for x in cands],
+                    "candidate_probs_renorm_topp": [float(x) for x in cand_probs],
+                    "candidate_texts": [tokenizer.decode([int(x)], skip_special_tokens=True) for x in cands],
+                    "f_values_mc": [float(x) for x in f_values] if f_values else None,
+                    "chosen_token": int(chosen_token),
+                    "chosen_text": tokenizer.decode([int(chosen_token)], skip_special_tokens=True),
+                }
+            )
+
+        response_ids.append(int(chosen_token))
+        if eos_token_id is not None and int(chosen_token) == int(eos_token_id):
+            break
+
+    return response_ids, branch_records
+
+
+def _mean(xs: list[float]) -> float:
+    return float(np.mean(np.array(xs, dtype=np.float64))) if xs else float("nan")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Compare min-F_mc decoding vs random-topk decoding at high-entropy steps.")
+    parser.add_argument("--input_data", type=str, required=True)
+    parser.add_argument("--model_path", type=str, required=True)
+    parser.add_argument("--output_dir", type=str, required=True)
+    parser.add_argument("--max_samples", type=int, default=300)
+    parser.add_argument("--seed", type=int, default=42)
+
+    parser.add_argument("--max_new_tokens", type=int, default=2048)
+    parser.add_argument("--entropy_threshold", type=float, default=1.0)
+    parser.add_argument("--candidate_top_p", type=float, default=0.95)
+    parser.add_argument("--candidate_max_k", type=int, default=5)
+    parser.add_argument("--max_branch_steps", type=int, default=0, help="<=0 means no cap.")
+
+    parser.add_argument("--mc_m_samples", type=int, default=128)
+    parser.add_argument("--mc_temperature", type=float, default=1.0)
+    parser.add_argument("--mc_top_p", type=float, default=0.95)
+    parser.add_argument("--bias_metrics_mode", choices=["raw", "length_normalized"], default="length_normalized")
+    parser.add_argument("--f_continuation_mode", choices=["full", "first_sentence"], default="first_sentence")
+    parser.add_argument("--f_sentence_max_new_tokens", type=int, default=256)
+    parser.add_argument("--f_sentence_stop", choices=["simple", "pysbd"], default="simple")
+
+    parser.add_argument("--vllm_logprobs_topk", type=int, default=20)
+    parser.add_argument("--vllm_request_batch_chunk", type=int, default=64)
+    parser.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.9)
+    parser.add_argument("--vllm_max_model_len", type=int, default=32768)
+    parser.add_argument("--save_traces", action=argparse.BooleanOptionalAction, default=True)
+
+    parser.add_argument("--vllm_shard_rank", type=int, default=None)
+    parser.add_argument("--vllm_shard_world_size", type=int, default=None)
+    args = parser.parse_args()
+
+    if not (0.0 < float(args.candidate_top_p) <= 1.0):
+        raise SystemExit("--candidate_top_p must be in (0, 1].")
+    if int(args.candidate_max_k) < 2:
+        raise SystemExit("--candidate_max_k should be >=2 for meaningful compare.")
+    if args.mc_m_samples < 1:
+        raise SystemExit("--mc_m_samples must be >=1.")
+    if args.max_new_tokens < 1:
+        raise SystemExit("--max_new_tokens must be >=1.")
+    if args.vllm_request_batch_chunk < 1:
+        raise SystemExit("--vllm_request_batch_chunk must be >=1.")
+
+    vllm_standalone = args.vllm_shard_rank is not None and args.vllm_shard_world_size is not None
+    if (args.vllm_shard_rank is None) ^ (args.vllm_shard_world_size is None):
+        raise SystemExit("Pass both --vllm_shard_rank and --vllm_shard_world_size, or neither.")
+    if vllm_standalone:
+        purge_all_torchrun_like_env_for_vllm_standalone()
+
+    _configure_vllm_multiprocessing_spawn()
+    _configure_vllm_ipc_for_single_node()
+
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    dist_snap = _snapshot_and_clear_torchrun_dist_env()
+    try:
+        from vllm import LLM
+
+        llm = LLM(
+            model=args.model_path,
+            trust_remote_code=True,
+            dtype="bfloat16",
+            tensor_parallel_size=1,
+            gpu_memory_utilization=float(args.vllm_gpu_memory_utilization),
+            max_model_len=int(args.vllm_max_model_len),
+            enforce_eager=True,
+        )
+    finally:
+        _restore_torchrun_dist_env(dist_snap)
+
+    _, rank, world_size = init_dist(
+        backend="vllm",
+        rank_override=args.vllm_shard_rank if vllm_standalone else None,
+        world_size_override=args.vllm_shard_world_size if vllm_standalone else None,
+    )
+
+    out_dir = Path(args.output_dir).expanduser().resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    part_path = out_dir / f"infer_compare_rank{rank}.jsonl"
+    part_path.write_text("", encoding="utf-8")
+
+    rows = load_data(args.input_data, args.max_samples, args.seed)
+    local_rows = [row for idx, row in enumerate(rows) if idx % world_size == rank]
+
+    rng = random.Random(args.seed + rank)
+    np.random.seed(args.seed + rank)
+
+    acc_minf: list[float] = []
+    acc_rand: list[float] = []
+    branch_count_minf: list[float] = []
+    branch_count_rand: list[float] = []
+    token_len_minf: list[float] = []
+    token_len_rand: list[float] = []
+
+    for local_i, row in enumerate(local_rows):
+        global_idx = local_i * world_size + rank
+        prompt_text = build_prompt_text(tokenizer, row["prompt"])
+        prompt_ids = tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False)["input_ids"][0].tolist()
+        data_source = row.get("data_source", "math_dapo")
+        ground_truth = _ground_truth_from_row(row)
+
+        response_minf, trace_minf = _decode_one_policy(
+            llm=llm,
+            tokenizer=tokenizer,
+            prompt_ids=prompt_ids,
+            policy="min_f_mc",
+            entropy_threshold=float(args.entropy_threshold),
+            candidate_top_p=float(args.candidate_top_p),
+            candidate_max_k=int(args.candidate_max_k),
+            max_new_tokens=int(args.max_new_tokens),
+            mc_m_samples=int(args.mc_m_samples),
+            mc_temperature=float(args.mc_temperature),
+            mc_top_p=float(args.mc_top_p),
+            vllm_logprobs_topk=int(args.vllm_logprobs_topk),
+            vllm_request_batch_chunk=int(args.vllm_request_batch_chunk),
+            f_continuation_mode=str(args.f_continuation_mode),
+            f_sentence_max_new_tokens=int(args.f_sentence_max_new_tokens),
+            f_sentence_stop=str(args.f_sentence_stop),
+            normalize_by_continuation_length=(args.bias_metrics_mode == "length_normalized"),
+            max_branch_steps=int(args.max_branch_steps),
+            rng=rng,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+        response_rand, trace_rand = _decode_one_policy(
+            llm=llm,
+            tokenizer=tokenizer,
+            prompt_ids=prompt_ids,
+            policy="random_topk",
+            entropy_threshold=float(args.entropy_threshold),
+            candidate_top_p=float(args.candidate_top_p),
+            candidate_max_k=int(args.candidate_max_k),
+            max_new_tokens=int(args.max_new_tokens),
+            mc_m_samples=int(args.mc_m_samples),
+            mc_temperature=float(args.mc_temperature),
+            mc_top_p=float(args.mc_top_p),
+            vllm_logprobs_topk=int(args.vllm_logprobs_topk),
+            vllm_request_batch_chunk=int(args.vllm_request_batch_chunk),
+            f_continuation_mode=str(args.f_continuation_mode),
+            f_sentence_max_new_tokens=int(args.f_sentence_max_new_tokens),
+            f_sentence_stop=str(args.f_sentence_stop),
+            normalize_by_continuation_length=(args.bias_metrics_mode == "length_normalized"),
+            max_branch_steps=int(args.max_branch_steps),
+            rng=rng,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+
+        text_minf = tokenizer.decode(response_minf, skip_special_tokens=True)
+        text_rand = tokenizer.decode(response_rand, skip_special_tokens=True)
+        ok_minf, eval_minf = evaluate_solution_acc(
+            data_source=data_source,
+            solution_str=text_minf,
+            ground_truth=ground_truth,
+        )
+        ok_rand, eval_rand = evaluate_solution_acc(
+            data_source=data_source,
+            solution_str=text_rand,
+            ground_truth=ground_truth,
+        )
+        acc_minf.append(1.0 if ok_minf else 0.0)
+        acc_rand.append(1.0 if ok_rand else 0.0)
+        branch_count_minf.append(float(len(trace_minf)))
+        branch_count_rand.append(float(len(trace_rand)))
+        token_len_minf.append(float(len(response_minf)))
+        token_len_rand.append(float(len(response_rand)))
+
+        rec: dict[str, Any] = {
+            "sample_index": int(global_idx),
+            "shard_rank": int(rank),
+            "data_source": data_source,
+            "ground_truth": ground_truth,
+            "prompt_text": prompt_text,
+            "entropy_threshold": float(args.entropy_threshold),
+            "candidate_top_p": float(args.candidate_top_p),
+            "candidate_max_k": int(args.candidate_max_k),
+            "max_new_tokens": int(args.max_new_tokens),
+            "mc_m_samples": int(args.mc_m_samples),
+            "f_continuation_mode": str(args.f_continuation_mode),
+            "f_sentence_max_new_tokens": int(args.f_sentence_max_new_tokens),
+            "f_sentence_stop": str(args.f_sentence_stop),
+            "bias_metrics_mode": str(args.bias_metrics_mode),
+            "result_min_f_mc": {
+                "is_correct": bool(ok_minf),
+                "eval": eval_minf,
+                "response_text": text_minf,
+                "response_len_tokens": int(len(response_minf)),
+                "num_branch_steps": int(len(trace_minf)),
+            },
+            "result_random_topk": {
+                "is_correct": bool(ok_rand),
+                "eval": eval_rand,
+                "response_text": text_rand,
+                "response_len_tokens": int(len(response_rand)),
+                "num_branch_steps": int(len(trace_rand)),
+            },
+            "improvement_min_f_over_random": bool(ok_minf and not ok_rand),
+            "regression_min_f_over_random": bool((not ok_minf) and ok_rand),
+        }
+        if args.save_traces:
+            rec["trace_min_f_mc"] = trace_minf
+            rec["trace_random_topk"] = trace_rand
+
+        with open(part_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    file_sync(out_dir=out_dir, rank=rank, world_size=world_size, tag="done_infer_compare")
+
+    if rank == 0:
+        merged: list[dict[str, Any]] = []
+        for r in range(world_size):
+            p = out_dir / f"infer_compare_rank{r}.jsonl"
+            if not p.exists():
+                continue
+            with open(p, encoding="utf-8") as f:
+                for line in f:
+                    if line.strip():
+                        merged.append(json.loads(line))
+
+        merged_path = out_dir / "infer_compare_merged.jsonl"
+        with open(merged_path, "w", encoding="utf-8") as f:
+            for rec in merged:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+        paired_improve = sum(int(x.get("improvement_min_f_over_random", False)) for x in merged)
+        paired_regress = sum(int(x.get("regression_min_f_over_random", False)) for x in merged)
+        n = len(merged)
+        if n > 0:
+            acc_minf_all = [1.0 if x["result_min_f_mc"]["is_correct"] else 0.0 for x in merged]
+            acc_rand_all = [1.0 if x["result_random_topk"]["is_correct"] else 0.0 for x in merged]
+            branch_minf_all = [float(x["result_min_f_mc"]["num_branch_steps"]) for x in merged]
+            branch_rand_all = [float(x["result_random_topk"]["num_branch_steps"]) for x in merged]
+            len_minf_all = [float(x["result_min_f_mc"]["response_len_tokens"]) for x in merged]
+            len_rand_all = [float(x["result_random_topk"]["response_len_tokens"]) for x in merged]
+        else:
+            acc_minf_all = acc_minf
+            acc_rand_all = acc_rand
+            branch_minf_all = branch_count_minf
+            branch_rand_all = branch_count_rand
+            len_minf_all = token_len_minf
+            len_rand_all = token_len_rand
+
+        summary = {
+            "num_prompts": int(n),
+            "accuracy_min_f_mc": _mean(acc_minf_all),
+            "accuracy_random_topk": _mean(acc_rand_all),
+            "accuracy_gain_abs": _mean(acc_minf_all) - _mean(acc_rand_all),
+            "paired_improve_count": int(paired_improve),
+            "paired_regress_count": int(paired_regress),
+            "paired_net_gain": int(paired_improve - paired_regress),
+            "avg_branch_steps_min_f_mc": _mean(branch_minf_all),
+            "avg_branch_steps_random_topk": _mean(branch_rand_all),
+            "avg_response_len_min_f_mc": _mean(len_minf_all),
+            "avg_response_len_random_topk": _mean(len_rand_all),
+            "config": {
+                "entropy_threshold": float(args.entropy_threshold),
+                "candidate_top_p": float(args.candidate_top_p),
+                "candidate_max_k": int(args.candidate_max_k),
+                "max_new_tokens": int(args.max_new_tokens),
+                "max_branch_steps": int(args.max_branch_steps),
+                "mc_m_samples": int(args.mc_m_samples),
+                "mc_temperature": float(args.mc_temperature),
+                "mc_top_p": float(args.mc_top_p),
+                "f_continuation_mode": str(args.f_continuation_mode),
+                "f_sentence_max_new_tokens": int(args.f_sentence_max_new_tokens),
+                "f_sentence_stop": str(args.f_sentence_stop),
+                "bias_metrics_mode": str(args.bias_metrics_mode),
+            },
+        }
+        with open(out_dir / "infer_compare_summary.json", "w", encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2)
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()
