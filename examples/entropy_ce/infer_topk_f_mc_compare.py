@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
+import time
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +28,11 @@ from entropy_credit_experiment import (
     purge_all_torchrun_like_env_for_vllm_standalone,
     vllm_generate_quiet,
 )
+
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # pragma: no cover
+    tqdm = None  # type: ignore[misc, assignment]
 
 
 def _ground_truth_from_row(row: dict[str, Any]) -> str:
@@ -136,6 +143,11 @@ def _decode_one_policy(
     max_branch_steps: int,
     rng: random.Random,
     eos_token_id: int | None,
+    show_nested_progress: bool = False,
+    progress_position: int = 1,
+    progress_desc: str = "decode",
+    progress_mc_position: int = 2,
+    progress_mc_desc: str = "mc",
 ) -> tuple[list[int], list[dict[str, Any]]]:
     response_ids: list[int] = []
     branch_records: list[dict[str, Any]] = []
@@ -146,7 +158,18 @@ def _decode_one_policy(
 
         sentence_stop_check = make_pysbd_first_sentence_stop_check()
 
-    for step_idx in range(max_new_tokens):
+    step_iter = range(max_new_tokens)
+    if show_nested_progress and tqdm is not None:
+        step_iter = tqdm(
+            step_iter,
+            total=max_new_tokens,
+            desc=progress_desc,
+            dynamic_ncols=True,
+            position=progress_position,
+            leave=False,
+        )
+
+    for step_idx in step_iter:
         prefix = prompt_ids + response_ids
         greedy_token, step_lp = _step_logprobs_vllm(
             llm=llm,
@@ -183,6 +206,19 @@ def _decode_one_policy(
                     chosen_token = int(cands[0])
                 else:
                     prefixes = [(prompt_ids + response_ids + [int(t)]) for t in cands]
+                    n_req = len(prefixes) * int(mc_m_samples)
+                    bs = int(vllm_request_batch_chunk)
+                    chunk_starts = range(0, n_req, bs)
+                    if show_nested_progress and tqdm is not None:
+                        n_chunks = (n_req + bs - 1) // bs
+                        chunk_starts = tqdm(
+                            chunk_starts,
+                            total=n_chunks,
+                            desc=progress_mc_desc,
+                            dynamic_ncols=True,
+                            position=progress_mc_position,
+                            leave=False,
+                        )
                     f_values = estimate_F_mc_many_prefixes_vllm(
                         llm=llm,
                         prefixes=prefixes,
@@ -197,6 +233,7 @@ def _decode_one_policy(
                         f_sentence_max_new_tokens=f_sentence_max_new_tokens,
                         sentence_stop_check=sentence_stop_check,
                         normalize_by_continuation_length=normalize_by_continuation_length,
+                        chunk_starts_iter=chunk_starts,
                     )
                     if not f_values or len(f_values) != len(cands):
                         chosen_token = int(cands[0])
@@ -258,6 +295,23 @@ def main() -> None:
     parser.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.9)
     parser.add_argument("--vllm_max_model_len", type=int, default=32768)
     parser.add_argument("--save_traces", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--no_progress", action="store_true", help="Disable tqdm progress bars.")
+    parser.add_argument(
+        "--progress_all_ranks",
+        action="store_true",
+        help="Show progress bars on all ranks (default: rank0 only).",
+    )
+    parser.add_argument(
+        "--progress_nested",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Show nested decode/MC progress bars per sample.",
+    )
+    parser.add_argument(
+        "--progress_echo",
+        action="store_true",
+        help="Rank0 prints prompt-level elapsed logs to stderr.",
+    )
 
     parser.add_argument("--vllm_shard_rank", type=int, default=None)
     parser.add_argument("--vllm_shard_world_size", type=int, default=None)
@@ -320,6 +374,13 @@ def main() -> None:
     rng = random.Random(args.seed + rank)
     np.random.seed(args.seed + rank)
 
+    env_no_tqdm = os.environ.get("TQDM_DISABLE", "").strip().lower() in ("1", "true", "yes")
+    use_tqdm = tqdm is not None and not args.no_progress and not env_no_tqdm and (
+        args.progress_all_ranks or rank == 0
+    )
+    use_nested = bool(use_tqdm and args.progress_nested)
+    bar_base = (rank * 4) if (use_tqdm and use_nested and args.progress_all_ranks) else (rank if use_tqdm else 0)
+
     acc_minf: list[float] = []
     acc_rand: list[float] = []
     branch_count_minf: list[float] = []
@@ -327,8 +388,29 @@ def main() -> None:
     token_len_minf: list[float] = []
     token_len_rand: list[float] = []
 
-    for local_i, row in enumerate(local_rows):
+    prompt_iter = enumerate(local_rows)
+    if use_tqdm:
+        prompt_iter = tqdm(
+            prompt_iter,
+            total=len(local_rows),
+            desc=f"shard{rank} prompts",
+            dynamic_ncols=True,
+            position=bar_base,
+            leave=True,
+        )
+
+    run_t0 = 0.0
+    if args.progress_echo and rank == 0:
+        run_t0 = time.perf_counter()
+
+    for local_i, row in prompt_iter:
         global_idx = local_i * world_size + rank
+        if args.progress_echo and rank == 0:
+            elapsed = time.perf_counter() - run_t0
+            print(
+                f"[infer_compare] rank0 prompt {local_i + 1}/{len(local_rows)} global#{global_idx} elapsed={elapsed:.1f}s",
+                flush=True,
+            )
         prompt_text = build_prompt_text(tokenizer, row["prompt"])
         prompt_ids = tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False)["input_ids"][0].tolist()
         data_source = row.get("data_source", "math_dapo")
@@ -355,6 +437,11 @@ def main() -> None:
             max_branch_steps=int(args.max_branch_steps),
             rng=rng,
             eos_token_id=tokenizer.eos_token_id,
+            show_nested_progress=bool(use_nested),
+            progress_position=bar_base + 1,
+            progress_desc=f"shard{rank} minF decode",
+            progress_mc_position=bar_base + 2,
+            progress_mc_desc=f"shard{rank} minF MC",
         )
         response_rand, trace_rand = _decode_one_policy(
             llm=llm,
@@ -377,6 +464,11 @@ def main() -> None:
             max_branch_steps=int(args.max_branch_steps),
             rng=rng,
             eos_token_id=tokenizer.eos_token_id,
+            show_nested_progress=bool(use_nested),
+            progress_position=bar_base + 3,
+            progress_desc=f"shard{rank} rand decode",
+            progress_mc_position=bar_base + 2,
+            progress_mc_desc=f"shard{rank} rand MC",
         )
 
         text_minf = tokenizer.decode(response_minf, skip_special_tokens=True)

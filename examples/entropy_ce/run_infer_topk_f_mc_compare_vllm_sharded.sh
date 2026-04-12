@@ -31,6 +31,10 @@ VLLM_REQUEST_BATCH_CHUNK="${VLLM_REQUEST_BATCH_CHUNK:-64}"
 VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.9}"
 VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-32768}"
 SAVE_TRACES="${SAVE_TRACES:-1}"
+NO_PROGRESS="${NO_PROGRESS:-0}"
+PROGRESS_ALL_RANKS="${PROGRESS_ALL_RANKS:-0}"
+PROGRESS_NESTED="${PROGRESS_NESTED:-1}"
+PROGRESS_ECHO="${PROGRESS_ECHO:-0}"
 
 mkdir -p "${OUTPUT_DIR}"
 export VLLM_HOST_IP="${VLLM_HOST_IP:-127.0.0.1}"
@@ -58,6 +62,18 @@ for ((r = 0; r < NPROC_PER_NODE; r++)); do
   EXTRA_ARGS=()
   if [ "${SAVE_TRACES}" != "1" ]; then
     EXTRA_ARGS+=(--no-save_traces)
+  fi
+  if [ "${NO_PROGRESS}" = "1" ]; then
+    EXTRA_ARGS+=(--no_progress)
+  fi
+  if [ "${PROGRESS_ALL_RANKS}" = "1" ]; then
+    EXTRA_ARGS+=(--progress_all_ranks)
+  fi
+  if [ "${PROGRESS_NESTED}" != "1" ]; then
+    EXTRA_ARGS+=(--no-progress_nested)
+  fi
+  if [ "${PROGRESS_ECHO}" = "1" ]; then
+    EXTRA_ARGS+=(--progress_echo)
   fi
 
   CUDA_VISIBLE_DEVICES="${r}" python3 examples/entropy_ce/infer_topk_f_mc_compare.py \
