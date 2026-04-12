@@ -22,6 +22,7 @@ from entropy_credit_experiment import (
     build_prompt_text,
     build_token_context,
     entropy_from_logprobs_topk,
+    estimate_F_beam_many_prefixes_vllm,
     estimate_F_mc_many_prefixes_vllm,
     evaluate_solution_acc,
     file_sync,
@@ -216,10 +217,22 @@ def main() -> None:
         help="每条 prompt 将题干、ground_truth 与全部 rollout 的完整回答写入 rollouts_archive_rank*.jsonl；rank0 合并为 rollouts_archive_merged.jsonl。关闭：--no-save-rollouts-archive。",
     )
     parser.add_argument(
+        "--f_estimator",
+        choices=["mc", "beam"],
+        default="beam",
+        help="F 的估计方式：mc=对续写做蒙特卡洛重复采样；beam=vLLM beam_search 取 beam_width 条假设后对 F 取平均（确定性、无采样方差）。",
+    )
+    parser.add_argument(
+        "--f_beam_width",
+        type=int,
+        default=10,
+        help="f_estimator=beam 时的 beam 宽度（与 vLLM 内部每步 logprobs=2*beam_width 一致）。",
+    )
+    parser.add_argument(
         "--mc_m_samples",
         type=int,
         default=64,
-        help="MC samples per F estimate (suffix entropy sum); higher = lower variance.",
+        help="f_estimator=mc：每个前缀的 MC 重复次数；beam 模式下 F 估计不使用此参数。",
     )
     parser.add_argument(
         "--f_continuation_mode",
@@ -311,6 +324,8 @@ def main() -> None:
         raise SystemExit("--context_window_tokens must be >= 0.")
     if int(args.f_sentence_max_new_tokens) < 1:
         raise SystemExit("--f_sentence_max_new_tokens must be >= 1.")
+    if int(args.f_beam_width) < 1:
+        raise SystemExit("--f_beam_width must be >= 1.")
 
     vllm_standalone = args.vllm_shard_rank is not None and args.vllm_shard_world_size is not None
     if (args.vllm_shard_rank is None) ^ (args.vllm_shard_world_size is None):
@@ -596,41 +611,69 @@ def main() -> None:
                 for tid in tids:
                     prefixes_mc.append(prompt_ids + response_ids[:pos] + [int(tid)])
                 bc = int(args.vllm_request_batch_chunk)
-                n_req = len(prefixes_mc) * int(args.mc_m_samples)
-                n_mc_chunks = (n_req + bc - 1) // bc
                 sentence_stop_check = None
                 if args.f_sentence_stop == "pysbd":
                     from sentence_stop_utils import make_pysbd_first_sentence_stop_check
 
                     sentence_stop_check = make_pysbd_first_sentence_stop_check()
 
-                chunk_starts = range(0, n_req, bc)
-                if use_nested and tqdm is not None:
-                    chunk_starts = tqdm(
-                        chunk_starts,
-                        total=n_mc_chunks,
-                        desc=f"{shard_desc} MC batched",
-                        position=bar_base + 3,
-                        leave=False,
-                        mininterval=0.2,
-                        **_tqdm_kw,
+                if args.f_estimator == "mc":
+                    n_req = len(prefixes_mc) * int(args.mc_m_samples)
+                    n_f_chunks = (n_req + bc - 1) // bc
+                    chunk_starts = range(0, n_req, bc)
+                    if use_nested and tqdm is not None:
+                        chunk_starts = tqdm(
+                            chunk_starts,
+                            total=n_f_chunks,
+                            desc=f"{shard_desc} MC batched",
+                            position=bar_base + 3,
+                            leave=False,
+                            mininterval=0.2,
+                            **_tqdm_kw,
+                        )
+                    Fs = estimate_F_mc_many_prefixes_vllm(
+                        llm,
+                        prefixes_mc,
+                        int(args.mc_m_samples),
+                        max_new_tokens=mtok,
+                        temperature=args.temperature,
+                        top_p=args.top_p,
+                        logprobs_k=args.vllm_logprobs_topk,
+                        batch_chunk=bc,
+                        chunk_starts_iter=chunk_starts,
+                        f_continuation_mode=str(args.f_continuation_mode),
+                        tokenizer=tokenizer if args.f_continuation_mode == "first_sentence" else None,
+                        f_sentence_max_new_tokens=int(args.f_sentence_max_new_tokens),
+                        sentence_stop_check=sentence_stop_check,
+                        normalize_by_continuation_length=(args.bias_metrics_mode == "length_normalized"),
                     )
-                Fs = estimate_F_mc_many_prefixes_vllm(
-                    llm,
-                    prefixes_mc,
-                    int(args.mc_m_samples),
-                    max_new_tokens=mtok,
-                    temperature=args.temperature,
-                    top_p=args.top_p,
-                    logprobs_k=args.vllm_logprobs_topk,
-                    batch_chunk=bc,
-                    chunk_starts_iter=chunk_starts,
-                    f_continuation_mode=str(args.f_continuation_mode),
-                    tokenizer=tokenizer if args.f_continuation_mode == "first_sentence" else None,
-                    f_sentence_max_new_tokens=int(args.f_sentence_max_new_tokens),
-                    sentence_stop_check=sentence_stop_check,
-                    normalize_by_continuation_length=(args.bias_metrics_mode == "length_normalized"),
-                )
+                else:
+                    n_prefix = len(prefixes_mc)
+                    n_f_chunks = (n_prefix + bc - 1) // bc
+                    chunk_starts = range(0, n_prefix, bc)
+                    if use_nested and tqdm is not None:
+                        chunk_starts = tqdm(
+                            chunk_starts,
+                            total=n_f_chunks,
+                            desc=f"{shard_desc} Beam batched",
+                            position=bar_base + 3,
+                            leave=False,
+                            mininterval=0.2,
+                            **_tqdm_kw,
+                        )
+                    Fs = estimate_F_beam_many_prefixes_vllm(
+                        llm,
+                        prefixes_mc,
+                        int(args.f_beam_width),
+                        max_new_tokens=mtok,
+                        batch_chunk=bc,
+                        chunk_starts_iter=chunk_starts,
+                        f_continuation_mode=str(args.f_continuation_mode),
+                        tokenizer=tokenizer if args.f_continuation_mode == "first_sentence" else None,
+                        f_sentence_max_new_tokens=int(args.f_sentence_max_new_tokens),
+                        sentence_stop_check=sentence_stop_check,
+                        normalize_by_continuation_length=(args.bias_metrics_mode == "length_normalized"),
+                    )
                 f_selected = Fs[0]
                 f_bar = sum(float(pr) * Fs[i + 1] for i, pr in enumerate(probs))
                 f_alt_mcs = [float(Fs[i + 1]) for i in range(len(tids))]
@@ -681,6 +724,8 @@ def main() -> None:
                     "context": ctx,
                     "rollout_response_length": len(response_ids),
                     "num_picked_entropy_positions": int(n_pos_pick),
+                    "f_estimator": str(args.f_estimator),
+                    "f_beam_width": int(args.f_beam_width),
                     "mc_m_samples": int(args.mc_m_samples),
                     "f_continuation_mode": str(args.f_continuation_mode),
                     "f_sentence_max_new_tokens": int(args.f_sentence_max_new_tokens),

@@ -11,7 +11,7 @@
 #   export VLLM_HOST_IP=$(hostname -I | awk '{print $1}')
 #
 # 进度条：
-#   默认 rank0 外层 tqdm + 嵌套 tqdm（rollout / 高熵位置 / MC）；PROGRESS_NESTED=0 可关嵌套（只保留按 prompt 一条杠）
+#   默认 rank0 外层 tqdm + 嵌套 tqdm（rollout / 高熵位置 / F 估计）；PROGRESS_NESTED=0 可关嵌套（只保留按 prompt 一条杠）
 #   PROGRESS_ALL_RANKS=1：8 卡各一条 tqdm（屏会很乱，一般不推荐）
 #   PROGRESS_ECHO=1：rank0 每进入一条 prompt 在 stderr 打一行累计秒数（便于估总时长）
 # 关闭：--no_progress 或 export TQDM_DISABLE=1
@@ -44,6 +44,9 @@ MAX_SAMPLES="${MAX_SAMPLES:-300}"
 ROLLOUTS_PER_PROMPT="${ROLLOUTS_PER_PROMPT:-8}"
 SEED="${SEED:-42}"
 MC_M_SAMPLES="${MC_M_SAMPLES:-64}"
+# F 估计：默认 beam（与 analyze 脚本默认一致）；改 MC 时设 F_ESTIMATOR=mc
+F_ESTIMATOR="${F_ESTIMATOR:-beam}"
+F_BEAM_WIDTH="${F_BEAM_WIDTH:-10}"
 # F 续写：full=一次续写到 MAX_NEW_TOKENS；first_sentence=单次最多 F_SENTENCE_MAX_NEW_TOKENS 再截断到首句（可批量）
 F_CONTINUATION_MODE="${F_CONTINUATION_MODE:-full}"
 F_SENTENCE_MAX_NEW_TOKENS="${F_SENTENCE_MAX_NEW_TOKENS:-256}"
@@ -63,7 +66,7 @@ MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-8192}"
 TEMPERATURE="${TEMPERATURE:-1.0}"
 TOP_P="${TOP_P:-0.95}"
 VLLM_LOGPROBS_TOPK="${VLLM_LOGPROBS_TOPK:-20}"
-# 单次 llm.generate 最大并发序列数（rollout 与 MC）；OOM 时改为 8 或 16
+# 单次 vLLM 请求批大小（rollout 与 F 估计分块）；OOM 时改为 8 或 16
 VLLM_REQUEST_BATCH_CHUNK="${VLLM_REQUEST_BATCH_CHUNK:-64}"
 VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.9}"
 VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-32768}"
@@ -130,6 +133,8 @@ for ((r = 0; r < NPROC_PER_NODE; r++)); do
     --max_new_tokens "${MAX_NEW_TOKENS}" \
     --temperature "${TEMPERATURE}" \
     --top_p "${TOP_P}" \
+    --f_estimator "${F_ESTIMATOR}" \
+    --f_beam_width "${F_BEAM_WIDTH}" \
     --mc_m_samples "${MC_M_SAMPLES}" \
     --candidate_mode "${CANDIDATE_MODE}" \
     --candidate_top_p "${CANDIDATE_TOP_P}" \

@@ -442,6 +442,59 @@ def completion_entropy_sum_and_len_from_vllm_output(o: Any) -> tuple[float, int]
     return float(sum(entropies)), max(n, 1)
 
 
+def _vllm_request_step_logprobs_to_float_dicts(o: Any) -> list[dict[int, float]]:
+    """Per-step logprobs from ``RequestOutput.outputs[0]`` (``logprob`` on each entry)."""
+    out: list[dict[int, float]] = []
+    for step_lp in o.logprobs or []:
+        d: dict[int, float] = {}
+        for tid, info in step_lp.items():
+            d[int(tid)] = float(info.logprob)
+        out.append(d)
+    return out
+
+
+def _beam_step_logprobs_to_float_dicts(raw_steps: list) -> list[dict[int, float]]:
+    """Beam search stores ``dict[int, Logprob]`` per step; normalize to float logprobs."""
+    out: list[dict[int, float]] = []
+    for step_lp in raw_steps or []:
+        d: dict[int, float] = {}
+        for tid, info in step_lp.items():
+            d[int(tid)] = float(info.logprob) if hasattr(info, "logprob") else float(info)
+        out.append(d)
+    return out
+
+
+def continuation_F_from_gen_ids_and_step_logprobs(
+    gen_ids: list[int],
+    step_lps_float: list[dict[int, float]],
+    *,
+    f_continuation_mode: str,
+    tokenizer: Any | None,
+    stop_fn: Any | None,
+    normalize_by_continuation_length: bool,
+) -> float:
+    """Shared F: continuation entropy sum or rate, aligned with MC / beam paths."""
+    if f_continuation_mode == "first_sentence":
+        if tokenizer is None:
+            raise ValueError("tokenizer is required when f_continuation_mode='first_sentence'")
+        if stop_fn is None:
+            raise ValueError("stop_fn is required when f_continuation_mode='first_sentence'")
+        from sentence_stop_utils import truncate_gen_ids_to_first_sentence
+
+        padded = list(step_lps_float)
+        while len(padded) < len(gen_ids):
+            padded.append({})
+        keep_k = truncate_gen_ids_to_first_sentence(gen_ids, tokenizer, stop_fn)
+        raw_sum = float(sum(entropy_from_logprobs_topk(padded[i]) for i in range(keep_k)))
+        denom = max(int(keep_k), 1)
+        return raw_sum / float(denom) if normalize_by_continuation_length else raw_sum
+    if normalize_by_continuation_length:
+        entropies = [entropy_from_logprobs_topk(s) for s in step_lps_float]
+        n = len(entropies)
+        return float(sum(entropies)) / float(max(n, 1))
+    return float(sum(entropy_from_logprobs_topk(s) for s in step_lps_float))
+
+
 def generate_rollouts_vllm_batched(
     llm: Any,
     tokenizer,
@@ -532,10 +585,7 @@ def estimate_F_mc_many_prefixes_vllm(
     if f_continuation_mode == "first_sentence":
         if tokenizer is None:
             raise ValueError("tokenizer is required when f_continuation_mode='first_sentence'")
-        from sentence_stop_utils import (
-            completion_should_stop_after_first_sentence_simple,
-            truncate_gen_ids_to_first_sentence,
-        )
+        from sentence_stop_utils import completion_should_stop_after_first_sentence_simple
 
         stop_fn = sentence_stop_check or completion_should_stop_after_first_sentence_simple
         gen_cap = min(int(f_sentence_max_new_tokens), int(max_new_tokens))
@@ -569,29 +619,125 @@ def estimate_F_mc_many_prefixes_vllm(
             raise RuntimeError(f"vLLM batch size mismatch: expected {len(chunk_prompts)}, got {len(outputs)}")
         for j, out_req in enumerate(outputs):
             o = out_req.outputs[0]
+            gen_ids = list(o.token_ids)
+            step_lps = _vllm_request_step_logprobs_to_float_dicts(o)
             if f_continuation_mode == "first_sentence":
                 assert stop_fn is not None
-                gen_ids = list(o.token_ids)
-                step_lps: list[dict[int, float]] = []
-                for step_lp in o.logprobs or []:
-                    d: dict[int, float] = {}
-                    for tid, info in step_lp.items():
-                        d[int(tid)] = float(info.logprob)
-                    step_lps.append(d)
                 while len(step_lps) < len(gen_ids):
                     step_lps.append({})
-                keep_k = truncate_gen_ids_to_first_sentence(gen_ids, tokenizer, stop_fn)
-                raw_sum = float(sum(entropy_from_logprobs_topk(step_lps[i]) for i in range(keep_k)))
-                denom = max(int(keep_k), 1)
-                val = raw_sum / float(denom) if normalize_by_continuation_length else raw_sum
+                val = continuation_F_from_gen_ids_and_step_logprobs(
+                    gen_ids,
+                    step_lps,
+                    f_continuation_mode=f_continuation_mode,
+                    tokenizer=tokenizer,
+                    stop_fn=stop_fn,
+                    normalize_by_continuation_length=normalize_by_continuation_length,
+                )
             else:
-                if normalize_by_continuation_length:
-                    s_len, n_steps = completion_entropy_sum_and_len_from_vllm_output(o)
-                    val = float(s_len) / float(n_steps)
-                else:
-                    val = completion_entropy_sum_from_vllm_output(o)
+                val = continuation_F_from_gen_ids_and_step_logprobs(
+                    gen_ids,
+                    step_lps,
+                    f_continuation_mode="full",
+                    tokenizer=None,
+                    stop_fn=None,
+                    normalize_by_continuation_length=normalize_by_continuation_length,
+                )
             per_pref[chunk_pi[j]].append(val)
     return [float(np.mean(xs)) if xs else 0.0 for xs in per_pref]
+
+
+def estimate_F_beam_many_prefixes_vllm(
+    llm: Any,
+    prefixes: list[list[int]],
+    beam_width: int,
+    max_new_tokens: int,
+    *,
+    batch_chunk: int = 32,
+    chunk_starts_iter: Any | None = None,
+    f_continuation_mode: str = "full",
+    tokenizer: Any | None = None,
+    f_sentence_max_new_tokens: int = 256,
+    sentence_stop_check: Any | None = None,
+    normalize_by_continuation_length: bool = False,
+) -> list[float]:
+    """Per prefix: mean continuation-F over the top-``beam_width`` beam hypotheses (deterministic).
+
+    Uses ``llm.beam_search`` (vLLM). Each decoding step only exposes ``2 * beam_width`` logprobs,
+    so per-step entropy is from a truncated distribution (same structural caveat as large-k MC).
+
+    Requires vLLM with ``BeamSearchParams`` / ``LLM.beam_search`` (``from vllm.sampling_params import
+    BeamSearchParams``).
+    """
+    try:
+        from vllm.sampling_params import BeamSearchParams
+    except ImportError as e:
+        raise ImportError(
+            "estimate_F_beam_many_prefixes_vllm requires a vLLM build that exports "
+            "BeamSearchParams (e.g. recent vllm). Install/upgrade vllm or use f_estimator=mc."
+        ) from e
+    from vllm.inputs import TokensPrompt
+
+    if beam_width < 1 or not prefixes:
+        return [0.0 for _ in prefixes]
+
+    if f_continuation_mode == "first_sentence":
+        if tokenizer is None:
+            raise ValueError("tokenizer is required when f_continuation_mode='first_sentence'")
+        from sentence_stop_utils import completion_should_stop_after_first_sentence_simple
+
+        stop_fn = sentence_stop_check or completion_should_stop_after_first_sentence_simple
+        gen_cap = min(int(f_sentence_max_new_tokens), int(max_new_tokens))
+        gen_cap = max(1, gen_cap)
+    else:
+        stop_fn = None
+        gen_cap = max(1, int(max_new_tokens))
+
+    beam_params = BeamSearchParams(beam_width=int(beam_width), max_tokens=gen_cap, temperature=0.0)
+    n_prefixes = len(prefixes)
+    out_vals: list[float] = []
+    if chunk_starts_iter is None:
+        chunk_starts_iter = range(0, n_prefixes, batch_chunk)
+    for start in chunk_starts_iter:
+        end = min(start + batch_chunk, n_prefixes)
+        chunk_prefixes = prefixes[start:end]
+        prompts = [TokensPrompt(prompt_token_ids=pref) for pref in chunk_prefixes]
+        outputs = llm.beam_search(prompts, beam_params, use_tqdm=False)
+        if len(outputs) != len(chunk_prefixes):
+            raise RuntimeError(
+                f"vLLM beam_search batch size mismatch: expected {len(chunk_prefixes)}, got {len(outputs)}"
+            )
+        for j, b_out in enumerate(outputs):
+            pi = start + j
+            prefix = prefixes[pi]
+            p_len = len(prefix)
+            beam_vals: list[float] = []
+            for seq in b_out.sequences:
+                gen_ids = seq.tokens[p_len:]
+                step_lps = _beam_step_logprobs_to_float_dicts(seq.logprobs)
+                while len(step_lps) < len(gen_ids):
+                    step_lps.append({})
+                if f_continuation_mode == "first_sentence":
+                    assert stop_fn is not None
+                    v = continuation_F_from_gen_ids_and_step_logprobs(
+                        gen_ids,
+                        step_lps,
+                        f_continuation_mode=f_continuation_mode,
+                        tokenizer=tokenizer,
+                        stop_fn=stop_fn,
+                        normalize_by_continuation_length=normalize_by_continuation_length,
+                    )
+                else:
+                    v = continuation_F_from_gen_ids_and_step_logprobs(
+                        gen_ids,
+                        step_lps,
+                        f_continuation_mode="full",
+                        tokenizer=None,
+                        stop_fn=None,
+                        normalize_by_continuation_length=normalize_by_continuation_length,
+                    )
+                beam_vals.append(float(v))
+            out_vals.append(float(np.mean(beam_vals)) if beam_vals else 0.0)
+    return out_vals
 
 
 def estimate_suffix_return_samples_batched(
