@@ -29,6 +29,26 @@ from pathlib import Path
 from typing import Any
 
 
+def _two_sample_tests(a: list[float], b: list[float]) -> dict[str, Any]:
+    """方差齐性（Levene / Fligner）与分布是否相同（KS）。若未安装 scipy 则跳过。"""
+    try:
+        import scipy.stats as st
+    except ImportError:
+        return {"available": False, "reason": "scipy not installed"}
+    if len(a) < 3 or len(b) < 3:
+        return {"available": False, "reason": "need at least 3 points per group"}
+    lev = st.levene(a, b, center="median")
+    fl = st.fligner(a, b)
+    ks = st.ks_2samp(a, b)
+    return {
+        "available": True,
+        "interpretation": "Levene/Fligner: p 小则拒绝「方差相同」；KS: p 小则拒绝「同分布」",
+        "levene_median": {"statistic": float(lev.statistic), "pvalue": float(lev.pvalue)},
+        "fligner": {"statistic": float(fl.statistic), "pvalue": float(fl.pvalue)},
+        "ks_2samp": {"statistic": float(ks.statistic), "pvalue": float(ks.pvalue)},
+    }
+
+
 def _load_records(path: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     with open(path, encoding="utf-8") as f:
@@ -246,6 +266,11 @@ def main() -> None:
         help="若设置，则忽略 entropy_threshold：只保留 entropy_t 最高的前 q 比例（如 0.25=最高 25%%）",
     )
     parser.add_argument("--bins", type=int, default=40, help="直方图分箱数")
+    parser.add_argument(
+        "--no-stat-tests",
+        action="store_true",
+        help="不运行 scipy 检验（Levene / Fligner / KS）",
+    )
     args = parser.parse_args()
 
     in_path = Path(args.input).expanduser().resolve()
@@ -304,7 +329,34 @@ def main() -> None:
                 cmp["range_ratio_wrong_over_correct"] = sw["range"] / sc["range"]
             else:
                 cmp["range_ratio_wrong_over_correct"] = None
+            if sc["mad"] and sc["mad"] > 0:
+                cmp["mad_ratio_wrong_over_correct"] = sw["mad"] / sc["mad"]
+            else:
+                cmp["mad_ratio_wrong_over_correct"] = None
             sub[key]["spread_compare"] = cmp
+
+        # |bias_t|：看「偏离 0 的幅度」，不受正负抵消影响
+        ab_c = [abs(x) for x in b_c]
+        ab_w = [abs(x) for x in b_w]
+        sub["abs_bias_t"] = {
+            "correct": _stats(ab_c),
+            "wrong": _stats(ab_w),
+        }
+        sac, saw = _stats(ab_c), _stats(ab_w)
+        sub["abs_bias_t"]["spread_compare"] = {}
+        if sac["std"] and sac["std"] > 0:
+            sub["abs_bias_t"]["spread_compare"]["std_ratio_wrong_over_correct"] = saw["std"] / sac["std"]
+        if sac["iqr"] and sac["iqr"] > 0:
+            sub["abs_bias_t"]["spread_compare"]["iqr_ratio_wrong_over_correct"] = saw["iqr"] / sac["iqr"]
+        if sac["mad"] and sac["mad"] > 0:
+            sub["abs_bias_t"]["spread_compare"]["mad_ratio_wrong_over_correct"] = saw["mad"] / sac["mad"]
+
+        if not args.no_stat_tests:
+            sub["tests"] = {
+                "bias_t": _two_sample_tests(b_c, b_w),
+                "delta_hat_t": _two_sample_tests(d_c, d_w),
+                "abs_bias_t": _two_sample_tests(ab_c, ab_w),
+            }
 
         full_summary[tag] = sub
 
@@ -315,6 +367,7 @@ def main() -> None:
         _plot_hist2(d_c, d_w, f"{tag}: delta_hat_t", "delta_hat_t", tag_dir / "hist_delta_hat_t.png", args.bins)
         _plot_violin(b_c, b_w, f"{tag}: bias_t", "bias_t", tag_dir / "violin_bias_t.png")
         _plot_violin(d_c, d_w, f"{tag}: delta_hat_t", "delta_hat_t", tag_dir / "violin_delta_hat_t.png")
+        _plot_hist2(ab_c, ab_w, f"{tag}: |bias_t|", "|bias_t|", tag_dir / "hist_abs_bias_t.png", args.bins)
 
         with open(tag_dir / "summary.json", "w", encoding="utf-8") as f:
             json_mod.dump(sub, f, ensure_ascii=False, indent=2)
@@ -329,6 +382,20 @@ def main() -> None:
                 print(f"  [{label}] std ratio (wrong/correct) = {sw['std']/sc['std']:.4f}")
             if sc["iqr"]:
                 print(f"  [{label}] IQR ratio (wrong/correct) = {sw['iqr']/sc['iqr']:.4f}")
+        sac, saw = _stats(ab_c), _stats(ab_w)
+        print("  [|bias_t|] correct: std={:.6f} IQR={:.6f}".format(sac["std"], sac["iqr"]))
+        print("  [|bias_t|] wrong:   std={:.6f} IQR={:.6f}".format(saw["std"], saw["iqr"]))
+        if sac["std"]:
+            print(f"  [|bias_t|] std ratio (wrong/correct) = {saw['std']/sac['std']:.4f}")
+        if not args.no_stat_tests and "tests" in sub:
+            t = sub["tests"]
+            for tn in ("bias_t", "delta_hat_t", "abs_bias_t"):
+                tt = t.get(tn, {})
+                if tt.get("available"):
+                    print(
+                        f"  [tests:{tn}] Levene p={tt['levene_median']['pvalue']:.4g} "
+                        f"Fligner p={tt['fligner']['pvalue']:.4g} KS p={tt['ks_2samp']['pvalue']:.4g}"
+                    )
 
     out_json = out_dir / "full_summary.json"
     with open(out_json, "w", encoding="utf-8") as f:
