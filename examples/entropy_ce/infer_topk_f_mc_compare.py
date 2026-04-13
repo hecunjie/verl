@@ -73,6 +73,21 @@ def _step_logprobs_vllm(llm: Any, prefix_ids: list[int], logprobs_k: int) -> tup
     return token_id, step_lp
 
 
+def _candidate_lookahead_1step_entropy(
+    llm: Any,
+    prefix_ids: list[int],
+    candidate_token_id: int,
+    logprobs_k: int,
+) -> float:
+    """Use next-step entropy after appending one candidate token as F proxy."""
+    _, step_lp = _step_logprobs_vllm(
+        llm=llm,
+        prefix_ids=prefix_ids + [int(candidate_token_id)],
+        logprobs_k=logprobs_k,
+    )
+    return float(entropy_from_logprobs_topk(step_lp))
+
+
 def _topk_from_step_logprobs(step_logprobs: dict[int, float], topk: int) -> tuple[list[int], list[float]]:
     if not step_logprobs:
         return [], []
@@ -217,43 +232,59 @@ def _decode_one_policy(
                         m_samples_use = int(mc_m_samples)
                         temp_use = float(mc_temperature)
                         top_p_use = float(mc_top_p)
+                    elif selection_f_mode == "lookahead_1step":
+                        f_values = [
+                            _candidate_lookahead_1step_entropy(
+                                llm=llm,
+                                prefix_ids=(prompt_ids + response_ids),
+                                candidate_token_id=int(t),
+                                logprobs_k=vllm_logprobs_topk,
+                            )
+                            for t in cands
+                        ]
+                        best_i = int(np.argmin(np.array(f_values, dtype=np.float64)))
+                        chosen_token = int(cands[best_i])
+                        m_samples_use = 0
+                        temp_use = 0.0
+                        top_p_use = 1.0
                     else:
                         raise ValueError(f"unsupported selection_f_mode: {selection_f_mode}")
 
-                    n_req = len(prefixes) * int(m_samples_use)
-                    bs = int(vllm_request_batch_chunk)
-                    chunk_starts = range(0, n_req, bs)
-                    if show_nested_progress and tqdm is not None:
-                        n_chunks = (n_req + bs - 1) // bs
-                        chunk_starts = tqdm(
-                            chunk_starts,
-                            total=n_chunks,
-                            desc=progress_mc_desc,
-                            dynamic_ncols=True,
-                            position=progress_mc_position,
-                            leave=False,
+                    if selection_f_mode in ("greedy_path", "mc"):
+                        n_req = len(prefixes) * int(m_samples_use)
+                        bs = int(vllm_request_batch_chunk)
+                        chunk_starts = range(0, n_req, bs)
+                        if show_nested_progress and tqdm is not None:
+                            n_chunks = (n_req + bs - 1) // bs
+                            chunk_starts = tqdm(
+                                chunk_starts,
+                                total=n_chunks,
+                                desc=progress_mc_desc,
+                                dynamic_ncols=True,
+                                position=progress_mc_position,
+                                leave=False,
+                            )
+                        f_values = estimate_F_mc_many_prefixes_vllm(
+                            llm=llm,
+                            prefixes=prefixes,
+                            m_samples=m_samples_use,
+                            max_new_tokens=remaining,
+                            temperature=temp_use,
+                            top_p=top_p_use,
+                            logprobs_k=vllm_logprobs_topk,
+                            batch_chunk=vllm_request_batch_chunk,
+                            f_continuation_mode=f_continuation_mode,
+                            tokenizer=tokenizer if f_continuation_mode == "first_sentence" else None,
+                            f_sentence_max_new_tokens=f_sentence_max_new_tokens,
+                            sentence_stop_check=sentence_stop_check,
+                            normalize_by_continuation_length=normalize_by_continuation_length,
+                            chunk_starts_iter=chunk_starts,
                         )
-                    f_values = estimate_F_mc_many_prefixes_vllm(
-                        llm=llm,
-                        prefixes=prefixes,
-                        m_samples=m_samples_use,
-                        max_new_tokens=remaining,
-                        temperature=temp_use,
-                        top_p=top_p_use,
-                        logprobs_k=vllm_logprobs_topk,
-                        batch_chunk=vllm_request_batch_chunk,
-                        f_continuation_mode=f_continuation_mode,
-                        tokenizer=tokenizer if f_continuation_mode == "first_sentence" else None,
-                        f_sentence_max_new_tokens=f_sentence_max_new_tokens,
-                        sentence_stop_check=sentence_stop_check,
-                        normalize_by_continuation_length=normalize_by_continuation_length,
-                        chunk_starts_iter=chunk_starts,
-                    )
-                    if not f_values or len(f_values) != len(cands):
-                        chosen_token = int(cands[0])
-                    else:
-                        best_i = int(np.argmin(np.array(f_values, dtype=np.float64)))
-                        chosen_token = int(cands[best_i])
+                        if not f_values or len(f_values) != len(cands):
+                            chosen_token = int(cands[0])
+                        else:
+                            best_i = int(np.argmin(np.array(f_values, dtype=np.float64)))
+                            chosen_token = int(cands[best_i])
             else:
                 raise ValueError(f"unsupported policy: {policy}")
 
@@ -297,9 +328,9 @@ def main() -> None:
     parser.add_argument("--candidate_max_k", type=int, default=5)
     parser.add_argument(
         "--selection_f_mode",
-        choices=["mc", "greedy_path"],
+        choices=["mc", "greedy_path", "lookahead_1step"],
         default="greedy_path",
-        help="How to estimate candidate F when selecting min-F: mc (multi-sample) or greedy_path (single deterministic continuation).",
+        help="How to estimate candidate F when selecting min-F: mc (multi-sample), greedy_path (single deterministic continuation), or lookahead_1step (H_{t+1} proxy).",
     )
     parser.add_argument("--max_branch_steps", type=int, default=0, help="<=0 means no cap.")
 
