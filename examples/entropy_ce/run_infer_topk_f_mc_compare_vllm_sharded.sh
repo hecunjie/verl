@@ -17,8 +17,9 @@ MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-2048}"
 ENTROPY_THRESHOLD="${ENTROPY_THRESHOLD:-1.0}"
 CANDIDATE_TOP_P="${CANDIDATE_TOP_P:-0.95}"
 CANDIDATE_MAX_K="${CANDIDATE_MAX_K:-5}"
+SELECTION_F_MODE="${SELECTION_F_MODE:-greedy_path}"
 MAX_BRANCH_STEPS="${MAX_BRANCH_STEPS:-0}"
-MC_M_SAMPLES="${MC_M_SAMPLES:-128}"
+MC_M_SAMPLES="${MC_M_SAMPLES:-1}"
 MC_TEMPERATURE="${MC_TEMPERATURE:-1.0}"
 MC_TOP_P="${MC_TOP_P:-0.95}"
 BIAS_METRICS_MODE="${BIAS_METRICS_MODE:-length_normalized}"
@@ -86,6 +87,7 @@ for ((r = 0; r < NPROC_PER_NODE; r++)); do
     --entropy_threshold "${ENTROPY_THRESHOLD}" \
     --candidate_top_p "${CANDIDATE_TOP_P}" \
     --candidate_max_k "${CANDIDATE_MAX_K}" \
+    --selection_f_mode "${SELECTION_F_MODE}" \
     --max_branch_steps "${MAX_BRANCH_STEPS}" \
     --mc_m_samples "${MC_M_SAMPLES}" \
     --mc_temperature "${MC_TEMPERATURE}" \

@@ -63,13 +63,35 @@ def _binom_two_sided_pvalue(n_trials: int, n_success: int) -> float:
     return float(min(1.0, max(0.0, p_two)))
 
 
+def _pair_values(row: dict[str, Any], pair: str) -> tuple[float, float]:
+    if pair == "minf_vs_random":
+        a = 1.0 if bool((row.get("result_min_f_mc") or {}).get("is_correct", False)) else 0.0
+        b = 1.0 if bool((row.get("result_random_topk") or {}).get("is_correct", False)) else 0.0
+        return a, b
+    if pair == "minf_vs_greedy":
+        a = 1.0 if bool((row.get("result_min_f_mc") or {}).get("is_correct", False)) else 0.0
+        b = 1.0 if bool((row.get("result_greedy_baseline") or {}).get("is_correct", False)) else 0.0
+        return a, b
+    if pair == "random_vs_greedy":
+        a = 1.0 if bool((row.get("result_random_topk") or {}).get("is_correct", False)) else 0.0
+        b = 1.0 if bool((row.get("result_greedy_baseline") or {}).get("is_correct", False)) else 0.0
+        return a, b
+    raise ValueError(f"Unsupported pair: {pair}")
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Significance analysis for min-F_mc vs random-topk paired results.")
+    parser = argparse.ArgumentParser(description="Significance analysis for paired policy results in infer_compare_merged.jsonl.")
     parser.add_argument("--input", type=str, required=True, help="infer_compare_merged.jsonl path")
     parser.add_argument("--output", type=str, default="", help="output json path (default: same dir/significance.json)")
     parser.add_argument("--bootstrap_samples", type=int, default=5000)
     parser.add_argument("--ci_alpha", type=float, default=0.95)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--pair",
+        choices=["minf_vs_random", "minf_vs_greedy", "random_vs_greedy"],
+        default="minf_vs_random",
+        help="Policy pair for paired significance test.",
+    )
     args = parser.parse_args()
 
     if args.bootstrap_samples < 100:
@@ -90,31 +112,30 @@ def main() -> None:
     if not rows:
         raise SystemExit("Empty input jsonl.")
 
-    minf_ok: list[float] = []
-    rand_ok: list[float] = []
+    lhs_ok: list[float] = []
+    rhs_ok: list[float] = []
     diffs: list[float] = []
     improve = 0
     regress = 0
     ties = 0
     for r in rows:
-        m = 1.0 if bool((r.get("result_min_f_mc") or {}).get("is_correct", False)) else 0.0
-        q = 1.0 if bool((r.get("result_random_topk") or {}).get("is_correct", False)) else 0.0
-        minf_ok.append(m)
-        rand_ok.append(q)
-        diffs.append(m - q)
-        if m > q:
+        lhs, rhs = _pair_values(r, str(args.pair))
+        lhs_ok.append(lhs)
+        rhs_ok.append(rhs)
+        diffs.append(lhs - rhs)
+        if lhs > rhs:
             improve += 1
-        elif m < q:
+        elif lhs < rhs:
             regress += 1
         else:
             ties += 1
 
     n = len(rows)
     n_discordant = improve + regress
-    acc_minf = _mean(minf_ok)
-    acc_rand = _mean(rand_ok)
-    gain = acc_minf - acc_rand
-    rel_gain = (gain / acc_rand) if acc_rand > 0 else float("nan")
+    acc_lhs = _mean(lhs_ok)
+    acc_rhs = _mean(rhs_ok)
+    gain = acc_lhs - acc_rhs
+    rel_gain = (gain / acc_rhs) if acc_rhs > 0 else float("nan")
 
     boot = _bootstrap_ci_mean_diff(
         diffs=diffs,
@@ -129,8 +150,9 @@ def main() -> None:
 
     result = {
         "num_prompts": int(n),
-        "accuracy_min_f_mc": float(acc_minf),
-        "accuracy_random_topk": float(acc_rand),
+        "pair": str(args.pair),
+        "accuracy_lhs": float(acc_lhs),
+        "accuracy_rhs": float(acc_rhs),
         "accuracy_gain_abs": float(gain),
         "accuracy_gain_relative": float(rel_gain),
         "paired_counts": {

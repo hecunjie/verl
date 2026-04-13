@@ -130,6 +130,7 @@ def _decode_one_policy(
     entropy_threshold: float,
     candidate_top_p: float,
     candidate_max_k: int,
+    selection_f_mode: str,
     max_new_tokens: int,
     mc_m_samples: int,
     mc_temperature: float,
@@ -190,6 +191,8 @@ def _decode_one_policy(
             cand_probs = [1.0]
 
         should_branch = (
+            policy != "greedy_baseline"
+            and
             entropy_t >= entropy_threshold
             and len(cands) >= 2
             and (max_branch_steps <= 0 or branch_count < max_branch_steps)
@@ -206,7 +209,18 @@ def _decode_one_policy(
                     chosen_token = int(cands[0])
                 else:
                     prefixes = [(prompt_ids + response_ids + [int(t)]) for t in cands]
-                    n_req = len(prefixes) * int(mc_m_samples)
+                    if selection_f_mode == "greedy_path":
+                        m_samples_use = 1
+                        temp_use = 0.0
+                        top_p_use = 1.0
+                    elif selection_f_mode == "mc":
+                        m_samples_use = int(mc_m_samples)
+                        temp_use = float(mc_temperature)
+                        top_p_use = float(mc_top_p)
+                    else:
+                        raise ValueError(f"unsupported selection_f_mode: {selection_f_mode}")
+
+                    n_req = len(prefixes) * int(m_samples_use)
                     bs = int(vllm_request_batch_chunk)
                     chunk_starts = range(0, n_req, bs)
                     if show_nested_progress and tqdm is not None:
@@ -222,10 +236,10 @@ def _decode_one_policy(
                     f_values = estimate_F_mc_many_prefixes_vllm(
                         llm=llm,
                         prefixes=prefixes,
-                        m_samples=mc_m_samples,
+                        m_samples=m_samples_use,
                         max_new_tokens=remaining,
-                        temperature=mc_temperature,
-                        top_p=mc_top_p,
+                        temperature=temp_use,
+                        top_p=top_p_use,
                         logprobs_k=vllm_logprobs_topk,
                         batch_chunk=vllm_request_batch_chunk,
                         f_continuation_mode=f_continuation_mode,
@@ -252,6 +266,7 @@ def _decode_one_policy(
                     "candidate_probs_renorm_topp": [float(x) for x in cand_probs],
                     "candidate_texts": [tokenizer.decode([int(x)], skip_special_tokens=True) for x in cands],
                     "f_values_mc": [float(x) for x in f_values] if f_values else None,
+                    "selection_f_mode": selection_f_mode if policy == "min_f_mc" else None,
                     "chosen_token": int(chosen_token),
                     "chosen_text": tokenizer.decode([int(chosen_token)], skip_special_tokens=True),
                 }
@@ -280,9 +295,15 @@ def main() -> None:
     parser.add_argument("--entropy_threshold", type=float, default=1.0)
     parser.add_argument("--candidate_top_p", type=float, default=0.95)
     parser.add_argument("--candidate_max_k", type=int, default=5)
+    parser.add_argument(
+        "--selection_f_mode",
+        choices=["mc", "greedy_path"],
+        default="greedy_path",
+        help="How to estimate candidate F when selecting min-F: mc (multi-sample) or greedy_path (single deterministic continuation).",
+    )
     parser.add_argument("--max_branch_steps", type=int, default=0, help="<=0 means no cap.")
 
-    parser.add_argument("--mc_m_samples", type=int, default=128)
+    parser.add_argument("--mc_m_samples", type=int, default=1)
     parser.add_argument("--mc_temperature", type=float, default=1.0)
     parser.add_argument("--mc_top_p", type=float, default=0.95)
     parser.add_argument("--bias_metrics_mode", choices=["raw", "length_normalized"], default="length_normalized")
@@ -379,14 +400,17 @@ def main() -> None:
         args.progress_all_ranks or rank == 0
     )
     use_nested = bool(use_tqdm and args.progress_nested)
-    bar_base = (rank * 4) if (use_tqdm and use_nested and args.progress_all_ranks) else (rank if use_tqdm else 0)
+    bar_base = (rank * 5) if (use_tqdm and use_nested and args.progress_all_ranks) else (rank if use_tqdm else 0)
 
     acc_minf: list[float] = []
     acc_rand: list[float] = []
+    acc_greedy: list[float] = []
     branch_count_minf: list[float] = []
     branch_count_rand: list[float] = []
+    branch_count_greedy: list[float] = []
     token_len_minf: list[float] = []
     token_len_rand: list[float] = []
+    token_len_greedy: list[float] = []
 
     prompt_iter = enumerate(local_rows)
     if use_tqdm:
@@ -424,6 +448,7 @@ def main() -> None:
             entropy_threshold=float(args.entropy_threshold),
             candidate_top_p=float(args.candidate_top_p),
             candidate_max_k=int(args.candidate_max_k),
+            selection_f_mode=str(args.selection_f_mode),
             max_new_tokens=int(args.max_new_tokens),
             mc_m_samples=int(args.mc_m_samples),
             mc_temperature=float(args.mc_temperature),
@@ -451,6 +476,7 @@ def main() -> None:
             entropy_threshold=float(args.entropy_threshold),
             candidate_top_p=float(args.candidate_top_p),
             candidate_max_k=int(args.candidate_max_k),
+            selection_f_mode=str(args.selection_f_mode),
             max_new_tokens=int(args.max_new_tokens),
             mc_m_samples=int(args.mc_m_samples),
             mc_temperature=float(args.mc_temperature),
@@ -470,9 +496,38 @@ def main() -> None:
             progress_mc_position=bar_base + 2,
             progress_mc_desc=f"shard{rank} rand MC",
         )
+        response_greedy, trace_greedy = _decode_one_policy(
+            llm=llm,
+            tokenizer=tokenizer,
+            prompt_ids=prompt_ids,
+            policy="greedy_baseline",
+            entropy_threshold=float(args.entropy_threshold),
+            candidate_top_p=float(args.candidate_top_p),
+            candidate_max_k=int(args.candidate_max_k),
+            selection_f_mode=str(args.selection_f_mode),
+            max_new_tokens=int(args.max_new_tokens),
+            mc_m_samples=int(args.mc_m_samples),
+            mc_temperature=float(args.mc_temperature),
+            mc_top_p=float(args.mc_top_p),
+            vllm_logprobs_topk=int(args.vllm_logprobs_topk),
+            vllm_request_batch_chunk=int(args.vllm_request_batch_chunk),
+            f_continuation_mode=str(args.f_continuation_mode),
+            f_sentence_max_new_tokens=int(args.f_sentence_max_new_tokens),
+            f_sentence_stop=str(args.f_sentence_stop),
+            normalize_by_continuation_length=(args.bias_metrics_mode == "length_normalized"),
+            max_branch_steps=int(args.max_branch_steps),
+            rng=rng,
+            eos_token_id=tokenizer.eos_token_id,
+            show_nested_progress=bool(use_nested),
+            progress_position=bar_base + 4,
+            progress_desc=f"shard{rank} greedy decode",
+            progress_mc_position=bar_base + 2,
+            progress_mc_desc=f"shard{rank} greedy MC",
+        )
 
         text_minf = tokenizer.decode(response_minf, skip_special_tokens=True)
         text_rand = tokenizer.decode(response_rand, skip_special_tokens=True)
+        text_greedy = tokenizer.decode(response_greedy, skip_special_tokens=True)
         ok_minf, eval_minf = evaluate_solution_acc(
             data_source=data_source,
             solution_str=text_minf,
@@ -483,12 +538,20 @@ def main() -> None:
             solution_str=text_rand,
             ground_truth=ground_truth,
         )
+        ok_greedy, eval_greedy = evaluate_solution_acc(
+            data_source=data_source,
+            solution_str=text_greedy,
+            ground_truth=ground_truth,
+        )
         acc_minf.append(1.0 if ok_minf else 0.0)
         acc_rand.append(1.0 if ok_rand else 0.0)
+        acc_greedy.append(1.0 if ok_greedy else 0.0)
         branch_count_minf.append(float(len(trace_minf)))
         branch_count_rand.append(float(len(trace_rand)))
+        branch_count_greedy.append(float(len(trace_greedy)))
         token_len_minf.append(float(len(response_minf)))
         token_len_rand.append(float(len(response_rand)))
+        token_len_greedy.append(float(len(response_greedy)))
 
         rec: dict[str, Any] = {
             "sample_index": int(global_idx),
@@ -501,6 +564,7 @@ def main() -> None:
             "candidate_max_k": int(args.candidate_max_k),
             "max_new_tokens": int(args.max_new_tokens),
             "mc_m_samples": int(args.mc_m_samples),
+            "selection_f_mode": str(args.selection_f_mode),
             "f_continuation_mode": str(args.f_continuation_mode),
             "f_sentence_max_new_tokens": int(args.f_sentence_max_new_tokens),
             "f_sentence_stop": str(args.f_sentence_stop),
@@ -519,12 +583,22 @@ def main() -> None:
                 "response_len_tokens": int(len(response_rand)),
                 "num_branch_steps": int(len(trace_rand)),
             },
+            "result_greedy_baseline": {
+                "is_correct": bool(ok_greedy),
+                "eval": eval_greedy,
+                "response_text": text_greedy,
+                "response_len_tokens": int(len(response_greedy)),
+                "num_branch_steps": int(len(trace_greedy)),
+            },
             "improvement_min_f_over_random": bool(ok_minf and not ok_rand),
             "regression_min_f_over_random": bool((not ok_minf) and ok_rand),
+            "improvement_min_f_over_greedy": bool(ok_minf and not ok_greedy),
+            "regression_min_f_over_greedy": bool((not ok_minf) and ok_greedy),
         }
         if args.save_traces:
             rec["trace_min_f_mc"] = trace_minf
             rec["trace_random_topk"] = trace_rand
+            rec["trace_greedy_baseline"] = trace_greedy
 
         with open(part_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -549,34 +623,49 @@ def main() -> None:
 
         paired_improve = sum(int(x.get("improvement_min_f_over_random", False)) for x in merged)
         paired_regress = sum(int(x.get("regression_min_f_over_random", False)) for x in merged)
+        paired_improve_g = sum(int(x.get("improvement_min_f_over_greedy", False)) for x in merged)
+        paired_regress_g = sum(int(x.get("regression_min_f_over_greedy", False)) for x in merged)
         n = len(merged)
         if n > 0:
             acc_minf_all = [1.0 if x["result_min_f_mc"]["is_correct"] else 0.0 for x in merged]
             acc_rand_all = [1.0 if x["result_random_topk"]["is_correct"] else 0.0 for x in merged]
+            acc_greedy_all = [1.0 if x["result_greedy_baseline"]["is_correct"] else 0.0 for x in merged]
             branch_minf_all = [float(x["result_min_f_mc"]["num_branch_steps"]) for x in merged]
             branch_rand_all = [float(x["result_random_topk"]["num_branch_steps"]) for x in merged]
+            branch_greedy_all = [float(x["result_greedy_baseline"]["num_branch_steps"]) for x in merged]
             len_minf_all = [float(x["result_min_f_mc"]["response_len_tokens"]) for x in merged]
             len_rand_all = [float(x["result_random_topk"]["response_len_tokens"]) for x in merged]
+            len_greedy_all = [float(x["result_greedy_baseline"]["response_len_tokens"]) for x in merged]
         else:
             acc_minf_all = acc_minf
             acc_rand_all = acc_rand
+            acc_greedy_all = acc_greedy
             branch_minf_all = branch_count_minf
             branch_rand_all = branch_count_rand
+            branch_greedy_all = branch_count_greedy
             len_minf_all = token_len_minf
             len_rand_all = token_len_rand
+            len_greedy_all = token_len_greedy
 
         summary = {
             "num_prompts": int(n),
             "accuracy_min_f_mc": _mean(acc_minf_all),
             "accuracy_random_topk": _mean(acc_rand_all),
+            "accuracy_greedy_baseline": _mean(acc_greedy_all),
             "accuracy_gain_abs": _mean(acc_minf_all) - _mean(acc_rand_all),
+            "accuracy_gain_abs_vs_greedy": _mean(acc_minf_all) - _mean(acc_greedy_all),
             "paired_improve_count": int(paired_improve),
             "paired_regress_count": int(paired_regress),
             "paired_net_gain": int(paired_improve - paired_regress),
+            "paired_improve_count_vs_greedy": int(paired_improve_g),
+            "paired_regress_count_vs_greedy": int(paired_regress_g),
+            "paired_net_gain_vs_greedy": int(paired_improve_g - paired_regress_g),
             "avg_branch_steps_min_f_mc": _mean(branch_minf_all),
             "avg_branch_steps_random_topk": _mean(branch_rand_all),
+            "avg_branch_steps_greedy_baseline": _mean(branch_greedy_all),
             "avg_response_len_min_f_mc": _mean(len_minf_all),
             "avg_response_len_random_topk": _mean(len_rand_all),
+            "avg_response_len_greedy_baseline": _mean(len_greedy_all),
             "config": {
                 "entropy_threshold": float(args.entropy_threshold),
                 "candidate_top_p": float(args.candidate_top_p),
@@ -584,6 +673,7 @@ def main() -> None:
                 "max_new_tokens": int(args.max_new_tokens),
                 "max_branch_steps": int(args.max_branch_steps),
                 "mc_m_samples": int(args.mc_m_samples),
+                "selection_f_mode": str(args.selection_f_mode),
                 "mc_temperature": float(args.mc_temperature),
                 "mc_top_p": float(args.mc_top_p),
                 "f_continuation_mode": str(args.f_continuation_mode),
