@@ -29,6 +29,9 @@ F_SENTENCE_STOP="${F_SENTENCE_STOP:-simple}"
 
 VLLM_LOGPROBS_TOPK="${VLLM_LOGPROBS_TOPK:-20}"
 VLLM_REQUEST_BATCH_CHUNK="${VLLM_REQUEST_BATCH_CHUNK:-64}"
+BUCKET_GROUP_ROLLOUTS="${BUCKET_GROUP_ROLLOUTS:-16}"
+BUCKET_NUM_BINS="${BUCKET_NUM_BINS:-100}"
+BUCKET_MIN_POINTS_PER_BIN="${BUCKET_MIN_POINTS_PER_BIN:-4}"
 VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.9}"
 VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-32768}"
 SAVE_TRACES="${SAVE_TRACES:-1}"
@@ -98,6 +101,9 @@ for ((r = 0; r < NPROC_PER_NODE; r++)); do
     --f_sentence_stop "${F_SENTENCE_STOP}" \
     --vllm_logprobs_topk "${VLLM_LOGPROBS_TOPK}" \
     --vllm_request_batch_chunk "${VLLM_REQUEST_BATCH_CHUNK}" \
+    --bucket_group_rollouts "${BUCKET_GROUP_ROLLOUTS}" \
+    --bucket_num_bins "${BUCKET_NUM_BINS}" \
+    --bucket_min_points_per_bin "${BUCKET_MIN_POINTS_PER_BIN}" \
     --vllm_gpu_memory_utilization "${VLLM_GPU_MEMORY_UTILIZATION}" \
     --vllm_max_model_len "${VLLM_MAX_MODEL_LEN}" \
     --vllm_shard_rank "${GLOBAL_RANK}" \

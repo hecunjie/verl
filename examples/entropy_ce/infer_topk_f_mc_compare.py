@@ -88,6 +88,165 @@ def _candidate_lookahead_1step_entropy(
     return float(entropy_from_logprobs_topk(step_lp))
 
 
+def _sample_group_rollouts_for_bucket(
+    *,
+    llm: Any,
+    prompt_ids: list[int],
+    n_rollouts: int,
+    max_new_tokens: int,
+    temperature: float,
+    top_p: float,
+    logprobs_k: int,
+    batch_chunk: int,
+) -> list[list[float]]:
+    from vllm import SamplingParams
+    from vllm.inputs import TokensPrompt
+
+    k = clamp_vllm_logprobs_topk(logprobs_k)
+    sp = SamplingParams(
+        max_tokens=max_new_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        logprobs=k,
+    )
+    out_h: list[list[float]] = []
+    for start in range(0, int(n_rollouts), int(batch_chunk)):
+        bs = min(int(batch_chunk), int(n_rollouts) - start)
+        prompts = [TokensPrompt(prompt_token_ids=prompt_ids)] * bs
+        outputs = vllm_generate_quiet(llm, prompts, sp)
+        if len(outputs) != bs:
+            raise RuntimeError(f"vLLM batch size mismatch: expected {bs}, got {len(outputs)}")
+        for out_req in outputs:
+            o = out_req.outputs[0]
+            hs: list[float] = []
+            for step_lp in o.logprobs or []:
+                d: dict[int, float] = {}
+                for tid, info in step_lp.items():
+                    d[int(tid)] = float(info.logprob)
+                hs.append(float(entropy_from_logprobs_topk(d)))
+            if hs:
+                out_h.append(hs)
+    return out_h
+
+
+def _build_bucket_group_estimator(
+    *,
+    llm: Any,
+    prompt_ids: list[int],
+    n_rollouts: int,
+    max_new_tokens: int,
+    temperature: float,
+    top_p: float,
+    logprobs_k: int,
+    batch_chunk: int,
+    num_bins: int,
+    min_points_per_bin: int,
+) -> dict[str, Any] | None:
+    b = max(2, int(num_bins))
+
+    def _make_padded_degenerate(global_mean: float) -> dict[str, Any]:
+        # Keep fixed-size bucket payload so downstream always sees exactly b bins.
+        return {
+            "degenerate": True,
+            "edges": [0.0 for _ in range(b + 1)],
+            "means": [float(global_mean) for _ in range(b)],
+            "valid": [True for _ in range(b)],
+            "global_mean_suffix_rate": float(global_mean),
+        }
+
+    hs_rollouts = _sample_group_rollouts_for_bucket(
+        llm=llm,
+        prompt_ids=prompt_ids,
+        n_rollouts=n_rollouts,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        logprobs_k=logprobs_k,
+        batch_chunk=batch_chunk,
+    )
+    prefix_rates: list[float] = []
+    suffix_rates: list[float] = []
+    for hs in hs_rollouts:
+        n = len(hs)
+        if n < 2:
+            continue
+        suffix_sum = np.cumsum(np.array(hs[::-1], dtype=np.float64))[::-1]
+        pref_sum = 0.0
+        for u in range(1, n):
+            pref_sum += float(hs[u - 1])
+            pref_rate = pref_sum / float(u)
+            suffix_rate = float(suffix_sum[u] / float(n - u))
+            prefix_rates.append(pref_rate)
+            suffix_rates.append(suffix_rate)
+    if not prefix_rates:
+        return _make_padded_degenerate(global_mean=0.0)
+
+    p = np.array(prefix_rates, dtype=np.float64)
+    f = np.array(suffix_rates, dtype=np.float64)
+    pmin = float(np.min(p))
+    pmax = float(np.max(p))
+    if not np.isfinite(pmin) or not np.isfinite(pmax):
+        return _make_padded_degenerate(global_mean=float(np.mean(f)))
+    if abs(pmax - pmin) < 1e-12:
+        return _make_padded_degenerate(global_mean=float(np.mean(f)))
+
+    edges = np.linspace(pmin, pmax, b + 1, dtype=np.float64)
+    sums = np.zeros(b, dtype=np.float64)
+    cnts = np.zeros(b, dtype=np.int64)
+    for pi, fi in zip(p.tolist(), f.tolist()):
+        idx = int(np.searchsorted(edges, pi, side="right") - 1)
+        idx = min(max(idx, 0), b - 1)
+        sums[idx] += float(fi)
+        cnts[idx] += 1
+    means = np.zeros(b, dtype=np.float64)
+    valid = np.zeros(b, dtype=np.bool_)
+    min_pts = max(1, int(min_points_per_bin))
+    for i in range(b):
+        if int(cnts[i]) >= min_pts:
+            means[i] = float(sums[i] / float(cnts[i]))
+            valid[i] = True
+    global_mean = float(np.mean(f))
+    return {
+        "degenerate": False,
+        "edges": [float(x) for x in edges.tolist()],
+        "means": [float(x) for x in means.tolist()],
+        "valid": [bool(x) for x in valid.tolist()],
+        "global_mean_suffix_rate": float(global_mean),
+    }
+
+
+def _bucket_estimate_bar_f(estimator: dict[str, Any] | None, prefix_rate: float) -> float:
+    if estimator is None:
+        return 0.0
+    gm = float(estimator.get("global_mean_suffix_rate", 0.0))
+    if bool(estimator.get("degenerate", False)):
+        return gm
+    edges = estimator.get("edges")
+    means = estimator.get("means")
+    valid = estimator.get("valid")
+    if not isinstance(edges, list) or not isinstance(means, list) or not isinstance(valid, list):
+        return gm
+    b = len(means)
+    if b == 0:
+        return gm
+    idx = int(np.searchsorted(np.array(edges, dtype=np.float64), float(prefix_rate), side="right") - 1)
+    idx = min(max(idx, 0), b - 1)
+    if valid[idx]:
+        return float(means[idx])
+    nearest_i = None
+    nearest_d = None
+    for i, ok in enumerate(valid):
+        if not ok:
+            continue
+        d = abs(i - idx)
+        if nearest_d is None or d < nearest_d:
+            nearest_d = d
+            nearest_i = i
+    if nearest_i is None:
+        return gm
+    return float(means[int(nearest_i)])
+
+
 def _topk_from_step_logprobs(step_logprobs: dict[int, float], topk: int) -> tuple[list[int], list[float]]:
     if not step_logprobs:
         return [], []
@@ -164,10 +323,12 @@ def _decode_one_policy(
     progress_desc: str = "decode",
     progress_mc_position: int = 2,
     progress_mc_desc: str = "mc",
+    bucket_group_estimator: dict[str, Any] | None = None,
 ) -> tuple[list[int], list[dict[str, Any]]]:
     response_ids: list[int] = []
     branch_records: list[dict[str, Any]] = []
     branch_count = 0
+    entropy_hist: list[float] = []
     sentence_stop_check = None
     if f_sentence_stop == "pysbd":
         from sentence_stop_utils import make_pysbd_first_sentence_stop_check
@@ -247,6 +408,24 @@ def _decode_one_policy(
                         m_samples_use = 0
                         temp_use = 0.0
                         top_p_use = 1.0
+                    elif selection_f_mode == "bucket_group_estimate":
+                        prefix_sum = float(sum(entropy_hist) + float(entropy_t))
+                        prefix_len = len(entropy_hist) + 1
+                        f_values = []
+                        for t in cands:
+                            h1 = _candidate_lookahead_1step_entropy(
+                                llm=llm,
+                                prefix_ids=(prompt_ids + response_ids),
+                                candidate_token_id=int(t),
+                                logprobs_k=vllm_logprobs_topk,
+                            )
+                            p_rate = (prefix_sum + float(h1)) / float(prefix_len + 1)
+                            f_values.append(float(_bucket_estimate_bar_f(bucket_group_estimator, p_rate)))
+                        best_i = int(np.argmin(np.array(f_values, dtype=np.float64)))
+                        chosen_token = int(cands[best_i])
+                        m_samples_use = 0
+                        temp_use = 0.0
+                        top_p_use = 1.0
                     else:
                         raise ValueError(f"unsupported selection_f_mode: {selection_f_mode}")
 
@@ -304,6 +483,7 @@ def _decode_one_policy(
             )
 
         response_ids.append(int(chosen_token))
+        entropy_hist.append(float(entropy_t))
         if eos_token_id is not None and int(chosen_token) == int(eos_token_id):
             break
 
@@ -328,9 +508,9 @@ def main() -> None:
     parser.add_argument("--candidate_max_k", type=int, default=5)
     parser.add_argument(
         "--selection_f_mode",
-        choices=["mc", "greedy_path", "lookahead_1step"],
+        choices=["mc", "greedy_path", "lookahead_1step", "bucket_group_estimate"],
         default="greedy_path",
-        help="How to estimate candidate F when selecting min-F: mc (multi-sample), greedy_path (single deterministic continuation), or lookahead_1step (H_{t+1} proxy).",
+        help="How to estimate candidate F when selecting min-F: mc (multi-sample), greedy_path (single deterministic continuation), lookahead_1step (H_{t+1} proxy), or bucket_group_estimate (group bucket-aligned estimate).",
     )
     parser.add_argument("--max_branch_steps", type=int, default=0, help="<=0 means no cap.")
 
@@ -344,6 +524,9 @@ def main() -> None:
 
     parser.add_argument("--vllm_logprobs_topk", type=int, default=20)
     parser.add_argument("--vllm_request_batch_chunk", type=int, default=64)
+    parser.add_argument("--bucket_group_rollouts", type=int, default=16)
+    parser.add_argument("--bucket_num_bins", type=int, default=100)
+    parser.add_argument("--bucket_min_points_per_bin", type=int, default=4)
     parser.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.9)
     parser.add_argument("--vllm_max_model_len", type=int, default=32768)
     parser.add_argument("--save_traces", action=argparse.BooleanOptionalAction, default=True)
@@ -379,6 +562,12 @@ def main() -> None:
         raise SystemExit("--max_new_tokens must be >=1.")
     if args.vllm_request_batch_chunk < 1:
         raise SystemExit("--vllm_request_batch_chunk must be >=1.")
+    if args.bucket_group_rollouts < 1:
+        raise SystemExit("--bucket_group_rollouts must be >=1.")
+    if args.bucket_num_bins < 2:
+        raise SystemExit("--bucket_num_bins must be >=2.")
+    if args.bucket_min_points_per_bin < 1:
+        raise SystemExit("--bucket_min_points_per_bin must be >=1.")
 
     vllm_standalone = args.vllm_shard_rank is not None and args.vllm_shard_world_size is not None
     if (args.vllm_shard_rank is None) ^ (args.vllm_shard_world_size is None):
@@ -470,6 +659,20 @@ def main() -> None:
         prompt_ids = tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False)["input_ids"][0].tolist()
         data_source = row.get("data_source", "math_dapo")
         ground_truth = _ground_truth_from_row(row)
+        bucket_estimator: dict[str, Any] | None = None
+        if str(args.selection_f_mode) == "bucket_group_estimate":
+            bucket_estimator = _build_bucket_group_estimator(
+                llm=llm,
+                prompt_ids=prompt_ids,
+                n_rollouts=int(args.bucket_group_rollouts),
+                max_new_tokens=int(args.max_new_tokens),
+                temperature=float(args.mc_temperature),
+                top_p=float(args.mc_top_p),
+                logprobs_k=int(args.vllm_logprobs_topk),
+                batch_chunk=int(args.vllm_request_batch_chunk),
+                num_bins=int(args.bucket_num_bins),
+                min_points_per_bin=int(args.bucket_min_points_per_bin),
+            )
 
         response_minf, trace_minf = _decode_one_policy(
             llm=llm,
@@ -498,6 +701,7 @@ def main() -> None:
             progress_desc=f"shard{rank} minF decode",
             progress_mc_position=bar_base + 2,
             progress_mc_desc=f"shard{rank} minF MC",
+            bucket_group_estimator=bucket_estimator,
         )
         response_rand, trace_rand = _decode_one_policy(
             llm=llm,
@@ -526,6 +730,7 @@ def main() -> None:
             progress_desc=f"shard{rank} rand decode",
             progress_mc_position=bar_base + 2,
             progress_mc_desc=f"shard{rank} rand MC",
+            bucket_group_estimator=None,
         )
         response_greedy, trace_greedy = _decode_one_policy(
             llm=llm,
@@ -554,6 +759,7 @@ def main() -> None:
             progress_desc=f"shard{rank} greedy decode",
             progress_mc_position=bar_base + 2,
             progress_mc_desc=f"shard{rank} greedy MC",
+            bucket_group_estimator=None,
         )
 
         text_minf = tokenizer.decode(response_minf, skip_special_tokens=True)
@@ -596,6 +802,9 @@ def main() -> None:
             "max_new_tokens": int(args.max_new_tokens),
             "mc_m_samples": int(args.mc_m_samples),
             "selection_f_mode": str(args.selection_f_mode),
+            "bucket_group_rollouts": int(args.bucket_group_rollouts),
+            "bucket_num_bins": int(args.bucket_num_bins),
+            "bucket_min_points_per_bin": int(args.bucket_min_points_per_bin),
             "f_continuation_mode": str(args.f_continuation_mode),
             "f_sentence_max_new_tokens": int(args.f_sentence_max_new_tokens),
             "f_sentence_stop": str(args.f_sentence_stop),
@@ -705,6 +914,9 @@ def main() -> None:
                 "max_branch_steps": int(args.max_branch_steps),
                 "mc_m_samples": int(args.mc_m_samples),
                 "selection_f_mode": str(args.selection_f_mode),
+                "bucket_group_rollouts": int(args.bucket_group_rollouts),
+                "bucket_num_bins": int(args.bucket_num_bins),
+                "bucket_min_points_per_bin": int(args.bucket_min_points_per_bin),
                 "mc_temperature": float(args.mc_temperature),
                 "mc_top_p": float(args.mc_top_p),
                 "f_continuation_mode": str(args.f_continuation_mode),
