@@ -194,9 +194,9 @@ def main() -> None:
     parser.add_argument("--bucket_min_points_per_bin", type=int, default=4)
     parser.add_argument(
         "--bucket_prefix_key_mode",
-        choices=["sum", "rate"],
+        choices=["sum", "rate", "both"],
         default="sum",
-        help="Prefix key for bucket retrieval: sum (recommended) or rate.",
+        help="Prefix key for bucket retrieval: sum, rate, or both (evaluate both in one run).",
     )
 
     parser.add_argument("--save_traces", action=argparse.BooleanOptionalAction, default=True)
@@ -282,12 +282,17 @@ def main() -> None:
             position=rank if args.progress_all_ranks else 0,
         )
 
+    mode_cfg = str(args.bucket_prefix_key_mode)
+    eval_modes = ["sum", "rate"] if mode_cfg == "both" else [mode_cfg]
+
     summary_cnt: dict[str, int] = {
         "n_prompts": 0,
         "n_eval_steps": 0,
         "n_mc_nonzero_steps": 0,
-        "n_match_steps": 0,
-        "n_match_steps_if_flip": 0,
+        "n_match_steps_sum": 0,
+        "n_match_steps_if_flip_sum": 0,
+        "n_match_steps_rate": 0,
+        "n_match_steps_if_flip_rate": 0,
         "n_skipped_chosen_not_in_candidates": 0,
     }
 
@@ -315,11 +320,17 @@ def main() -> None:
             logprobs_k=int(args.vllm_logprobs_topk),
             batch_chunk=int(args.vllm_request_batch_chunk),
         )
-        bucket_estimator = _build_bucket_estimator_with_key_mode(
+        bucket_estimator_sum = _build_bucket_estimator_with_key_mode(
             hs_rollouts=hs_rollouts,
             num_bins=int(args.bucket_num_bins),
             min_points_per_bin=int(args.bucket_min_points_per_bin),
-            prefix_key_mode=str(args.bucket_prefix_key_mode),
+            prefix_key_mode="sum",
+        )
+        bucket_estimator_rate = _build_bucket_estimator_with_key_mode(
+            hs_rollouts=hs_rollouts,
+            num_bins=int(args.bucket_num_bins),
+            min_points_per_bin=int(args.bucket_min_points_per_bin),
+            prefix_key_mode="rate",
         )
 
         response_ids: list[int] = []
@@ -411,11 +422,7 @@ def main() -> None:
             sign_mc_real = _sign(fbar_mc - f_real_mc)
 
             pref_sum = float(np.sum(np.array(entropy_seq[: step_idx + 1], dtype=np.float64)))
-            if str(args.bucket_prefix_key_mode) == "sum":
-                pref_key = pref_sum
-            else:
-                pref_key = pref_sum / float(step_idx + 1)
-            fbar_bucket = _bucket_lookup(bucket_estimator, pref_key)
+            pref_rate = pref_sum / float(step_idx + 1)
 
             future_sum = float(suffix_sum[step_idx + 1])
             future_len = int(n_steps - step_idx - 1)
@@ -425,11 +432,18 @@ def main() -> None:
                 f_real_proxy = future_sum / float(future_len)
             else:
                 f_real_proxy = future_sum
-            sign_bucket_real = _sign(float(fbar_bucket) - float(f_real_proxy))
+            fbar_bucket_sum = _bucket_lookup(bucket_estimator_sum, pref_sum)
+            fbar_bucket_rate = _bucket_lookup(bucket_estimator_rate, pref_rate)
+            sign_bucket_real_sum = _sign(float(fbar_bucket_sum) - float(f_real_proxy))
+            sign_bucket_real_rate = _sign(float(fbar_bucket_rate) - float(f_real_proxy))
 
             summary_cnt["n_eval_steps"] += 1
-            summary_cnt["n_match_steps"] += int(sign_bucket_real == sign_mc_real)
-            summary_cnt["n_match_steps_if_flip"] += int((-sign_bucket_real) == sign_mc_real)
+            if "sum" in eval_modes:
+                summary_cnt["n_match_steps_sum"] += int(sign_bucket_real_sum == sign_mc_real)
+                summary_cnt["n_match_steps_if_flip_sum"] += int((-sign_bucket_real_sum) == sign_mc_real)
+            if "rate" in eval_modes:
+                summary_cnt["n_match_steps_rate"] += int(sign_bucket_real_rate == sign_mc_real)
+                summary_cnt["n_match_steps_if_flip_rate"] += int((-sign_bucket_real_rate) == sign_mc_real)
             if sign_mc_real != 0:
                 summary_cnt["n_mc_nonzero_steps"] += 1
 
@@ -448,12 +462,17 @@ def main() -> None:
                         "f_real_mc_128": float(f_real_mc),
                         "sign_real_mc_128": int(sign_mc_real),
                         "bucket_prefix_key_mode": str(args.bucket_prefix_key_mode),
-                        "bucket_prefix_key": float(pref_key),
-                        "f_bar_bucket_proxy": float(fbar_bucket),
+                        "bucket_prefix_key_sum": float(pref_sum),
+                        "bucket_prefix_key_rate": float(pref_rate),
+                        "f_bar_bucket_proxy_sum": float(fbar_bucket_sum),
+                        "f_bar_bucket_proxy_rate": float(fbar_bucket_rate),
                         "f_real_proxy_from_trajectory": float(f_real_proxy),
-                        "sign_real_bucket_proxy": int(sign_bucket_real),
-                        "sign_match_real": bool(sign_bucket_real == sign_mc_real),
-                        "sign_match_real_if_flip": bool((-sign_bucket_real) == sign_mc_real),
+                        "sign_real_bucket_proxy_sum": int(sign_bucket_real_sum),
+                        "sign_real_bucket_proxy_rate": int(sign_bucket_real_rate),
+                        "sign_match_real_sum": bool(sign_bucket_real_sum == sign_mc_real),
+                        "sign_match_real_rate": bool(sign_bucket_real_rate == sign_mc_real),
+                        "sign_match_real_if_flip_sum": bool((-sign_bucket_real_sum) == sign_mc_real),
+                        "sign_match_real_if_flip_rate": bool((-sign_bucket_real_rate) == sign_mc_real),
                     }
                 )
 
@@ -510,12 +529,33 @@ def main() -> None:
         summary = {
             "num_prompts": int(total["n_prompts"]),
             "num_eval_steps": int(total["n_eval_steps"]),
-            "real_sign_match_acc_all": _mean_ratio(int(total["n_match_steps"]), int(total["n_eval_steps"])),
-            "real_sign_match_acc_mc_nonzero_only": _mean_ratio(
-                int(total["n_match_steps"]), int(total["n_mc_nonzero_steps"])
+            "real_sign_match_acc_all_sum": (
+                _mean_ratio(int(total["n_match_steps_sum"]), int(total["n_eval_steps"])) if "sum" in eval_modes else float("nan")
             ),
-            "real_sign_match_acc_if_flip_all": _mean_ratio(
-                int(total["n_match_steps_if_flip"]), int(total["n_eval_steps"])
+            "real_sign_match_acc_mc_nonzero_only_sum": (
+                _mean_ratio(int(total["n_match_steps_sum"]), int(total["n_mc_nonzero_steps"]))
+                if "sum" in eval_modes
+                else float("nan")
+            ),
+            "real_sign_match_acc_if_flip_all_sum": (
+                _mean_ratio(int(total["n_match_steps_if_flip_sum"]), int(total["n_eval_steps"]))
+                if "sum" in eval_modes
+                else float("nan")
+            ),
+            "real_sign_match_acc_all_rate": (
+                _mean_ratio(int(total["n_match_steps_rate"]), int(total["n_eval_steps"]))
+                if "rate" in eval_modes
+                else float("nan")
+            ),
+            "real_sign_match_acc_mc_nonzero_only_rate": (
+                _mean_ratio(int(total["n_match_steps_rate"]), int(total["n_mc_nonzero_steps"]))
+                if "rate" in eval_modes
+                else float("nan")
+            ),
+            "real_sign_match_acc_if_flip_all_rate": (
+                _mean_ratio(int(total["n_match_steps_if_flip_rate"]), int(total["n_eval_steps"]))
+                if "rate" in eval_modes
+                else float("nan")
             ),
             "counts": total,
             "config": {
