@@ -35,6 +35,7 @@ VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-32768}"
 BUCKET_GROUP_ROLLOUTS="${BUCKET_GROUP_ROLLOUTS:-16}"
 BUCKET_NUM_BINS="${BUCKET_NUM_BINS:-100}"
 BUCKET_MIN_POINTS_PER_BIN="${BUCKET_MIN_POINTS_PER_BIN:-4}"
+BUCKET_PREFIX_KEY_MODE="${BUCKET_PREFIX_KEY_MODE:-sum}"
 
 SAVE_TRACES="${SAVE_TRACES:-1}"
 NO_PROGRESS="${NO_PROGRESS:-0}"
@@ -103,6 +104,7 @@ for ((r = 0; r < NPROC_PER_NODE; r++)); do
     --bucket_group_rollouts "${BUCKET_GROUP_ROLLOUTS}" \
     --bucket_num_bins "${BUCKET_NUM_BINS}" \
     --bucket_min_points_per_bin "${BUCKET_MIN_POINTS_PER_BIN}" \
+    --bucket_prefix_key_mode "${BUCKET_PREFIX_KEY_MODE}" \
     --vllm_shard_rank "${GLOBAL_RANK}" \
     --vllm_shard_world_size "${WORLD_SIZE}" \
     "${EXTRA_ARGS[@]}" \

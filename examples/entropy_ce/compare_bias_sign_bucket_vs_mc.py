@@ -24,10 +24,8 @@ from entropy_credit_experiment import (
     purge_all_torchrun_like_env_for_vllm_standalone,
 )
 from infer_topk_f_mc_compare import (
-    _build_bucket_group_estimator,
-    _bucket_estimate_bar_f,
-    _candidate_lookahead_1step_entropy,
     _ground_truth_from_row,
+    _sample_group_rollouts_for_bucket,
     _step_logprobs_vllm,
     _topp_capped_from_step_logprobs,
 )
@@ -57,9 +55,114 @@ def _append_jsonl(path: Path, rec: dict[str, Any]) -> None:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
+def _build_bucket_estimator_with_key_mode(
+    *,
+    hs_rollouts: list[list[float]],
+    num_bins: int,
+    min_points_per_bin: int,
+    prefix_key_mode: str,
+) -> dict[str, Any]:
+    b = max(2, int(num_bins))
+    prefix_keys: list[float] = []
+    suffix_rates: list[float] = []
+    for hs in hs_rollouts:
+        n = len(hs)
+        if n < 2:
+            continue
+        suffix_sum = np.cumsum(np.array(hs[::-1], dtype=np.float64))[::-1]
+        pref_sum = 0.0
+        for u in range(1, n):
+            pref_sum += float(hs[u - 1])
+            if prefix_key_mode == "sum":
+                key = pref_sum
+            else:
+                key = pref_sum / float(u)
+            suffix_rate = float(suffix_sum[u] / float(n - u))
+            prefix_keys.append(float(key))
+            suffix_rates.append(float(suffix_rate))
+
+    if not prefix_keys:
+        return {
+            "degenerate": True,
+            "edges": [0.0 for _ in range(b + 1)],
+            "means": [0.0 for _ in range(b)],
+            "valid": [True for _ in range(b)],
+            "global_mean_suffix_rate": 0.0,
+        }
+
+    p = np.array(prefix_keys, dtype=np.float64)
+    f = np.array(suffix_rates, dtype=np.float64)
+    pmin = float(np.min(p))
+    pmax = float(np.max(p))
+    global_mean = float(np.mean(f))
+    if (not np.isfinite(pmin)) or (not np.isfinite(pmax)) or abs(pmax - pmin) < 1e-12:
+        return {
+            "degenerate": True,
+            "edges": [0.0 for _ in range(b + 1)],
+            "means": [float(global_mean) for _ in range(b)],
+            "valid": [True for _ in range(b)],
+            "global_mean_suffix_rate": float(global_mean),
+        }
+
+    edges = np.linspace(pmin, pmax, b + 1, dtype=np.float64)
+    sums = np.zeros(b, dtype=np.float64)
+    cnts = np.zeros(b, dtype=np.int64)
+    for pi, fi in zip(p.tolist(), f.tolist()):
+        idx = int(np.searchsorted(edges, pi, side="right") - 1)
+        idx = min(max(idx, 0), b - 1)
+        sums[idx] += float(fi)
+        cnts[idx] += 1
+
+    means = np.zeros(b, dtype=np.float64)
+    valid = np.zeros(b, dtype=np.bool_)
+    min_pts = max(1, int(min_points_per_bin))
+    for i in range(b):
+        if int(cnts[i]) >= min_pts:
+            means[i] = float(sums[i] / float(cnts[i]))
+            valid[i] = True
+
+    return {
+        "degenerate": False,
+        "edges": [float(x) for x in edges.tolist()],
+        "means": [float(x) for x in means.tolist()],
+        "valid": [bool(x) for x in valid.tolist()],
+        "global_mean_suffix_rate": float(global_mean),
+    }
+
+
+def _bucket_lookup(estimator: dict[str, Any], prefix_key: float) -> float:
+    gm = float(estimator.get("global_mean_suffix_rate", 0.0))
+    if bool(estimator.get("degenerate", False)):
+        return gm
+    edges = estimator.get("edges")
+    means = estimator.get("means")
+    valid = estimator.get("valid")
+    if not isinstance(edges, list) or not isinstance(means, list) or not isinstance(valid, list):
+        return gm
+    b = len(means)
+    if b <= 0:
+        return gm
+    idx = int(np.searchsorted(np.array(edges, dtype=np.float64), float(prefix_key), side="right") - 1)
+    idx = min(max(idx, 0), b - 1)
+    if bool(valid[idx]):
+        return float(means[idx])
+    nearest_i = None
+    nearest_d = None
+    for i, ok in enumerate(valid):
+        if not ok:
+            continue
+        d = abs(i - idx)
+        if nearest_d is None or d < nearest_d:
+            nearest_d = d
+            nearest_i = i
+    if nearest_i is None:
+        return gm
+    return float(means[int(nearest_i)])
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Compare sign agreement of bias term: bucket_group_estimate vs MC=128."
+        description="Compare real-token bias-sign: bucket estimate vs MC reference."
     )
     parser.add_argument("--input_data", type=str, required=True)
     parser.add_argument("--model_path", type=str, required=True)
@@ -89,6 +192,12 @@ def main() -> None:
     parser.add_argument("--bucket_group_rollouts", type=int, default=16)
     parser.add_argument("--bucket_num_bins", type=int, default=100)
     parser.add_argument("--bucket_min_points_per_bin", type=int, default=4)
+    parser.add_argument(
+        "--bucket_prefix_key_mode",
+        choices=["sum", "rate"],
+        default="sum",
+        help="Prefix key for bucket retrieval: sum (recommended) or rate.",
+    )
 
     parser.add_argument("--save_traces", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--no_progress", action="store_true")
@@ -176,14 +285,10 @@ def main() -> None:
     summary_cnt: dict[str, int] = {
         "n_prompts": 0,
         "n_eval_steps": 0,
-        "n_eval_candidates": 0,
-        "n_mc_nonzero_candidates": 0,
-        "n_match_all_candidates": 0,
-        "n_match_mc_nonzero_candidates": 0,
-        "n_eval_steps_chosen": 0,
-        "n_mc_nonzero_steps_chosen": 0,
-        "n_match_steps_chosen": 0,
-        "n_match_steps_chosen_mc_nonzero": 0,
+        "n_mc_nonzero_steps": 0,
+        "n_match_steps": 0,
+        "n_match_steps_if_flip": 0,
+        "n_skipped_chosen_not_in_candidates": 0,
     }
 
     sentence_stop_check = None
@@ -200,7 +305,7 @@ def main() -> None:
 
         prompt_text = build_prompt_text(tokenizer, row["prompt"])
         prompt_ids = tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False)["input_ids"][0].tolist()
-        bucket_estimator = _build_bucket_group_estimator(
+        hs_rollouts = _sample_group_rollouts_for_bucket(
             llm=llm,
             prompt_ids=prompt_ids,
             n_rollouts=int(args.bucket_group_rollouts),
@@ -209,15 +314,20 @@ def main() -> None:
             top_p=float(args.mc_top_p),
             logprobs_k=int(args.vllm_logprobs_topk),
             batch_chunk=int(args.vllm_request_batch_chunk),
+        )
+        bucket_estimator = _build_bucket_estimator_with_key_mode(
+            hs_rollouts=hs_rollouts,
             num_bins=int(args.bucket_num_bins),
             min_points_per_bin=int(args.bucket_min_points_per_bin),
+            prefix_key_mode=str(args.bucket_prefix_key_mode),
         )
 
         response_ids: list[int] = []
-        entropy_hist: list[float] = []
+        entropy_seq: list[float] = []
+        step_lps_seq: list[dict[int, float]] = []
         step_records: list[dict[str, Any]] = []
-        branch_count = 0
 
+        # Pass-1: generate one greedy trajectory and cache per-step logprobs.
         for step_idx in range(int(args.max_new_tokens)):
             prefix = prompt_ids + response_ids
             greedy_token, step_lp = _step_logprobs_vllm(
@@ -229,108 +339,123 @@ def main() -> None:
                 break
 
             entropy_t = float(entropy_from_logprobs_topk(step_lp))
+            response_ids.append(int(greedy_token))
+            entropy_seq.append(float(entropy_t))
+            step_lps_seq.append(dict(step_lp))
+            if tokenizer.eos_token_id is not None and int(greedy_token) == int(tokenizer.eos_token_id):
+                break
+
+        # Precompute realized suffix proxy F_t from greedy trajectory itself.
+        n_steps = len(entropy_seq)
+        if n_steps > 0:
+            arr = np.array(entropy_seq, dtype=np.float64)
+            suffix_sum = np.cumsum(arr[::-1])[::-1]
+        else:
+            suffix_sum = np.array([], dtype=np.float64)
+
+        eval_positions: list[int] = []
+        branch_count = 0
+        for step_idx in range(n_steps):
+            step_lp = step_lps_seq[step_idx]
+            cands, _cand_probs = _topp_capped_from_step_logprobs(
+                step_lp,
+                top_p=float(args.candidate_top_p),
+                max_k=int(args.candidate_max_k),
+            )
+            if (
+                float(entropy_seq[step_idx]) >= float(args.entropy_threshold)
+                and len(cands) >= 2
+                and (int(args.max_branch_steps) <= 0 or branch_count < int(args.max_branch_steps))
+                and (step_idx + 1) < n_steps
+            ):
+                eval_positions.append(step_idx)
+                branch_count += 1
+
+        for step_idx in eval_positions:
+            step_lp = step_lps_seq[step_idx]
             cands, cand_probs = _topp_capped_from_step_logprobs(
                 step_lp,
                 top_p=float(args.candidate_top_p),
                 max_k=int(args.candidate_max_k),
             )
-            if not cands:
-                cands = [int(greedy_token)]
-                cand_probs = [1.0]
+            chosen_token = int(response_ids[step_idx])
+            if chosen_token not in cands:
+                summary_cnt["n_skipped_chosen_not_in_candidates"] += 1
+                continue
 
-            should_eval = (
-                entropy_t >= float(args.entropy_threshold)
-                and len(cands) >= 2
-                and (int(args.max_branch_steps) <= 0 or branch_count < int(args.max_branch_steps))
+            remaining = int(args.max_new_tokens) - step_idx - 1
+            if remaining <= 0:
+                continue
+            prefixes = [prompt_ids + response_ids[:step_idx] + [int(t)] for t in cands]
+            f_mc = estimate_F_mc_many_prefixes_vllm(
+                llm=llm,
+                prefixes=prefixes,
+                m_samples=int(args.mc_m_samples_ref),
+                max_new_tokens=remaining,
+                temperature=float(args.mc_temperature),
+                top_p=float(args.mc_top_p),
+                logprobs_k=int(args.vllm_logprobs_topk),
+                batch_chunk=int(args.vllm_request_batch_chunk),
+                f_continuation_mode=str(args.f_continuation_mode),
+                tokenizer=tokenizer if str(args.f_continuation_mode) == "first_sentence" else None,
+                f_sentence_max_new_tokens=int(args.f_sentence_max_new_tokens),
+                sentence_stop_check=sentence_stop_check,
+                normalize_by_continuation_length=(str(args.bias_metrics_mode) == "length_normalized"),
             )
-            if should_eval:
-                remaining = int(args.max_new_tokens) - step_idx - 1
-                if remaining > 0:
-                    prefixes = [prompt_ids + response_ids + [int(t)] for t in cands]
-                    f_mc = estimate_F_mc_many_prefixes_vllm(
-                        llm=llm,
-                        prefixes=prefixes,
-                        m_samples=int(args.mc_m_samples_ref),
-                        max_new_tokens=remaining,
-                        temperature=float(args.mc_temperature),
-                        top_p=float(args.mc_top_p),
-                        logprobs_k=int(args.vllm_logprobs_topk),
-                        batch_chunk=int(args.vllm_request_batch_chunk),
-                        f_continuation_mode=str(args.f_continuation_mode),
-                        tokenizer=tokenizer if str(args.f_continuation_mode) == "first_sentence" else None,
-                        f_sentence_max_new_tokens=int(args.f_sentence_max_new_tokens),
-                        sentence_stop_check=sentence_stop_check,
-                        normalize_by_continuation_length=(str(args.bias_metrics_mode) == "length_normalized"),
-                    )
-                    if len(f_mc) == len(cands):
-                        fbar_mc = float(sum(float(p) * float(v) for p, v in zip(cand_probs, f_mc, strict=False)))
-                        sign_mc = [_sign(fbar_mc - float(v)) for v in f_mc]
+            if len(f_mc) != len(cands):
+                continue
 
-                        prefix_sum = float(sum(entropy_hist) + entropy_t)
-                        prefix_len = len(entropy_hist) + 1
-                        f_bucket: list[float] = []
-                        for t in cands:
-                            h1 = _candidate_lookahead_1step_entropy(
-                                llm=llm,
-                                prefix_ids=(prompt_ids + response_ids),
-                                candidate_token_id=int(t),
-                                logprobs_k=int(args.vllm_logprobs_topk),
-                            )
-                            p_rate = (prefix_sum + float(h1)) / float(prefix_len + 1)
-                            f_bucket.append(float(_bucket_estimate_bar_f(bucket_estimator, p_rate)))
-                        fbar_bucket = float(
-                            sum(float(p) * float(v) for p, v in zip(cand_probs, f_bucket, strict=False))
-                        )
-                        sign_bucket = [_sign(fbar_bucket - float(v)) for v in f_bucket]
+            chosen_idx = cands.index(chosen_token)
+            fbar_mc = float(sum(float(p) * float(v) for p, v in zip(cand_probs, f_mc, strict=False)))
+            f_real_mc = float(f_mc[chosen_idx])
+            sign_mc_real = _sign(fbar_mc - f_real_mc)
 
-                        chosen_idx = 0
-                        if int(greedy_token) in cands:
-                            chosen_idx = cands.index(int(greedy_token))
+            pref_sum = float(np.sum(np.array(entropy_seq[: step_idx + 1], dtype=np.float64)))
+            if str(args.bucket_prefix_key_mode) == "sum":
+                pref_key = pref_sum
+            else:
+                pref_key = pref_sum / float(step_idx + 1)
+            fbar_bucket = _bucket_lookup(bucket_estimator, pref_key)
 
-                        cand_match = [int(a == b) for a, b in zip(sign_bucket, sign_mc, strict=False)]
-                        nz_mask = [int(s != 0) for s in sign_mc]
-                        nz_match = [m for m, z in zip(cand_match, nz_mask, strict=False) if z == 1]
+            future_sum = float(suffix_sum[step_idx + 1])
+            future_len = int(n_steps - step_idx - 1)
+            if future_len <= 0:
+                continue
+            if str(args.bias_metrics_mode) == "length_normalized":
+                f_real_proxy = future_sum / float(future_len)
+            else:
+                f_real_proxy = future_sum
+            sign_bucket_real = _sign(float(fbar_bucket) - float(f_real_proxy))
 
-                        summary_cnt["n_eval_steps"] += 1
-                        summary_cnt["n_eval_candidates"] += int(len(cands))
-                        summary_cnt["n_match_all_candidates"] += int(sum(cand_match))
-                        summary_cnt["n_mc_nonzero_candidates"] += int(sum(nz_mask))
-                        summary_cnt["n_match_mc_nonzero_candidates"] += int(sum(nz_match))
-                        summary_cnt["n_eval_steps_chosen"] += 1
-                        summary_cnt["n_match_steps_chosen"] += int(sign_bucket[chosen_idx] == sign_mc[chosen_idx])
-                        if sign_mc[chosen_idx] != 0:
-                            summary_cnt["n_mc_nonzero_steps_chosen"] += 1
-                            summary_cnt["n_match_steps_chosen_mc_nonzero"] += int(
-                                sign_bucket[chosen_idx] == sign_mc[chosen_idx]
-                            )
+            summary_cnt["n_eval_steps"] += 1
+            summary_cnt["n_match_steps"] += int(sign_bucket_real == sign_mc_real)
+            summary_cnt["n_match_steps_if_flip"] += int((-sign_bucket_real) == sign_mc_real)
+            if sign_mc_real != 0:
+                summary_cnt["n_mc_nonzero_steps"] += 1
 
-                        if bool(args.save_traces):
-                            step_records.append(
-                                {
-                                    "step_index": int(step_idx),
-                                    "entropy_t": float(entropy_t),
-                                    "chosen_token": int(greedy_token),
-                                    "chosen_text": tokenizer.decode([int(greedy_token)], skip_special_tokens=True),
-                                    "candidates": [int(x) for x in cands],
-                                    "candidate_probs_renorm_topp": [float(x) for x in cand_probs],
-                                    "f_mc_128": [float(x) for x in f_mc],
-                                    "f_bar_mc_128": float(fbar_mc),
-                                    "bias_sign_mc_128": [int(x) for x in sign_mc],
-                                    "f_bucket_proxy": [float(x) for x in f_bucket],
-                                    "f_bar_bucket_proxy": float(fbar_bucket),
-                                    "bias_sign_bucket_proxy": [int(x) for x in sign_bucket],
-                                    "chosen_idx": int(chosen_idx),
-                                    "chosen_sign_mc_128": int(sign_mc[chosen_idx]),
-                                    "chosen_sign_bucket_proxy": int(sign_bucket[chosen_idx]),
-                                    "chosen_sign_match": bool(sign_mc[chosen_idx] == sign_bucket[chosen_idx]),
-                                }
-                            )
-                        branch_count += 1
-
-            response_ids.append(int(greedy_token))
-            entropy_hist.append(float(entropy_t))
-            if tokenizer.eos_token_id is not None and int(greedy_token) == int(tokenizer.eos_token_id):
-                break
+            if bool(args.save_traces):
+                step_records.append(
+                    {
+                        "step_index": int(step_idx),
+                        "entropy_t": float(entropy_seq[step_idx]),
+                        "chosen_token": int(chosen_token),
+                        "chosen_text": tokenizer.decode([int(chosen_token)], skip_special_tokens=True),
+                        "candidate_count": int(len(cands)),
+                        "candidates": [int(x) for x in cands],
+                        "candidate_probs_renorm_topp": [float(x) for x in cand_probs],
+                        "f_mc_128": [float(x) for x in f_mc],
+                        "f_bar_mc_128": float(fbar_mc),
+                        "f_real_mc_128": float(f_real_mc),
+                        "sign_real_mc_128": int(sign_mc_real),
+                        "bucket_prefix_key_mode": str(args.bucket_prefix_key_mode),
+                        "bucket_prefix_key": float(pref_key),
+                        "f_bar_bucket_proxy": float(fbar_bucket),
+                        "f_real_proxy_from_trajectory": float(f_real_proxy),
+                        "sign_real_bucket_proxy": int(sign_bucket_real),
+                        "sign_match_real": bool(sign_bucket_real == sign_mc_real),
+                        "sign_match_real_if_flip": bool((-sign_bucket_real) == sign_mc_real),
+                    }
+                )
 
         rec: dict[str, Any] = {
             "sample_index": int(global_idx),
@@ -345,6 +470,7 @@ def main() -> None:
             "bucket_group_rollouts": int(args.bucket_group_rollouts),
             "bucket_num_bins": int(args.bucket_num_bins),
             "bucket_min_points_per_bin": int(args.bucket_min_points_per_bin),
+            "bucket_prefix_key_mode": str(args.bucket_prefix_key_mode),
             "num_eval_steps": int(len(step_records)) if bool(args.save_traces) else int(branch_count),
         }
         if bool(args.save_traces):
@@ -384,18 +510,12 @@ def main() -> None:
         summary = {
             "num_prompts": int(total["n_prompts"]),
             "num_eval_steps": int(total["n_eval_steps"]),
-            "num_eval_candidates": int(total["n_eval_candidates"]),
-            "candidate_sign_match_acc_all": _mean_ratio(
-                int(total["n_match_all_candidates"]), int(total["n_eval_candidates"])
+            "real_sign_match_acc_all": _mean_ratio(int(total["n_match_steps"]), int(total["n_eval_steps"])),
+            "real_sign_match_acc_mc_nonzero_only": _mean_ratio(
+                int(total["n_match_steps"]), int(total["n_mc_nonzero_steps"])
             ),
-            "candidate_sign_match_acc_mc_nonzero_only": _mean_ratio(
-                int(total["n_match_mc_nonzero_candidates"]), int(total["n_mc_nonzero_candidates"])
-            ),
-            "chosen_sign_match_acc_all": _mean_ratio(
-                int(total["n_match_steps_chosen"]), int(total["n_eval_steps_chosen"])
-            ),
-            "chosen_sign_match_acc_mc_nonzero_only": _mean_ratio(
-                int(total["n_match_steps_chosen_mc_nonzero"]), int(total["n_mc_nonzero_steps_chosen"])
+            "real_sign_match_acc_if_flip_all": _mean_ratio(
+                int(total["n_match_steps_if_flip"]), int(total["n_eval_steps"])
             ),
             "counts": total,
             "config": {
@@ -414,6 +534,7 @@ def main() -> None:
                 "bucket_group_rollouts": int(args.bucket_group_rollouts),
                 "bucket_num_bins": int(args.bucket_num_bins),
                 "bucket_min_points_per_bin": int(args.bucket_min_points_per_bin),
+                "bucket_prefix_key_mode": str(args.bucket_prefix_key_mode),
             },
         }
         with open(out_dir / "sign_compare_summary.json", "w", encoding="utf-8") as f:
