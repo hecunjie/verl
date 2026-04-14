@@ -550,6 +550,12 @@ def main() -> None:
 
     parser.add_argument("--vllm_shard_rank", type=int, default=None)
     parser.add_argument("--vllm_shard_world_size", type=int, default=None)
+    parser.add_argument(
+        "--math_eval_backend",
+        choices=["auto", "math_dapo", "math_verify"],
+        default="auto",
+        help="Math correctness backend for math-like datasets; use math_verify for MATH-500 style evaluation.",
+    )
     args = parser.parse_args()
 
     if not (0.0 < float(args.candidate_top_p) <= 1.0):
@@ -769,16 +775,19 @@ def main() -> None:
             data_source=data_source,
             solution_str=text_minf,
             ground_truth=ground_truth,
+            math_eval_backend=str(args.math_eval_backend),
         )
         ok_rand, eval_rand = evaluate_solution_acc(
             data_source=data_source,
             solution_str=text_rand,
             ground_truth=ground_truth,
+            math_eval_backend=str(args.math_eval_backend),
         )
         ok_greedy, eval_greedy = evaluate_solution_acc(
             data_source=data_source,
             solution_str=text_greedy,
             ground_truth=ground_truth,
+            math_eval_backend=str(args.math_eval_backend),
         )
         acc_minf.append(1.0 if ok_minf else 0.0)
         acc_rand.append(1.0 if ok_rand else 0.0)
@@ -802,6 +811,7 @@ def main() -> None:
             "max_new_tokens": int(args.max_new_tokens),
             "mc_m_samples": int(args.mc_m_samples),
             "selection_f_mode": str(args.selection_f_mode),
+            "math_eval_backend": str(args.math_eval_backend),
             "bucket_group_rollouts": int(args.bucket_group_rollouts),
             "bucket_num_bins": int(args.bucket_num_bins),
             "bucket_min_points_per_bin": int(args.bucket_min_points_per_bin),
@@ -914,6 +924,7 @@ def main() -> None:
                 "max_branch_steps": int(args.max_branch_steps),
                 "mc_m_samples": int(args.mc_m_samples),
                 "selection_f_mode": str(args.selection_f_mode),
+                "math_eval_backend": str(args.math_eval_backend),
                 "bucket_group_rollouts": int(args.bucket_group_rollouts),
                 "bucket_num_bins": int(args.bucket_num_bins),
                 "bucket_min_points_per_bin": int(args.bucket_min_points_per_bin),

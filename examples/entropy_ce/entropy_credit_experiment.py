@@ -359,16 +359,52 @@ def extract_acc(result: Any) -> bool:
     return float(result) > 0.5
 
 
-def evaluate_solution_acc(data_source: str, solution_str: str, ground_truth: str) -> tuple[bool, dict[str, Any]]:
-    """Evaluate correctness with math_dapo for math-like sources.
+def evaluate_solution_acc(
+    data_source: str,
+    solution_str: str,
+    ground_truth: str,
+    *,
+    math_eval_backend: str = "auto",
+) -> tuple[bool, dict[str, Any]]:
+    """Evaluate correctness for math and non-math datasets.
 
-    Uses ``strict_box_verify=False`` (Minerva-style), matching ``default_compute_score`` / RL training.
+    Args:
+        math_eval_backend:
+            - ``auto``: keep existing behavior by data_source routing.
+            - ``math_dapo``: force math_dapo minerva-style verifier on math-like datasets.
+            - ``math_verify``: force math_verify symbolic verifier on math-like datasets.
     """
-    if data_source in {"math_dapo", "math", "math_dapo_reasoning"} or data_source.startswith("aime"):
+    ds = str(data_source or "")
+    backend = str(math_eval_backend)
+    if backend not in {"auto", "math_dapo", "math_verify"}:
+        raise ValueError(f"unsupported math_eval_backend: {backend}")
+
+    math_like = (
+        ds in {"math_dapo", "math", "math_dapo_reasoning", "lighteval/MATH", "DigitalLearningGmbH/MATH-lighteval", "HuggingFaceH4/MATH-500"}
+        or ds.startswith("aime")
+        or ("math500" in ds.lower())
+    )
+
+    if math_like and backend in {"auto", "math_dapo"}:
         res = math_dapo_score.compute_score(solution_str, ground_truth, strict_box_verify=False)
         return bool(res.get("acc", False)), {"mode": "math_dapo_minerva", **res}
 
-    res = default_compute_score(data_source=data_source, solution_str=solution_str, ground_truth=ground_truth)
+    if math_like and backend == "math_verify":
+        try:
+            from verl.utils.reward_score import math_verify as math_verify_score
+
+            sc = float(math_verify_score.compute_score(solution_str, ground_truth))
+            ok = bool(sc > 0.5)
+            return ok, {"mode": "math_verify", "score": sc}
+        except Exception as e:  # pragma: no cover
+            res = math_dapo_score.compute_score(solution_str, ground_truth, strict_box_verify=False)
+            return bool(res.get("acc", False)), {
+                "mode": "math_verify_fallback_math_dapo",
+                "fallback_reason": f"{type(e).__name__}: {e}",
+                **res,
+            }
+
+    res = default_compute_score(data_source=ds, solution_str=solution_str, ground_truth=ground_truth)
     return extract_acc(res), {"mode": "default_compute_score", "raw_result": res}
 
 

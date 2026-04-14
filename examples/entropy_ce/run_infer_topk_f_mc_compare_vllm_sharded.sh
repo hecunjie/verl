@@ -23,6 +23,7 @@ MC_M_SAMPLES="${MC_M_SAMPLES:-1}"
 MC_TEMPERATURE="${MC_TEMPERATURE:-1.0}"
 MC_TOP_P="${MC_TOP_P:-0.95}"
 BIAS_METRICS_MODE="${BIAS_METRICS_MODE:-length_normalized}"
+MATH_EVAL_BACKEND="${MATH_EVAL_BACKEND:-auto}"
 F_CONTINUATION_MODE="${F_CONTINUATION_MODE:-first_sentence}"
 F_SENTENCE_MAX_NEW_TOKENS="${F_SENTENCE_MAX_NEW_TOKENS:-256}"
 F_SENTENCE_STOP="${F_SENTENCE_STOP:-simple}"
@@ -96,6 +97,7 @@ for ((r = 0; r < NPROC_PER_NODE; r++)); do
     --mc_temperature "${MC_TEMPERATURE}" \
     --mc_top_p "${MC_TOP_P}" \
     --bias_metrics_mode "${BIAS_METRICS_MODE}" \
+    --math_eval_backend "${MATH_EVAL_BACKEND}" \
     --f_continuation_mode "${F_CONTINUATION_MODE}" \
     --f_sentence_max_new_tokens "${F_SENTENCE_MAX_NEW_TOKENS}" \
     --f_sentence_stop "${F_SENTENCE_STOP}" \

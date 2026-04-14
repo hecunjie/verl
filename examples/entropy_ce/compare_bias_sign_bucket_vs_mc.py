@@ -200,6 +200,12 @@ def main() -> None:
     )
 
     parser.add_argument("--save_traces", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--math_eval_backend",
+        choices=["auto", "math_dapo", "math_verify"],
+        default="auto",
+        help="Math correctness backend for math-like datasets.",
+    )
     parser.add_argument("--no_progress", action="store_true")
     parser.add_argument("--progress_all_ranks", action="store_true")
     parser.add_argument("--progress_echo", action="store_true")
