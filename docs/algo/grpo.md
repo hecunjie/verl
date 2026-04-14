@@ -52,18 +52,27 @@ Instead of adding KL penalty in the reward, GRPO regularizes by directly adding 
 
 ### GTPO (Group Token Policy Optimization)
 
-[GTPO and GRPO-S: Token and Sequence-Level Reward Shaping with Policy Entropy](https://arxiv.org/abs/2508.04349) uses **dynamic entropy weighting**: within each response, token-level advantage is scaled by \(w_t = H_t / \sum_k H_k\) where \(H_t\) is the policy entropy at step \(t\). Group-relative scalars are the same as GRPO; only the distribution across tokens changes (high-entropy steps receive a larger share).
+[GTPO and GRPO-S: Token and Sequence-Level Reward Shaping with Policy Entropy](https://arxiv.org/abs/2508.04349) introduces entropy-based reward shaping with asymmetric positive/negative credit assignment.
 
-By default, advantages are **`w_t` times the sequence length** so that \(\sum_t A_t = \hat{A}_i \cdot n\) for \(n\) valid response tokens, matching the **total advantage mass** of GRPO’s uniform broadcast. Set `algorithm.gtpo_scale_advantage_by_seq_len=False` for the legacy behavior \(\sum_t A_t = \hat{A}_i\).
+VERL currently provides two GTPO-related estimators:
 
-Configure:
+- **`grpo_gtpo`**: legacy variant that redistributes GRPO scalar advantages by per-sequence entropy ratios.
+- **`gtpo`**: paper-inspired variant with asymmetric shaping:
+  - positive paths use entropy bonus \(H\)-proportional allocation,
+  - negative paths use inverse-entropy \(1/H\)-proportional allocation.
 
-- `algorithm.adv_estimator`: set to **`grpo_gtpo`**
+For `gtpo`, configure:
+
+- `algorithm.adv_estimator`: set to **`gtpo`**
 - `algorithm.norm_adv_by_std_in_grpo`: same meaning as GRPO (typically `True`)
-- `algorithm.gtpo_scale_advantage_by_seq_len`: default **`True`** (fair total mass vs GRPO); **`False`** for legacy scaling
-- **Do not** use `rollout_correction` **bypass_mode**: GTPO needs per-token entropy from the recomputed `old_log_prob` path; bypass mode does not provide `token_entropy`.
+- `algorithm.gtpo_alpha1`: base coefficient (paper default: `1.0`)
+- `algorithm.gtpo_alpha2`: entropy shaping coefficient (paper default: `0.1`)
+- `algorithm.gtpo_entropy_clip_low`: entropy clip low (paper default: `0.2`)
+- `algorithm.gtpo_entropy_clip_high`: entropy clip high (paper default: `0.28`)
+- `algorithm.gtpo_success_reward_threshold`: split positive/negative by sequence score threshold (`> threshold` is positive; default: `0.0`)
+- **Do not** use `rollout_correction` **bypass_mode**: GTPO needs per-token entropy from recomputed `old_log_prob`; bypass mode does not provide `token_entropy`.
 
-Other settings match the GRPO example scripts (e.g. `examples/grpo_trainer/run_grpo_gtpo_r1_distill_7b_dapo_data.sh`).
+Example script: `examples/grpo_trainer/run_gtpo_r1_distill_7b_dapo_data.sh`.
 
 ### DrGRPO
 

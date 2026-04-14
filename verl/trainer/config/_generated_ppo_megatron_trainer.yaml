@@ -639,6 +639,11 @@ algorithm:
   adv_estimator: gae
   norm_adv_by_std_in_grpo: true
   gtpo_scale_advantage_by_seq_len: true
+  gtpo_alpha1: 1.0
+  gtpo_alpha2: 0.1
+  gtpo_entropy_clip_low: 0.2
+  gtpo_entropy_clip_high: 0.28
+  gtpo_success_reward_threshold: 0.0
   use_kl_in_reward: false
   kl_penalty: kl
   kl_ctrl:

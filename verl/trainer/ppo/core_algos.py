@@ -106,6 +106,7 @@ class AdvantageEstimator(str, Enum):
     RLOO_VECTORIZED = "rloo_vectorized"
     GRPO_VECTORIZED = "grpo_vectorized"
     GRPO_GTPO = "grpo_gtpo"
+    GTPO = "gtpo"
     OPTIMAL_TOKEN_BASELINE = "optimal_token_baseline"
     TIR_OPTIMAL_TOKEN_BASELINE = "tir_optimal_token_baseline"
 
@@ -409,6 +410,84 @@ def compute_grpo_gtpo_outcome_advantage(
         advantages = scalars.unsqueeze(-1) * w
         if scale_by_seq_len:
             advantages = advantages * sum_mask
+        return advantages, advantages
+
+
+@register_adv_est(AdvantageEstimator.GTPO)  # or simply: @register_adv_est("gtpo")
+def compute_gtpo_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    token_entropy: torch.Tensor,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Optional[AlgoConfig] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Paper-inspired GTPO with asymmetric credit assignment for positive/negative paths.
+
+    This estimator keeps GRPO-style group-relative scalars and applies token-level multiplicative
+    reward-shaping factors:
+
+      - Positive-path bonus uses entropy proportion (high entropy gets larger bonus).
+      - Negative-path bonus uses inverse-entropy proportion (low entropy gets larger penalty magnitude).
+
+    The per-token multiplier has the form ``alpha1 + alpha2 * bonus_t`` and is applied on top of
+    the GRPO scalar advantage.
+    """
+    with torch.no_grad():
+        scores = token_level_rewards.sum(dim=-1)
+        g = as_torch_index(index, device=scores.device)
+        mean_g, std_g, _ = group_mean_std(scores, g, eps=epsilon, device=scores.device)
+        if norm_adv_by_std_in_grpo:
+            scalars = (scores - mean_g[g]) / (std_g[g] + epsilon)
+        else:
+            scalars = scores - mean_g[g]
+
+        alpha1 = 1.0 if config is None else float(config.get("gtpo_alpha1", 1.0))
+        alpha2 = 0.1 if config is None else float(config.get("gtpo_alpha2", 0.1))
+        entropy_clip_low = 0.2 if config is None else float(config.get("gtpo_entropy_clip_low", 0.2))
+        entropy_clip_high = 0.28 if config is None else float(config.get("gtpo_entropy_clip_high", 0.28))
+        success_threshold = 0.0 if config is None else float(config.get("gtpo_success_reward_threshold", 0.0))
+
+        mask_f = response_mask.float()
+        H_raw = token_entropy.float()
+        H_clipped = torch.clamp(H_raw, min=entropy_clip_low, max=entropy_clip_high)
+        H = torch.where(mask_f > 0, H_clipped, torch.zeros_like(H_clipped))
+        inv_H = torch.where(H > epsilon, 1.0 / H, torch.zeros_like(H))
+
+        bonus = torch.zeros_like(H)
+        unique_groups = torch.unique(g)
+
+        is_positive = scores > success_threshold
+        is_negative = ~is_positive
+
+        for gid in unique_groups:
+            group_rows = torch.nonzero(g == gid, as_tuple=True)[0]
+            if group_rows.numel() == 0:
+                continue
+
+            pos_rows = group_rows[is_positive[group_rows]]
+            if pos_rows.numel() > 0:
+                H_pos = H[pos_rows]
+                pos_valid = (response_mask[pos_rows] > 0).float()
+                d_t = pos_valid.sum(dim=0, keepdim=True)
+                denom_pos = H_pos.sum(dim=0, keepdim=True)
+                uniform_pos = torch.where(d_t > 0, 1.0 / d_t, torch.zeros_like(d_t)).expand_as(H_pos)
+                pos_share = torch.where(denom_pos > epsilon, H_pos / (denom_pos + epsilon), uniform_pos)
+                bonus[pos_rows] = pos_share * d_t
+
+            neg_rows = group_rows[is_negative[group_rows]]
+            if neg_rows.numel() > 0:
+                inv_neg = inv_H[neg_rows]
+                neg_valid = (response_mask[neg_rows] > 0).float()
+                h_t = neg_valid.sum(dim=0, keepdim=True)
+                denom_neg = inv_neg.sum(dim=0, keepdim=True)
+                uniform_neg = torch.where(h_t > 0, 1.0 / h_t, torch.zeros_like(h_t)).expand_as(inv_neg)
+                neg_share = torch.where(denom_neg > epsilon, inv_neg / (denom_neg + epsilon), uniform_neg)
+                bonus[neg_rows] = neg_share * h_t
+
+        multiplier = (alpha1 + alpha2 * bonus) * mask_f
+        advantages = scalars.unsqueeze(-1) * multiplier
         return advantages, advantages
 
 

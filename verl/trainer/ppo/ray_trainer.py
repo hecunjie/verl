@@ -245,21 +245,31 @@ def compute_advantage(
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
-    elif adv_estimator == AdvantageEstimator.GRPO_GTPO:
+    elif adv_estimator in (AdvantageEstimator.GRPO_GTPO, AdvantageEstimator.GTPO):
         if "token_entropy" not in data.batch:
             raise ValueError(
-                "algorithm.adv_estimator=grpo_gtpo requires batch['token_entropy'] (per-token policy "
+                "algorithm.adv_estimator in {grpo_gtpo, gtpo} requires batch['token_entropy'] (per-token policy "
                 "entropy). It is stored when recomputing old_log_prob; disable rollout_correction "
                 "bypass_mode if you use off-policy correction, or use the standard decoupled path."
             )
-        advantages, returns = core_algos.compute_grpo_gtpo_outcome_advantage(
-            token_level_rewards=data.batch["token_level_rewards"],
-            response_mask=data.batch["response_mask"],
-            index=data.non_tensor_batch["uid"],
-            token_entropy=data.batch["token_entropy"],
-            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-            config=config,
-        )
+        if adv_estimator == AdvantageEstimator.GRPO_GTPO:
+            advantages, returns = core_algos.compute_grpo_gtpo_outcome_advantage(
+                token_level_rewards=data.batch["token_level_rewards"],
+                response_mask=data.batch["response_mask"],
+                index=data.non_tensor_batch["uid"],
+                token_entropy=data.batch["token_entropy"],
+                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                config=config,
+            )
+        else:
+            advantages, returns = core_algos.compute_gtpo_outcome_advantage(
+                token_level_rewards=data.batch["token_level_rewards"],
+                response_mask=data.batch["response_mask"],
+                index=data.non_tensor_batch["uid"],
+                token_entropy=data.batch["token_entropy"],
+                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                config=config,
+            )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
     else:
@@ -1592,7 +1602,10 @@ class RayPPOTrainer:
                                 "perf/mfu/actor_infer": old_log_prob_mfu,
                             }
                             metrics.update(old_log_prob_metrics)
-                            if self.config.algorithm.adv_estimator == AdvantageEstimator.GRPO_GTPO:
+                            if self.config.algorithm.adv_estimator in (
+                                AdvantageEstimator.GRPO_GTPO,
+                                AdvantageEstimator.GTPO,
+                            ):
                                 batch.batch["token_entropy"] = entropys.detach().clone()
                             old_log_prob.batch.pop("entropys")
                             batch = batch.union(old_log_prob)
@@ -1604,10 +1617,13 @@ class RayPPOTrainer:
 
                     assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
 
-                    if self.config.algorithm.adv_estimator == AdvantageEstimator.GRPO_GTPO:
+                    if self.config.algorithm.adv_estimator in (
+                        AdvantageEstimator.GRPO_GTPO,
+                        AdvantageEstimator.GTPO,
+                    ):
                         if "token_entropy" not in batch.batch:
                             raise ValueError(
-                                "algorithm.adv_estimator=grpo_gtpo requires per-token entropy from "
+                                "algorithm.adv_estimator in {grpo_gtpo, gtpo} requires per-token entropy from "
                                 "old_log_prob (batch['token_entropy']). This is unavailable in "
                                 "rollout_correction bypass_mode; disable bypass or use adv_estimator=grpo."
                             )

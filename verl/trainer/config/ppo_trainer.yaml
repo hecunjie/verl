@@ -87,6 +87,21 @@ algorithm:
   # GRPO broadcast (sum_t A_t = n * A_hat_i). Set False for legacy sum_t A_t = A_hat_i.
   gtpo_scale_advantage_by_seq_len: True
 
+  # GTPO shaping coefficient for the base reward term
+  gtpo_alpha1: 1.0
+
+  # GTPO shaping coefficient for the entropy bonus/penalty term
+  gtpo_alpha2: 0.1
+
+  # GTPO entropy clipping lower bound (paper setting)
+  gtpo_entropy_clip_low: 0.2
+
+  # GTPO entropy clipping upper bound (paper setting)
+  gtpo_entropy_clip_high: 0.28
+
+  # GTPO path split threshold: seq score > threshold -> positive, otherwise negative
+  gtpo_success_reward_threshold: 0.0
+
   # Whether to enable in-reward KL penalty
   use_kl_in_reward: False
 

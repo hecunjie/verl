@@ -136,3 +136,24 @@ F_SENTENCE_MAX_NEW_TOKENS=256 \
 BIAS_METRICS_MODE=length_normalized \
 PROGRESS_ECHO=1 \
 bash /mnt/ali-sh-1/dataset/zeus/hecunjie/gitlab-source/verl/examples/entropy_ce/run_infer_topk_f_mc_compare_vllm_sharded.sh
+
+SELECTION_F_MODE=mc \
+MC_M_SAMPLES=10 \
+MATH_EVAL_BACKEND=math_verify \
+MODEL_PATH=/mnt/tidal-alsh01/dataset/zeus/hecunjie/models/Qwen/Qwen3-4B-base \
+INPUT_DATA=/mnt/ali-sh-1/dataset/zeus/hecunjie/rl_data/grpo/math500_test.parquet \
+OUTPUT_DIR=/mnt/tidal-alsh01/dataset/zeus/hecunjie/entropy_check/infer_topk_f_mc_compare_qwen3_4b_base_mc10_mathverify \
+NPROC_PER_NODE=8 \
+MAX_SAMPLES=300 \
+MAX_NEW_TOKENS=8192 \
+ENTROPY_THRESHOLD=1.0 \
+CANDIDATE_TOP_P=0.95 \
+CANDIDATE_MAX_K=5 \
+MAX_BRANCH_STEPS=64 \
+MC_TEMPERATURE=1.0 \
+MC_TOP_P=0.95 \
+F_CONTINUATION_MODE=first_sentence \
+F_SENTENCE_MAX_NEW_TOKENS=256 \
+BIAS_METRICS_MODE=length_normalized \
+PROGRESS_ECHO=1 \
+bash /mnt/ali-sh-1/dataset/zeus/hecunjie/gitlab-source/verl/examples/entropy_ce/run_infer_topk_f_mc_compare_vllm_sharded.sh

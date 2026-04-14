@@ -263,15 +263,25 @@ def compute_advantage(
             index=data.non_tensor_batch["uid"],
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
         )
-    elif adv_estimator == AdvantageEstimator.GRPO_GTPO:
-        advantages, returns = core_algos.compute_grpo_gtpo_outcome_advantage(
-            token_level_rewards=data.batch["token_level_rewards"],
-            response_mask=data.batch["response_mask"],
-            index=data.non_tensor_batch["uid"],
-            token_entropy=data.batch["token_entropy"],
-            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-            config=config,
-        )
+    elif adv_estimator in (AdvantageEstimator.GRPO_GTPO, AdvantageEstimator.GTPO):
+        if adv_estimator == AdvantageEstimator.GRPO_GTPO:
+            advantages, returns = core_algos.compute_grpo_gtpo_outcome_advantage(
+                token_level_rewards=data.batch["token_level_rewards"],
+                response_mask=data.batch["response_mask"],
+                index=data.non_tensor_batch["uid"],
+                token_entropy=data.batch["token_entropy"],
+                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                config=config,
+            )
+        else:
+            advantages, returns = core_algos.compute_gtpo_outcome_advantage(
+                token_level_rewards=data.batch["token_level_rewards"],
+                response_mask=data.batch["response_mask"],
+                index=data.non_tensor_batch["uid"],
+                token_entropy=data.batch["token_entropy"],
+                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                config=config,
+            )
     else:
         # handle all other adv estimator type other than GAE and GRPO
         adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)
@@ -1385,7 +1395,10 @@ class RayPPOTrainer:
                         old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
                         metrics.update(old_log_prob_metrics)
 
-                        if self.config.algorithm.adv_estimator == AdvantageEstimator.GRPO_GTPO:
+                        if self.config.algorithm.adv_estimator in (
+                            AdvantageEstimator.GRPO_GTPO,
+                            AdvantageEstimator.GTPO,
+                        ):
                             token_entropy_td = TensorDict(
                                 {"token_entropy": entropys.detach().clone()}, batch_size=entropys.size(0)
                             )
@@ -1505,7 +1518,10 @@ class RayPPOTrainer:
                             compute_advantage_fields.append("values")
                         elif self.config.algorithm.adv_estimator == AdvantageEstimator.GRPO:
                             compute_advantage_fields.append("uid")
-                        elif self.config.algorithm.adv_estimator == AdvantageEstimator.GRPO_GTPO:
+                        elif self.config.algorithm.adv_estimator in (
+                            AdvantageEstimator.GRPO_GTPO,
+                            AdvantageEstimator.GTPO,
+                        ):
                             compute_advantage_fields.append("uid")
                             compute_advantage_fields.append("token_entropy")
                         else:

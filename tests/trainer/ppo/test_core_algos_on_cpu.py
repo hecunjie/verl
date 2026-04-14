@@ -23,6 +23,7 @@ import torch
 import verl.trainer.ppo.core_algos
 from verl.trainer.ppo.core_algos import (
     compute_gae_advantage_return,
+    compute_gtpo_outcome_advantage,
     compute_grpo_gtpo_outcome_advantage,
     compute_grpo_outcome_advantage,
     compute_grpo_vectorized_outcome_advantage,
@@ -379,6 +380,50 @@ def test_grpo_gtpo_legacy_sum_matches_group_scalar():
             continue
         scalar_i = adv_grpo[i, m][0]
         assert torch.isclose(adv_gtpo[i, m].sum(), scalar_i, rtol=1e-5, atol=1e-5)
+
+
+def test_gtpo_positive_negative_asymmetric_credit_assignment():
+    """GTPO: positive uses entropy-proportional; negative uses inverse-entropy-proportional shaping."""
+    token_level_rewards = torch.tensor(
+        [
+            [0.0, 1.0],  # positive sample A
+            [0.0, 1.0],  # positive sample B
+            [0.0, -0.2],  # negative sample C
+            [0.0, -0.2],  # negative sample D
+        ],
+        dtype=torch.float32,
+    )
+    response_mask = torch.ones_like(token_level_rewards)
+    # Same entropy pattern for pos/neg pairs:
+    # sample A/C has lower entropy at token 0 than sample B/D.
+    token_entropy = torch.tensor(
+        [
+            [0.2, 0.2],
+            [0.28, 0.28],
+            [0.2, 0.2],
+            [0.28, 0.28],
+        ],
+        dtype=torch.float32,
+    )
+    index = np.asarray([0, 0, 0, 0], dtype=np.int64)
+    cfg = SimpleNamespace(
+        gtpo_alpha1=1.0,
+        gtpo_alpha2=0.1,
+        gtpo_entropy_clip_low=0.2,
+        gtpo_entropy_clip_high=0.28,
+        gtpo_success_reward_threshold=0.0,
+    )
+    advantages, _ = compute_gtpo_outcome_advantage(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        index=index,
+        token_entropy=token_entropy,
+        config=cfg,
+    )
+    # Positive path: higher entropy should receive larger positive bonus.
+    assert advantages[1, 0] > advantages[0, 0]
+    # Negative path: lower entropy should receive larger penalty magnitude (more negative).
+    assert advantages[2, 0] < advantages[3, 0]
 
 
 if __name__ == "__main__":
