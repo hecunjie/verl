@@ -55,109 +55,68 @@ def _append_jsonl(path: Path, rec: dict[str, Any]) -> None:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
-def _build_bucket_estimator_with_key_mode(
-    *,
-    hs_rollouts: list[list[float]],
-    num_bins: int,
-    min_points_per_bin: int,
-    prefix_key_mode: str,
-) -> dict[str, Any]:
-    b = max(2, int(num_bins))
-    prefix_keys: list[float] = []
-    suffix_rates: list[float] = []
+def _build_rollout_prefix_suffix_refs(hs_rollouts: list[list[float]]) -> list[dict[str, Any]]:
+    """Per-rollout references keyed by monotonic prefix entropy sum.
+
+    For each rollout and each split position u in [1, n-1], store:
+      - prefix_sum(u) = sum_{s<=u} h_s
+      - suffix_sum(u) = sum_{s>u} h_s
+      - suffix_rate(u) = suffix_sum(u) / (n-u)
+    """
+    refs: list[dict[str, Any]] = []
     for hs in hs_rollouts:
         n = len(hs)
         if n < 2:
             continue
-        suffix_sum = np.cumsum(np.array(hs[::-1], dtype=np.float64))[::-1]
-        pref_sum = 0.0
-        for u in range(1, n):
-            pref_sum += float(hs[u - 1])
-            if prefix_key_mode == "sum":
-                key = pref_sum
-            else:
-                key = pref_sum / float(u)
-            suffix_rate = float(suffix_sum[u] / float(n - u))
-            prefix_keys.append(float(key))
-            suffix_rates.append(float(suffix_rate))
-
-    if not prefix_keys:
-        return {
-            "degenerate": True,
-            "edges": [0.0 for _ in range(b + 1)],
-            "means": [0.0 for _ in range(b)],
-            "valid": [True for _ in range(b)],
-            "global_mean_suffix_rate": 0.0,
-        }
-
-    p = np.array(prefix_keys, dtype=np.float64)
-    f = np.array(suffix_rates, dtype=np.float64)
-    pmin = float(np.min(p))
-    pmax = float(np.max(p))
-    global_mean = float(np.mean(f))
-    if (not np.isfinite(pmin)) or (not np.isfinite(pmax)) or abs(pmax - pmin) < 1e-12:
-        return {
-            "degenerate": True,
-            "edges": [0.0 for _ in range(b + 1)],
-            "means": [float(global_mean) for _ in range(b)],
-            "valid": [True for _ in range(b)],
-            "global_mean_suffix_rate": float(global_mean),
-        }
-
-    edges = np.linspace(pmin, pmax, b + 1, dtype=np.float64)
-    sums = np.zeros(b, dtype=np.float64)
-    cnts = np.zeros(b, dtype=np.int64)
-    for pi, fi in zip(p.tolist(), f.tolist()):
-        idx = int(np.searchsorted(edges, pi, side="right") - 1)
-        idx = min(max(idx, 0), b - 1)
-        sums[idx] += float(fi)
-        cnts[idx] += 1
-
-    means = np.zeros(b, dtype=np.float64)
-    valid = np.zeros(b, dtype=np.bool_)
-    min_pts = max(1, int(min_points_per_bin))
-    for i in range(b):
-        if int(cnts[i]) >= min_pts:
-            means[i] = float(sums[i] / float(cnts[i]))
-            valid[i] = True
-
-    return {
-        "degenerate": False,
-        "edges": [float(x) for x in edges.tolist()],
-        "means": [float(x) for x in means.tolist()],
-        "valid": [bool(x) for x in valid.tolist()],
-        "global_mean_suffix_rate": float(global_mean),
-    }
+        arr = np.array(hs, dtype=np.float64)
+        pref = np.cumsum(arr)[:-1]
+        suf = np.cumsum(arr[::-1])[::-1][1:]
+        den = np.arange(n - 1, 0, -1, dtype=np.float64)  # n-u for u=1..n-1
+        rate = suf / den
+        refs.append(
+            {
+                "prefix_sum": pref,
+                "suffix_sum": suf,
+                "suffix_rate": rate,
+            }
+        )
+    return refs
 
 
-def _bucket_lookup(estimator: dict[str, Any], prefix_key: float) -> float:
-    gm = float(estimator.get("global_mean_suffix_rate", 0.0))
-    if bool(estimator.get("degenerate", False)):
-        return gm
-    edges = estimator.get("edges")
-    means = estimator.get("means")
-    valid = estimator.get("valid")
-    if not isinstance(edges, list) or not isinstance(means, list) or not isinstance(valid, list):
-        return gm
-    b = len(means)
-    if b <= 0:
-        return gm
-    idx = int(np.searchsorted(np.array(edges, dtype=np.float64), float(prefix_key), side="right") - 1)
-    idx = min(max(idx, 0), b - 1)
-    if bool(valid[idx]):
-        return float(means[idx])
-    nearest_i = None
-    nearest_d = None
-    for i, ok in enumerate(valid):
-        if not ok:
+def _nearest_idx_on_monotonic_prefix(prefix_sum_arr: np.ndarray, target: float) -> int:
+    if prefix_sum_arr.size == 0:
+        return -1
+    idx = int(np.searchsorted(prefix_sum_arr, target, side="left"))
+    if idx <= 0:
+        return 0
+    if idx >= int(prefix_sum_arr.size):
+        return int(prefix_sum_arr.size - 1)
+    left = idx - 1
+    right = idx
+    dl = abs(float(prefix_sum_arr[left]) - float(target))
+    dr = abs(float(prefix_sum_arr[right]) - float(target))
+    # Tie-break toward earlier position (left), matching "from head to tail" intuition.
+    return left if dl <= dr else right
+
+
+def _query_fbar_from_refs_by_prefix_sum(refs: list[dict[str, Any]], prefix_sum_target: float) -> tuple[float, float, int]:
+    """Return mean suffix_sum / suffix_rate across rollouts at nearest prefix-sum positions."""
+    picked_sum: list[float] = []
+    picked_rate: list[float] = []
+    for r in refs:
+        p = r.get("prefix_sum")
+        ssum = r.get("suffix_sum")
+        srate = r.get("suffix_rate")
+        if not isinstance(p, np.ndarray) or not isinstance(ssum, np.ndarray) or not isinstance(srate, np.ndarray):
             continue
-        d = abs(i - idx)
-        if nearest_d is None or d < nearest_d:
-            nearest_d = d
-            nearest_i = i
-    if nearest_i is None:
-        return gm
-    return float(means[int(nearest_i)])
+        i = _nearest_idx_on_monotonic_prefix(p, float(prefix_sum_target))
+        if i < 0:
+            continue
+        picked_sum.append(float(ssum[i]))
+        picked_rate.append(float(srate[i]))
+    if not picked_sum:
+        return 0.0, 0.0, 0
+    return float(np.mean(np.array(picked_sum, dtype=np.float64))), float(np.mean(np.array(picked_rate, dtype=np.float64))), int(len(picked_sum))
 
 
 def main() -> None:
@@ -195,8 +154,8 @@ def main() -> None:
     parser.add_argument(
         "--bucket_prefix_key_mode",
         choices=["sum", "rate", "both"],
-        default="sum",
-        help="Prefix key for bucket retrieval: sum, rate, or both (evaluate both in one run).",
+        default="both",
+        help="Which proxy metric to report. Retrieval key is always prefix entropy sum.",
     )
 
     parser.add_argument("--save_traces", action=argparse.BooleanOptionalAction, default=True)
@@ -326,18 +285,7 @@ def main() -> None:
             logprobs_k=int(args.vllm_logprobs_topk),
             batch_chunk=int(args.vllm_request_batch_chunk),
         )
-        bucket_estimator_sum = _build_bucket_estimator_with_key_mode(
-            hs_rollouts=hs_rollouts,
-            num_bins=int(args.bucket_num_bins),
-            min_points_per_bin=int(args.bucket_min_points_per_bin),
-            prefix_key_mode="sum",
-        )
-        bucket_estimator_rate = _build_bucket_estimator_with_key_mode(
-            hs_rollouts=hs_rollouts,
-            num_bins=int(args.bucket_num_bins),
-            min_points_per_bin=int(args.bucket_min_points_per_bin),
-            prefix_key_mode="rate",
-        )
+        rollout_refs = _build_rollout_prefix_suffix_refs(hs_rollouts)
 
         response_ids: list[int] = []
         entropy_seq: list[float] = []
@@ -428,7 +376,6 @@ def main() -> None:
             sign_mc_real = _sign(fbar_mc - f_real_mc)
 
             pref_sum = float(np.sum(np.array(entropy_seq[: step_idx + 1], dtype=np.float64)))
-            pref_rate = pref_sum / float(step_idx + 1)
 
             future_sum = float(suffix_sum[step_idx + 1])
             future_len = int(n_steps - step_idx - 1)
@@ -438,8 +385,9 @@ def main() -> None:
                 f_real_proxy = future_sum / float(future_len)
             else:
                 f_real_proxy = future_sum
-            fbar_bucket_sum = _bucket_lookup(bucket_estimator_sum, pref_sum)
-            fbar_bucket_rate = _bucket_lookup(bucket_estimator_rate, pref_rate)
+            fbar_bucket_sum, fbar_bucket_rate, n_ref_hits = _query_fbar_from_refs_by_prefix_sum(
+                rollout_refs, pref_sum
+            )
             sign_bucket_real_sum = _sign(float(fbar_bucket_sum) - float(f_real_proxy))
             sign_bucket_real_rate = _sign(float(fbar_bucket_rate) - float(f_real_proxy))
 
@@ -469,7 +417,7 @@ def main() -> None:
                         "sign_real_mc_128": int(sign_mc_real),
                         "bucket_prefix_key_mode": str(args.bucket_prefix_key_mode),
                         "bucket_prefix_key_sum": float(pref_sum),
-                        "bucket_prefix_key_rate": float(pref_rate),
+                        "bucket_ref_hits": int(n_ref_hits),
                         "f_bar_bucket_proxy_sum": float(fbar_bucket_sum),
                         "f_bar_bucket_proxy_rate": float(fbar_bucket_rate),
                         "f_real_proxy_from_trajectory": float(f_real_proxy),
