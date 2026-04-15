@@ -4,7 +4,9 @@
 **默认训练集**：[`open-r1/DAPO-Math-17k-Processed`](https://huggingface.co/datasets/open-r1/DAPO-Math-17k-Processed)
 （约 1.7 万条，与 DAPO 论文规模一致）。训练样本会统一为 DAPO prompt 指引格式（末行要求 ``Answer: \\boxed{...}``），并将 ``label`` 写入 ``reward_model.ground_truth``。
 
-**测试集**：MATH-500、AIME 2024，题干用与上述数据集 **相同** 的 user 文案模板包裹（含 ``\\boxed`` 与末尾 ``Remember to put...``）。
+**测试集**：MATH-500、AIME 2024、GPQA-D（diamond）。
+其中前两者题干用与上述数据集 **相同** 的 user 文案模板包裹（含 ``\\boxed`` 与末尾 ``Remember to put...``）；
+GPQA-D 会转为四选一格式（末行 ``Answer: X``，X∈{A,B,C,D}）。
 
 若需使用字节版百万级数据，加 ``--train_source byted``。
 
@@ -17,6 +19,7 @@
   - dapo_math_17k_processed_train.parquet  # 默认：Processed 训练（或 byted 时为 dapo_math_byted_train.parquet）
   - math500_test.parquet
   - aime2024_test.parquet
+  - gpqa_d_test.parquet
 
 依赖：datasets。"""
 from __future__ import annotations
@@ -24,6 +27,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 from typing import Any
 
 from datasets import Dataset, DatasetDict, load_dataset
@@ -51,6 +55,21 @@ def _user_content_legacy(problem: str) -> str:
 
 def _user_content_dapo_processed(problem: str) -> str:
     return DAPO_PROCESSED_USER_TEMPLATE.format(problem=str(problem).strip())
+
+
+def _user_content_gpqa_d(question: str, choices: list[str]) -> str:
+    opts = []
+    letters = ["A", "B", "C", "D"]
+    for i, c in enumerate(choices[:4]):
+        opts.append(f"{letters[i]}. {str(c).strip()}")
+    choice_block = "\n".join(opts)
+    return (
+        "Answer the following multiple-choice question.\n\n"
+        f"{str(question).strip()}\n\n"
+        f"{choice_block}\n\n"
+        "Think step by step, then put the final option letter on its own line in the format:\n"
+        "Answer: X"
+    )
 
 
 def _row(
@@ -253,6 +272,122 @@ def iter_aime24_test():
         )
 
 
+def _load_gpqa_d_hf() -> Dataset:
+    """Load GPQA-Diamond from HF with fallback dataset/config names."""
+    last_err: Exception | None = None
+    factories = (
+        lambda: load_dataset("Idavidrein/gpqa", "gpqa_diamond"),
+        lambda: load_dataset("Idavidrein/gpqa", "diamond"),
+        lambda: load_dataset("Idavidrein/gpqa"),
+        lambda: load_dataset("openai/gpqa", "diamond"),
+        lambda: load_dataset("openai/gpqa"),
+    )
+    for factory in factories:
+        try:
+            raw = factory()
+            if isinstance(raw, DatasetDict):
+                return _pick_split(raw)
+            return raw
+        except Exception as e:
+            last_err = e
+            continue
+    assert last_err is not None
+    raise RuntimeError("无法从 HuggingFace 加载 GPQA-D（diamond）数据集。") from last_err
+
+
+def _first_present(ex: dict[str, Any], keys: list[str]) -> Any:
+    for k in keys:
+        if k in ex and ex[k] is not None:
+            return ex[k]
+    return None
+
+
+def _extract_gpqa_d_row(ex: dict[str, Any], idx: int) -> tuple[str, list[str], str]:
+    question = _first_present(ex, ["question", "Question", "problem", "query", "prompt"])
+    if question is None:
+        raise KeyError(f"GPQA-D idx={idx} no question field, keys={list(ex.keys())}")
+
+    options: list[str] | None = None
+    # schema 1: explicit A/B/C/D columns
+    a = _first_present(ex, ["A", "a", "option_a", "choice_a"])
+    b = _first_present(ex, ["B", "b", "option_b", "choice_b"])
+    c = _first_present(ex, ["C", "c", "option_c", "choice_c"])
+    d = _first_present(ex, ["D", "d", "option_d", "choice_d"])
+    if all(x is not None for x in (a, b, c, d)):
+        options = [str(a), str(b), str(c), str(d)]
+
+    # schema 2: choices/options list
+    if options is None:
+        choices = _first_present(ex, ["choices", "options", "candidates"])
+        if isinstance(choices, list) and len(choices) >= 4:
+            options = [str(choices[i]) for i in range(4)]
+
+    # schema 3: one correct + three incorrect
+    if options is None:
+        correct = _first_present(ex, ["Correct Answer", "correct_answer", "answer", "gold"])
+        i1 = _first_present(ex, ["Incorrect Answer 1", "incorrect_answer_1", "distractor1"])
+        i2 = _first_present(ex, ["Incorrect Answer 2", "incorrect_answer_2", "distractor2"])
+        i3 = _first_present(ex, ["Incorrect Answer 3", "incorrect_answer_3", "distractor3"])
+        if correct is not None and i1 is not None and i2 is not None and i3 is not None:
+            pool = [str(correct), str(i1), str(i2), str(i3)]
+            r = random.Random(2024 + idx)  # deterministic shuffle
+            r.shuffle(pool)
+            options = pool
+
+    if options is None or len(options) < 4:
+        raise KeyError(f"GPQA-D idx={idx} cannot build 4 options, keys={list(ex.keys())}")
+
+    gt_letter = None
+    ans = _first_present(
+        ex,
+        ["label", "answer", "correct", "correct_option", "answer_letter", "target", "gold_label"],
+    )
+    if ans is not None:
+        ans_s = str(ans).strip()
+        if ans_s in {"A", "B", "C", "D"}:
+            gt_letter = ans_s
+        elif ans_s in {"0", "1", "2", "3"}:
+            gt_letter = ["A", "B", "C", "D"][int(ans_s)]
+        else:
+            for i, opt in enumerate(options[:4]):
+                if str(opt).strip() == ans_s:
+                    gt_letter = ["A", "B", "C", "D"][i]
+                    break
+
+    if gt_letter is None:
+        corr_text = _first_present(ex, ["Correct Answer", "correct_answer", "gold"])
+        if corr_text is not None:
+            corr_s = str(corr_text).strip()
+            for i, opt in enumerate(options[:4]):
+                if str(opt).strip() == corr_s:
+                    gt_letter = ["A", "B", "C", "D"][i]
+                    break
+
+    if gt_letter is None:
+        raise KeyError(f"GPQA-D idx={idx} cannot infer gold option, keys={list(ex.keys())}")
+
+    return str(question).strip(), [str(x).strip() for x in options[:4]], gt_letter
+
+
+def iter_gpqa_d_test():
+    ds = _load_gpqa_d_hf()
+    for idx in range(len(ds)):
+        ex = ds[idx]
+        q, choices, gt_letter = _extract_gpqa_d_row(ex, idx)
+        yield _row(
+            _user_content_gpqa_d(q, choices),
+            gt_letter,
+            "gpqa_d",
+            extra_info={
+                "index": idx,
+                "split": "test",
+                "source": "gpqa_diamond",
+                "subject": ex.get("subject"),
+            },
+            ability="science",
+        )
+
+
 def _write_parquet(path: str, gen):
     ds = Dataset.from_generator(gen)
     ds.to_parquet(path)
@@ -285,7 +420,7 @@ def main():
         def gen_train():
             yield from iter_dapo_processed_train(args.max_train_samples)
 
-        print("1/3 open-r1/DAPO-Math-17k-Processed (train) ...")
+        print("1/4 open-r1/DAPO-Math-17k-Processed (train) ...")
         n1 = _write_parquet(f_train, gen_train)
     else:
         f_train = os.path.join(out, "dapo_math_byted_train.parquet")
@@ -293,25 +428,30 @@ def main():
         def gen_byted():
             yield from iter_byted_dapo_train(args.max_train_samples)
 
-        print("1/3 BytedTsinghua-SIA/DAPO-Math-17k (train, 大规模) ...")
+        print("1/4 BytedTsinghua-SIA/DAPO-Math-17k (train, 大规模) ...")
         n1 = _write_parquet(f_train, gen_byted)
 
     print(f"    -> {n1} rows, {f_train}")
 
     f_m500 = os.path.join(out, "math500_test.parquet")
     f_aime = os.path.join(out, "aime2024_test.parquet")
+    f_gpqa = os.path.join(out, "gpqa_d_test.parquet")
 
-    print("2/3 MATH-500 (test, DAPO-Processed 同款 prompt) ...")
+    print("2/4 MATH-500 (test, DAPO-Processed 同款 prompt) ...")
     n2 = _write_parquet(f_m500, iter_math500_test)
     print(f"    -> {n2} rows, {f_m500}")
 
-    print("3/3 AIME 2024 (test, 同上) ...")
+    print("3/4 AIME 2024 (test, 同上) ...")
     n3 = _write_parquet(f_aime, iter_aime24_test)
     print(f"    -> {n3} rows, {f_aime}")
 
+    print("4/4 GPQA-D (diamond test, multiple-choice) ...")
+    n4 = _write_parquet(f_gpqa, iter_gpqa_d_test)
+    print(f"    -> {n4} rows, {f_gpqa}")
+
     print("\n训练 / 验证可设为:")
     print(f'  data.train_files="{f_train}"')
-    print(f'  data.val_files="[\'{f_m500}\',\'{f_aime}\']"')
+    print(f'  data.val_files="[\'{f_m500}\',\'{f_aime}\',\'{f_gpqa}\']"')
 
 
 if __name__ == "__main__":
