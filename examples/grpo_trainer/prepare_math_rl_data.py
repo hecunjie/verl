@@ -393,11 +393,12 @@ def iter_math_hard_test(min_level: int = 5):
         yield _row(
             _user_content_dapo_processed(str(p).strip()),
             _extract_math_final_answer(a),
-            "math_hard",
+            "math_dapo",
             extra_info={
                 "index": out_idx,
                 "source_index": idx,
                 "split": "test",
+                "eval_set": "math_hard",
                 "subject": ex.get("subject"),
                 "level": ex.get("level"),
                 "min_level_filter": int(min_level),
