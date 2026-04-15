@@ -22,6 +22,8 @@ MAX_BRANCH_STEPS="${MAX_BRANCH_STEPS:-0}"
 MC_M_SAMPLES="${MC_M_SAMPLES:-1}"
 MC_TEMPERATURE="${MC_TEMPERATURE:-1.0}"
 MC_TOP_P="${MC_TOP_P:-0.95}"
+SAMPLING_TEMPERATURE="${SAMPLING_TEMPERATURE:-1.0}"
+SAMPLING_TOP_P="${SAMPLING_TOP_P:-0.95}"
 BIAS_METRICS_MODE="${BIAS_METRICS_MODE:-length_normalized}"
 MATH_EVAL_BACKEND="${MATH_EVAL_BACKEND:-auto}"
 FORCE_BOXED_ANSWER_INSTRUCTION="${FORCE_BOXED_ANSWER_INSTRUCTION:-0}"
@@ -100,6 +102,8 @@ for ((r = 0; r < NPROC_PER_NODE; r++)); do
     --mc_m_samples "${MC_M_SAMPLES}" \
     --mc_temperature "${MC_TEMPERATURE}" \
     --mc_top_p "${MC_TOP_P}" \
+    --sampling_temperature "${SAMPLING_TEMPERATURE}" \
+    --sampling_top_p "${SAMPLING_TOP_P}" \
     --bias_metrics_mode "${BIAS_METRICS_MODE}" \
     --math_eval_backend "${MATH_EVAL_BACKEND}" \
     --f_continuation_mode "${F_CONTINUATION_MODE}" \

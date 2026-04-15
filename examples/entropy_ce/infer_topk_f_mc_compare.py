@@ -100,6 +100,29 @@ def _step_logprobs_vllm(llm: Any, prefix_ids: list[int], logprobs_k: int) -> tup
     return token_id, step_lp
 
 
+def _sample_one_token_vllm(
+    *,
+    llm: Any,
+    prefix_ids: list[int],
+    temperature: float,
+    top_p: float,
+) -> int | None:
+    from vllm import SamplingParams
+    from vllm.inputs import TokensPrompt
+
+    sp = SamplingParams(
+        max_tokens=1,
+        temperature=float(temperature),
+        top_p=float(top_p),
+        logprobs=0,
+    )
+    out = vllm_generate_quiet(llm, [TokensPrompt(prompt_token_ids=prefix_ids)], sp)
+    o = out[0].outputs[0]
+    if not o.token_ids:
+        return None
+    return int(o.token_ids[0])
+
+
 def _candidate_lookahead_1step_entropy(
     llm: Any,
     prefix_ids: list[int],
@@ -336,6 +359,8 @@ def _decode_one_policy(
     mc_m_samples: int,
     mc_temperature: float,
     mc_top_p: float,
+    sampling_temperature: float,
+    sampling_top_p: float,
     vllm_logprobs_topk: int,
     vllm_request_batch_chunk: int,
     f_continuation_mode: str,
@@ -352,6 +377,9 @@ def _decode_one_policy(
     progress_mc_desc: str = "mc",
     bucket_group_estimator: dict[str, Any] | None = None,
 ) -> tuple[list[int], list[dict[str, Any]]]:
+    if policy not in {"min_f_mc", "sampling_baseline", "greedy_baseline"}:
+        raise ValueError(f"unsupported policy: {policy}")
+
     response_ids: list[int] = []
     branch_records: list[dict[str, Any]] = []
     branch_count = 0
@@ -375,6 +403,22 @@ def _decode_one_policy(
 
     for step_idx in step_iter:
         prefix = prompt_ids + response_ids
+        if policy == "sampling_baseline":
+            sampled_token = _sample_one_token_vllm(
+                llm=llm,
+                prefix_ids=prefix,
+                temperature=sampling_temperature,
+                top_p=sampling_top_p,
+            )
+            if sampled_token is None:
+                break
+            chosen_token = int(sampled_token)
+            response_ids.append(chosen_token)
+            entropy_hist.append(float("nan"))
+            if eos_token_id is not None and chosen_token == int(eos_token_id):
+                break
+            continue
+
         greedy_token, step_lp = _step_logprobs_vllm(
             llm=llm,
             prefix_ids=prefix,
@@ -394,9 +438,8 @@ def _decode_one_policy(
             cand_probs = [1.0]
 
         should_branch = (
-            policy != "greedy_baseline"
-            and
-            entropy_t >= entropy_threshold
+            policy == "min_f_mc"
+            and entropy_t >= entropy_threshold
             and len(cands) >= 2
             and (max_branch_steps <= 0 or branch_count < max_branch_steps)
         )
@@ -404,9 +447,7 @@ def _decode_one_policy(
         chosen_token = greedy_token
         f_values: list[float] = []
         if should_branch:
-            if policy == "random_topk":
-                chosen_token = int(rng.choice(cands))
-            elif policy == "min_f_mc":
+            if policy == "min_f_mc":
                 remaining = max_new_tokens - step_idx - 1
                 if remaining <= 0:
                     chosen_token = int(cands[0])
@@ -522,7 +563,9 @@ def _mean(xs: list[float]) -> float:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Compare min-F_mc decoding vs random-topk decoding at high-entropy steps.")
+    parser = argparse.ArgumentParser(
+        description="Compare min-F_mc decoding vs pure sampling baseline and greedy baseline."
+    )
     parser.add_argument("--input_data", type=str, required=True)
     parser.add_argument("--model_path", type=str, required=True)
     parser.add_argument("--output_dir", type=str, required=True)
@@ -544,6 +587,8 @@ def main() -> None:
     parser.add_argument("--mc_m_samples", type=int, default=1)
     parser.add_argument("--mc_temperature", type=float, default=1.0)
     parser.add_argument("--mc_top_p", type=float, default=0.95)
+    parser.add_argument("--sampling_temperature", type=float, default=1.0)
+    parser.add_argument("--sampling_top_p", type=float, default=0.95)
     parser.add_argument("--bias_metrics_mode", choices=["raw", "length_normalized"], default="length_normalized")
     parser.add_argument("--f_continuation_mode", choices=["full", "first_sentence"], default="first_sentence")
     parser.add_argument("--f_sentence_max_new_tokens", type=int, default=256)
@@ -597,6 +642,10 @@ def main() -> None:
         raise SystemExit("--candidate_max_k should be >=2 for meaningful compare.")
     if args.mc_m_samples < 1:
         raise SystemExit("--mc_m_samples must be >=1.")
+    if float(args.sampling_temperature) < 0.0:
+        raise SystemExit("--sampling_temperature must be >=0.")
+    if not (0.0 < float(args.sampling_top_p) <= 1.0):
+        raise SystemExit("--sampling_top_p must be in (0, 1].")
     if args.max_new_tokens < 1:
         raise SystemExit("--max_new_tokens must be >=1.")
     if args.vllm_request_batch_chunk < 1:
@@ -728,6 +777,8 @@ def main() -> None:
             mc_m_samples=int(args.mc_m_samples),
             mc_temperature=float(args.mc_temperature),
             mc_top_p=float(args.mc_top_p),
+            sampling_temperature=float(args.sampling_temperature),
+            sampling_top_p=float(args.sampling_top_p),
             vllm_logprobs_topk=int(args.vllm_logprobs_topk),
             vllm_request_batch_chunk=int(args.vllm_request_batch_chunk),
             f_continuation_mode=str(args.f_continuation_mode),
@@ -748,7 +799,7 @@ def main() -> None:
             llm=llm,
             tokenizer=tokenizer,
             prompt_ids=prompt_ids,
-            policy="random_topk",
+            policy="sampling_baseline",
             entropy_threshold=float(args.entropy_threshold),
             candidate_top_p=float(args.candidate_top_p),
             candidate_max_k=int(args.candidate_max_k),
@@ -757,6 +808,8 @@ def main() -> None:
             mc_m_samples=int(args.mc_m_samples),
             mc_temperature=float(args.mc_temperature),
             mc_top_p=float(args.mc_top_p),
+            sampling_temperature=float(args.sampling_temperature),
+            sampling_top_p=float(args.sampling_top_p),
             vllm_logprobs_topk=int(args.vllm_logprobs_topk),
             vllm_request_batch_chunk=int(args.vllm_request_batch_chunk),
             f_continuation_mode=str(args.f_continuation_mode),
@@ -768,9 +821,9 @@ def main() -> None:
             eos_token_id=tokenizer.eos_token_id,
             show_nested_progress=bool(use_nested),
             progress_position=bar_base + 3,
-            progress_desc=f"shard{rank} rand decode",
+            progress_desc=f"shard{rank} sampling decode",
             progress_mc_position=bar_base + 2,
-            progress_mc_desc=f"shard{rank} rand MC",
+            progress_mc_desc=f"shard{rank} sampling MC",
             bucket_group_estimator=None,
         )
         response_greedy, trace_greedy = _decode_one_policy(
@@ -786,6 +839,8 @@ def main() -> None:
             mc_m_samples=int(args.mc_m_samples),
             mc_temperature=float(args.mc_temperature),
             mc_top_p=float(args.mc_top_p),
+            sampling_temperature=float(args.sampling_temperature),
+            sampling_top_p=float(args.sampling_top_p),
             vllm_logprobs_topk=int(args.vllm_logprobs_topk),
             vllm_request_batch_chunk=int(args.vllm_request_batch_chunk),
             f_continuation_mode=str(args.f_continuation_mode),
@@ -845,6 +900,8 @@ def main() -> None:
             "candidate_max_k": int(args.candidate_max_k),
             "max_new_tokens": int(args.max_new_tokens),
             "mc_m_samples": int(args.mc_m_samples),
+            "sampling_temperature": float(args.sampling_temperature),
+            "sampling_top_p": float(args.sampling_top_p),
             "selection_f_mode": str(args.selection_f_mode),
             "math_eval_backend": str(args.math_eval_backend),
             "force_boxed_answer_instruction": bool(args.force_boxed_answer_instruction),
@@ -862,6 +919,14 @@ def main() -> None:
                 "response_len_tokens": int(len(response_minf)),
                 "num_branch_steps": int(len(trace_minf)),
             },
+            "result_random_sampling": {
+                "is_correct": bool(ok_rand),
+                "eval": eval_rand,
+                "response_text": text_rand,
+                "response_len_tokens": int(len(response_rand)),
+                "num_branch_steps": int(len(trace_rand)),
+            },
+            # Backward-compatible alias for older analysis scripts.
             "result_random_topk": {
                 "is_correct": bool(ok_rand),
                 "eval": eval_rand,
@@ -883,6 +948,8 @@ def main() -> None:
         }
         if args.save_traces:
             rec["trace_min_f_mc"] = trace_minf
+            rec["trace_random_sampling"] = trace_rand
+            # Backward-compatible alias for older analysis scripts.
             rec["trace_random_topk"] = trace_rand
             rec["trace_greedy_baseline"] = trace_greedy
 
@@ -914,13 +981,24 @@ def main() -> None:
         n = len(merged)
         if n > 0:
             acc_minf_all = [1.0 if x["result_min_f_mc"]["is_correct"] else 0.0 for x in merged]
-            acc_rand_all = [1.0 if x["result_random_topk"]["is_correct"] else 0.0 for x in merged]
+            acc_rand_all = [
+                1.0
+                if (x.get("result_random_sampling", x.get("result_random_topk", {})).get("is_correct", False))
+                else 0.0
+                for x in merged
+            ]
             acc_greedy_all = [1.0 if x["result_greedy_baseline"]["is_correct"] else 0.0 for x in merged]
             branch_minf_all = [float(x["result_min_f_mc"]["num_branch_steps"]) for x in merged]
-            branch_rand_all = [float(x["result_random_topk"]["num_branch_steps"]) for x in merged]
+            branch_rand_all = [
+                float(x.get("result_random_sampling", x.get("result_random_topk", {})).get("num_branch_steps", 0.0))
+                for x in merged
+            ]
             branch_greedy_all = [float(x["result_greedy_baseline"]["num_branch_steps"]) for x in merged]
             len_minf_all = [float(x["result_min_f_mc"]["response_len_tokens"]) for x in merged]
-            len_rand_all = [float(x["result_random_topk"]["response_len_tokens"]) for x in merged]
+            len_rand_all = [
+                float(x.get("result_random_sampling", x.get("result_random_topk", {})).get("response_len_tokens", 0.0))
+                for x in merged
+            ]
             len_greedy_all = [float(x["result_greedy_baseline"]["response_len_tokens"]) for x in merged]
         else:
             acc_minf_all = acc_minf
@@ -936,6 +1014,8 @@ def main() -> None:
         summary = {
             "num_prompts": int(n),
             "accuracy_min_f_mc": _mean(acc_minf_all),
+            "accuracy_random_sampling": _mean(acc_rand_all),
+            # Backward-compatible alias.
             "accuracy_random_topk": _mean(acc_rand_all),
             "accuracy_greedy_baseline": _mean(acc_greedy_all),
             "accuracy_gain_abs": _mean(acc_minf_all) - _mean(acc_rand_all),
@@ -947,9 +1027,13 @@ def main() -> None:
             "paired_regress_count_vs_greedy": int(paired_regress_g),
             "paired_net_gain_vs_greedy": int(paired_improve_g - paired_regress_g),
             "avg_branch_steps_min_f_mc": _mean(branch_minf_all),
+            "avg_branch_steps_random_sampling": _mean(branch_rand_all),
+            # Backward-compatible alias.
             "avg_branch_steps_random_topk": _mean(branch_rand_all),
             "avg_branch_steps_greedy_baseline": _mean(branch_greedy_all),
             "avg_response_len_min_f_mc": _mean(len_minf_all),
+            "avg_response_len_random_sampling": _mean(len_rand_all),
+            # Backward-compatible alias.
             "avg_response_len_random_topk": _mean(len_rand_all),
             "avg_response_len_greedy_baseline": _mean(len_greedy_all),
             "config": {
@@ -966,6 +1050,8 @@ def main() -> None:
                 "bucket_min_points_per_bin": int(args.bucket_min_points_per_bin),
                 "mc_temperature": float(args.mc_temperature),
                 "mc_top_p": float(args.mc_top_p),
+                "sampling_temperature": float(args.sampling_temperature),
+                "sampling_top_p": float(args.sampling_top_p),
                 "f_continuation_mode": str(args.f_continuation_mode),
                 "f_sentence_max_new_tokens": int(args.f_sentence_max_new_tokens),
                 "f_sentence_stop": str(args.f_sentence_stop),
