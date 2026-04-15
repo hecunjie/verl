@@ -529,6 +529,7 @@ def main() -> None:
                         "is_correct": bool(r["is_correct"]),
                         "response_text": r["response_text"],
                         "response_length_tokens": len(r["response_ids"]),
+                        "entropies": [float(x) for x in r["entropies"]],
                     }
                     for r in rollouts
                 ],
