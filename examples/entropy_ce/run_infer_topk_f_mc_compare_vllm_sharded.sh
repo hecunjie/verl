@@ -24,6 +24,7 @@ MC_TEMPERATURE="${MC_TEMPERATURE:-1.0}"
 MC_TOP_P="${MC_TOP_P:-0.95}"
 BIAS_METRICS_MODE="${BIAS_METRICS_MODE:-length_normalized}"
 MATH_EVAL_BACKEND="${MATH_EVAL_BACKEND:-auto}"
+FORCE_BOXED_ANSWER_INSTRUCTION="${FORCE_BOXED_ANSWER_INSTRUCTION:-0}"
 F_CONTINUATION_MODE="${F_CONTINUATION_MODE:-first_sentence}"
 F_SENTENCE_MAX_NEW_TOKENS="${F_SENTENCE_MAX_NEW_TOKENS:-256}"
 F_SENTENCE_STOP="${F_SENTENCE_STOP:-simple}"
@@ -79,6 +80,9 @@ for ((r = 0; r < NPROC_PER_NODE; r++)); do
   fi
   if [ "${PROGRESS_ECHO}" = "1" ]; then
     EXTRA_ARGS+=(--progress_echo)
+  fi
+  if [ "${FORCE_BOXED_ANSWER_INSTRUCTION}" = "1" ]; then
+    EXTRA_ARGS+=(--force_boxed_answer_instruction)
   fi
 
   CUDA_VISIBLE_DEVICES="${r}" python3 examples/entropy_ce/infer_topk_f_mc_compare.py \

@@ -53,6 +53,33 @@ def _ground_truth_from_row(row: dict[str, Any]) -> str:
     return ""
 
 
+def _is_math_like_source(data_source: str) -> bool:
+    ds = str(data_source or "")
+    dsl = ds.lower()
+    return (
+        ds in {
+            "math_dapo",
+            "math",
+            "math_dapo_reasoning",
+            "lighteval/MATH",
+            "DigitalLearningGmbH/MATH-lighteval",
+            "HuggingFaceH4/MATH-500",
+        }
+        or ds.startswith("aime")
+        or ("math500" in dsl)
+    )
+
+
+def _append_boxed_instruction(prompt_text: str) -> str:
+    suffix = (
+        "\n\nPlease end your final answer with exactly one LaTeX boxed form: "
+        "\\boxed{...}."
+    )
+    if "\\boxed" in prompt_text:
+        return prompt_text
+    return f"{prompt_text.rstrip()}{suffix}"
+
+
 def _step_logprobs_vllm(llm: Any, prefix_ids: list[int], logprobs_k: int) -> tuple[int | None, dict[int, float]]:
     from vllm import SamplingParams
     from vllm.inputs import TokensPrompt
@@ -556,6 +583,12 @@ def main() -> None:
         default="auto",
         help="Math correctness backend for math-like datasets; use math_verify for MATH-500 style evaluation.",
     )
+    parser.add_argument(
+        "--force_boxed_answer_instruction",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="For math-like data_source, append an explicit instruction requiring final answer in \\boxed{...}.",
+    )
     args = parser.parse_args()
 
     if not (0.0 < float(args.candidate_top_p) <= 1.0):
@@ -661,9 +694,11 @@ def main() -> None:
                 f"[infer_compare] rank0 prompt {local_i + 1}/{len(local_rows)} global#{global_idx} elapsed={elapsed:.1f}s",
                 flush=True,
             )
-        prompt_text = build_prompt_text(tokenizer, row["prompt"])
-        prompt_ids = tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False)["input_ids"][0].tolist()
         data_source = row.get("data_source", "math_dapo")
+        prompt_text = build_prompt_text(tokenizer, row["prompt"])
+        if args.force_boxed_answer_instruction and _is_math_like_source(str(data_source)):
+            prompt_text = _append_boxed_instruction(prompt_text)
+        prompt_ids = tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False)["input_ids"][0].tolist()
         ground_truth = _ground_truth_from_row(row)
         bucket_estimator: dict[str, Any] | None = None
         if str(args.selection_f_mode) == "bucket_group_estimate":
@@ -812,6 +847,7 @@ def main() -> None:
             "mc_m_samples": int(args.mc_m_samples),
             "selection_f_mode": str(args.selection_f_mode),
             "math_eval_backend": str(args.math_eval_backend),
+            "force_boxed_answer_instruction": bool(args.force_boxed_answer_instruction),
             "bucket_group_rollouts": int(args.bucket_group_rollouts),
             "bucket_num_bins": int(args.bucket_num_bins),
             "bucket_min_points_per_bin": int(args.bucket_min_points_per_bin),
