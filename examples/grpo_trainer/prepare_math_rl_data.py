@@ -286,6 +286,44 @@ def _extract_gsm8k_final_answer(ans: Any) -> str:
     return s
 
 
+def _extract_last_boxed_content(text: str) -> str | None:
+    """Extract content of the last \\boxed{...} with simple brace matching."""
+    s = str(text or "")
+    key = "\\boxed{"
+    pos = s.rfind(key)
+    if pos < 0:
+        return None
+    i = pos + len(key)
+    depth = 1
+    start = i
+    while i < len(s):
+        ch = s[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return s[start:i].strip()
+        i += 1
+    return None
+
+
+def _extract_math_final_answer(ans: Any) -> str:
+    """Normalize math ground-truth to final answer when solution text is provided."""
+    s = str(ans or "").strip()
+    if not s:
+        return s
+    boxed = _extract_last_boxed_content(s)
+    if boxed:
+        return boxed
+    # Fallbacks for common formats
+    if "####" in s:
+        return s.split("####")[-1].strip()
+    if "Answer:" in s:
+        return s.split("Answer:")[-1].strip()
+    return s
+
+
 def iter_gsm8k_test():
     ds = load_dataset("openai/gsm8k", "main", split="test")
     for idx in range(len(ds)):
@@ -313,7 +351,7 @@ def iter_math_lighteval_test():
             raise KeyError(f"MATH-lighteval idx={idx} keys={list(ex.keys())}")
         yield _row(
             _user_content_dapo_processed(str(p).strip()),
-            _gt(a),
+            _extract_math_final_answer(a),
             "DigitalLearningGmbH/MATH-lighteval",
             extra_info={
                 "index": idx,
@@ -354,7 +392,7 @@ def iter_math_hard_test(min_level: int = 5):
             continue
         yield _row(
             _user_content_dapo_processed(str(p).strip()),
-            _gt(a),
+            _extract_math_final_answer(a),
             "math_hard",
             extra_info={
                 "index": out_idx,
