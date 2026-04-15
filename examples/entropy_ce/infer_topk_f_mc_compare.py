@@ -694,6 +694,13 @@ def main() -> None:
 
     out_dir = Path(args.output_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+    # Clear stale file-sync markers from previous runs in the same output dir.
+    # Otherwise rank0 may observe old "_done_infer_compare_rank*" files and pass barrier early.
+    if rank == 0:
+        for r in range(world_size):
+            stale = out_dir / f"_done_infer_compare_rank{r}"
+            if stale.exists():
+                stale.unlink()
     part_path = out_dir / f"infer_compare_rank{rank}.jsonl"
     part_path.write_text("", encoding="utf-8")
 
