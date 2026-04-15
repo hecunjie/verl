@@ -7,6 +7,8 @@
 **测试集**：MATH-500、AIME 2024、GPQA-D（diamond）。
 其中前两者题干用与上述数据集 **相同** 的 user 文案模板包裹（含 ``\\boxed`` 与末尾 ``Remember to put...``）；
 GPQA-D 会转为四选一格式（末行 ``Answer: X``，X∈{A,B,C,D}）。
+另外新增常见数学测试集：GSM8K（test）、MATH-lighteval（test），同样统一为 DAPO 风格 prompt。
+并支持从 MATH-lighteval 筛出 ``math_hard``（默认 ``level>=5``）单独保存。
 
 若需使用字节版百万级数据，加 ``--train_source byted``。
 
@@ -19,6 +21,9 @@ GPQA-D 会转为四选一格式（末行 ``Answer: X``，X∈{A,B,C,D}）。
   - dapo_math_17k_processed_train.parquet  # 默认：Processed 训练（或 byted 时为 dapo_math_byted_train.parquet）
   - math500_test.parquet
   - aime2024_test.parquet
+  - gsm8k_test.parquet
+  - math_lighteval_test.parquet
+  - math_hard_test.parquet
   - gpqa_d_test.parquet
 
 依赖：datasets。"""
@@ -273,6 +278,96 @@ def iter_aime24_test():
         )
 
 
+def _extract_gsm8k_final_answer(ans: Any) -> str:
+    s = str(ans or "").strip()
+    # GSM8K commonly stores rationale + final answer in "#### 42" form.
+    if "####" in s:
+        return s.split("####")[-1].strip()
+    return s
+
+
+def iter_gsm8k_test():
+    ds = load_dataset("openai/gsm8k", "main", split="test")
+    for idx in range(len(ds)):
+        ex = ds[idx]
+        q = ex.get("question")
+        a = ex.get("answer")
+        if q is None or a is None:
+            raise KeyError(f"GSM8K idx={idx} keys={list(ex.keys())}")
+        yield _row(
+            _user_content_dapo_processed(str(q).strip()),
+            _extract_gsm8k_final_answer(a),
+            "math",
+            extra_info={"index": idx, "split": "gsm8k_test"},
+        )
+
+
+def iter_math_lighteval_test():
+    raw = load_dataset("DigitalLearningGmbH/MATH-lighteval")
+    ds = _pick_split(raw) if isinstance(raw, DatasetDict) else raw
+    for idx in range(len(ds)):
+        ex = ds[idx]
+        p = ex.get("problem") or ex.get("question")
+        a = ex.get("answer") or ex.get("solution")
+        if p is None or a is None:
+            raise KeyError(f"MATH-lighteval idx={idx} keys={list(ex.keys())}")
+        yield _row(
+            _user_content_dapo_processed(str(p).strip()),
+            _gt(a),
+            "DigitalLearningGmbH/MATH-lighteval",
+            extra_info={
+                "index": idx,
+                "split": "test",
+                "subject": ex.get("subject"),
+                "level": ex.get("level"),
+            },
+        )
+
+
+def _level_as_int(x: Any) -> int | None:
+    if x is None:
+        return None
+    s = str(x).strip().lower()
+    if not s:
+        return None
+    # common patterns: "5", "Level 5", "level 5"
+    for tok in s.replace("_", " ").split():
+        if tok.isdigit():
+            return int(tok)
+    if s.isdigit():
+        return int(s)
+    return None
+
+
+def iter_math_hard_test(min_level: int = 5):
+    raw = load_dataset("DigitalLearningGmbH/MATH-lighteval")
+    ds = _pick_split(raw) if isinstance(raw, DatasetDict) else raw
+    out_idx = 0
+    for idx in range(len(ds)):
+        ex = ds[idx]
+        lv = _level_as_int(ex.get("level"))
+        if lv is None or int(lv) < int(min_level):
+            continue
+        p = ex.get("problem") or ex.get("question")
+        a = ex.get("answer") or ex.get("solution")
+        if p is None or a is None:
+            continue
+        yield _row(
+            _user_content_dapo_processed(str(p).strip()),
+            _gt(a),
+            "math_hard",
+            extra_info={
+                "index": out_idx,
+                "source_index": idx,
+                "split": "test",
+                "subject": ex.get("subject"),
+                "level": ex.get("level"),
+                "min_level_filter": int(min_level),
+            },
+        )
+        out_idx += 1
+
+
 def _load_gpqa_d_hf(
     dataset_name: str | None = None,
     dataset_config: str | None = None,
@@ -514,6 +609,24 @@ def main():
         default="test",
         help="GPQA 使用的 split，默认 test。",
     )
+    ap.add_argument(
+        "--include_extra_math_tests",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="是否额外导出 GSM8K(test) 与 MATH-lighteval(test)。",
+    )
+    ap.add_argument(
+        "--include_math_hard",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="是否导出 math_hard_test（从 MATH-lighteval 按 level 过滤）。",
+    )
+    ap.add_argument(
+        "--math_hard_min_level",
+        type=int,
+        default=5,
+        help="math_hard 过滤的最小 level（默认 5）。",
+    )
     args = ap.parse_args()
     out = os.path.expanduser(args.output_dir)
     os.makedirs(out, exist_ok=True)
@@ -539,6 +652,9 @@ def main():
 
     f_m500 = os.path.join(out, "math500_test.parquet")
     f_aime = os.path.join(out, "aime2024_test.parquet")
+    f_gsm8k = os.path.join(out, "gsm8k_test.parquet")
+    f_math_lighteval = os.path.join(out, "math_lighteval_test.parquet")
+    f_math_hard = os.path.join(out, "math_hard_test.parquet")
     f_gpqa = os.path.join(out, "gpqa_d_test.parquet")
 
     print("2/4 MATH-500 (test, DAPO-Processed 同款 prompt) ...")
@@ -549,10 +665,38 @@ def main():
     n3 = _write_parquet(f_aime, iter_aime24_test)
     print(f"    -> {n3} rows, {f_aime}")
 
+    val_files = [f_m500, f_aime]
+
+    if bool(args.include_extra_math_tests):
+        print("4/6 GSM8K (test, 同款 prompt) ...")
+        n4 = _write_parquet(f_gsm8k, iter_gsm8k_test)
+        print(f"    -> {n4} rows, {f_gsm8k}")
+        val_files.append(f_gsm8k)
+
+        print("5/6 MATH-lighteval (test, 同款 prompt) ...")
+        n5 = _write_parquet(f_math_lighteval, iter_math_lighteval_test)
+        print(f"    -> {n5} rows, {f_math_lighteval}")
+        val_files.append(f_math_lighteval)
+    else:
+        print("4/6 GSM8K (test, 同款 prompt) ... skipped (--no-include_extra_math_tests)")
+        print("5/6 MATH-lighteval (test, 同款 prompt) ... skipped (--no-include_extra_math_tests)")
+
+    if bool(args.include_math_hard):
+        print("6/7 math_hard (MATH-lighteval level filtered) ...")
+
+        def gen_math_hard():
+            yield from iter_math_hard_test(min_level=int(args.math_hard_min_level))
+
+        n_hard = _write_parquet(f_math_hard, gen_math_hard)
+        print(f"    -> {n_hard} rows, {f_math_hard}")
+        val_files.append(f_math_hard)
+    else:
+        print("6/7 math_hard (MATH-lighteval level filtered) ... skipped (--no-include_math_hard)")
+
     gpqa_enabled = bool(args.include_gpqa_d)
     gpqa_written = False
     if gpqa_enabled:
-        print("4/4 GPQA-D (diamond test, multiple-choice) ...")
+        print("7/7 GPQA-D (diamond test, multiple-choice) ...")
 
         try:
             # Pre-materialize to surface the real underlying exception instead of
@@ -575,11 +719,10 @@ def main():
                 raise
             print(f"    !! 跳过 GPQA-D：{_format_exception_chain(e)}")
     else:
-        print("4/4 GPQA-D (diamond test, multiple-choice) ... skipped (--no-include_gpqa_d)")
+        print("7/7 GPQA-D (diamond test, multiple-choice) ... skipped (--no-include_gpqa_d)")
 
     print("\n训练 / 验证可设为:")
     print(f'  data.train_files="{f_train}"')
-    val_files = [f_m500, f_aime]
     if gpqa_written:
         val_files.append(f_gpqa)
     val_files_str = ",".join([f"'{p}'" for p in val_files])
