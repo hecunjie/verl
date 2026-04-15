@@ -272,15 +272,35 @@ def iter_aime24_test():
         )
 
 
-def _load_gpqa_d_hf() -> Dataset:
+def _load_gpqa_d_hf(
+    dataset_name: str | None = None,
+    dataset_config: str | None = None,
+    dataset_split: str | None = None,
+) -> Dataset:
     """Load GPQA-Diamond from HF with fallback dataset/config names."""
     last_err: Exception | None = None
-    factories = (
-        lambda: load_dataset("Idavidrein/gpqa", "gpqa_diamond"),
-        lambda: load_dataset("Idavidrein/gpqa", "diamond"),
-        lambda: load_dataset("Idavidrein/gpqa"),
-        lambda: load_dataset("openai/gpqa", "diamond"),
-        lambda: load_dataset("openai/gpqa"),
+    factories: list = []
+    if dataset_name:
+        if dataset_config:
+            factories.append(
+                lambda: load_dataset(
+                    dataset_name,
+                    dataset_config,
+                    split=dataset_split,
+                )
+            )
+        else:
+            factories.append(lambda: load_dataset(dataset_name, split=dataset_split))
+    factories.extend(
+        (
+            lambda: load_dataset("Idavidrein/gpqa", "gpqa_diamond", split=dataset_split),
+            lambda: load_dataset("Idavidrein/gpqa", "diamond", split=dataset_split),
+            lambda: load_dataset("Idavidrein/gpqa", split=dataset_split),
+            lambda: load_dataset("openai/gpqa", "diamond", split=dataset_split),
+            lambda: load_dataset("openai/gpqa", split=dataset_split),
+            lambda: load_dataset("hendrycks/GPQA", "diamond", split=dataset_split),
+            lambda: load_dataset("hendrycks/GPQA", split=dataset_split),
+        )
     )
     for factory in factories:
         try:
@@ -292,7 +312,9 @@ def _load_gpqa_d_hf() -> Dataset:
             last_err = e
             continue
     assert last_err is not None
-    raise RuntimeError("无法从 HuggingFace 加载 GPQA-D（diamond）数据集。") from last_err
+    raise RuntimeError(
+        f"无法从 HuggingFace 加载 GPQA-D（diamond）数据集。最后错误: {type(last_err).__name__}: {last_err}"
+    ) from last_err
 
 
 def _first_present(ex: dict[str, Any], keys: list[str]) -> Any:
@@ -369,8 +391,16 @@ def _extract_gpqa_d_row(ex: dict[str, Any], idx: int) -> tuple[str, list[str], s
     return str(question).strip(), [str(x).strip() for x in options[:4]], gt_letter
 
 
-def iter_gpqa_d_test():
-    ds = _load_gpqa_d_hf()
+def iter_gpqa_d_test(
+    gpqa_d_dataset: str | None = None,
+    gpqa_d_config: str | None = None,
+    gpqa_d_split: str | None = None,
+):
+    ds = _load_gpqa_d_hf(
+        dataset_name=gpqa_d_dataset,
+        dataset_config=gpqa_d_config,
+        dataset_split=gpqa_d_split,
+    )
     for idx in range(len(ds)):
         ex = ds[idx]
         q, choices, gt_letter = _extract_gpqa_d_row(ex, idx)
@@ -410,6 +440,36 @@ def main():
         default=None,
         help="仅导出训练集前 N 条",
     )
+    ap.add_argument(
+        "--include_gpqa_d",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="是否尝试下载并导出 GPQA-D（diamond）测试集。",
+    )
+    ap.add_argument(
+        "--gpqa_d_required",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="若为 true，GPQA-D 下载/处理失败时直接报错退出；否则仅告警并跳过。",
+    )
+    ap.add_argument(
+        "--gpqa_d_dataset",
+        type=str,
+        default=None,
+        help="可选，手动指定 GPQA 数据集名（如 Idavidrein/gpqa）。",
+    )
+    ap.add_argument(
+        "--gpqa_d_config",
+        type=str,
+        default=None,
+        help="可选，手动指定 GPQA 配置名（如 diamond 或 gpqa_diamond）。",
+    )
+    ap.add_argument(
+        "--gpqa_d_split",
+        type=str,
+        default="test",
+        help="GPQA 使用的 split，默认 test。",
+    )
     args = ap.parse_args()
     out = os.path.expanduser(args.output_dir)
     os.makedirs(out, exist_ok=True)
@@ -445,13 +505,36 @@ def main():
     n3 = _write_parquet(f_aime, iter_aime24_test)
     print(f"    -> {n3} rows, {f_aime}")
 
-    print("4/4 GPQA-D (diamond test, multiple-choice) ...")
-    n4 = _write_parquet(f_gpqa, iter_gpqa_d_test)
-    print(f"    -> {n4} rows, {f_gpqa}")
+    gpqa_enabled = bool(args.include_gpqa_d)
+    gpqa_written = False
+    if gpqa_enabled:
+        print("4/4 GPQA-D (diamond test, multiple-choice) ...")
+
+        def gen_gpqa():
+            yield from iter_gpqa_d_test(
+                gpqa_d_dataset=args.gpqa_d_dataset,
+                gpqa_d_config=args.gpqa_d_config,
+                gpqa_d_split=args.gpqa_d_split,
+            )
+
+        try:
+            n4 = _write_parquet(f_gpqa, gen_gpqa)
+            gpqa_written = True
+            print(f"    -> {n4} rows, {f_gpqa}")
+        except Exception as e:
+            if bool(args.gpqa_d_required):
+                raise
+            print(f"    !! 跳过 GPQA-D：{type(e).__name__}: {e}")
+    else:
+        print("4/4 GPQA-D (diamond test, multiple-choice) ... skipped (--no-include_gpqa_d)")
 
     print("\n训练 / 验证可设为:")
     print(f'  data.train_files="{f_train}"')
-    print(f'  data.val_files="[\'{f_m500}\',\'{f_aime}\',\'{f_gpqa}\']"')
+    val_files = [f_m500, f_aime]
+    if gpqa_written:
+        val_files.append(f_gpqa)
+    val_files_str = ",".join([f"'{p}'" for p in val_files])
+    print(f'  data.val_files="[{val_files_str}]"')
 
 
 if __name__ == "__main__":
