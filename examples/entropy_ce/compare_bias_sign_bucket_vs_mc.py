@@ -381,15 +381,16 @@ def main() -> None:
             future_len = int(n_steps - step_idx - 1)
             if future_len <= 0:
                 continue
-            if str(args.bias_metrics_mode) == "length_normalized":
-                f_real_proxy = future_sum / float(future_len)
-            else:
-                f_real_proxy = future_sum
+            # IMPORTANT: sum/rate comparisons must use their own realized trajectory proxy.
+            # - bucket_sum should compare against realized suffix SUM
+            # - bucket_rate should compare against realized suffix RATE
+            f_real_proxy_sum = future_sum
+            f_real_proxy_rate = future_sum / float(future_len)
             fbar_bucket_sum, fbar_bucket_rate, n_ref_hits = _query_fbar_from_refs_by_prefix_sum(
                 rollout_refs, pref_sum
             )
-            sign_bucket_real_sum = _sign(float(fbar_bucket_sum) - float(f_real_proxy))
-            sign_bucket_real_rate = _sign(float(fbar_bucket_rate) - float(f_real_proxy))
+            sign_bucket_real_sum = _sign(float(fbar_bucket_sum) - float(f_real_proxy_sum))
+            sign_bucket_real_rate = _sign(float(fbar_bucket_rate) - float(f_real_proxy_rate))
 
             summary_cnt["n_eval_steps"] += 1
             if "sum" in eval_modes:
@@ -420,7 +421,14 @@ def main() -> None:
                         "bucket_ref_hits": int(n_ref_hits),
                         "f_bar_bucket_proxy_sum": float(fbar_bucket_sum),
                         "f_bar_bucket_proxy_rate": float(fbar_bucket_rate),
-                        "f_real_proxy_from_trajectory": float(f_real_proxy),
+                        "f_real_proxy_sum_from_trajectory": float(f_real_proxy_sum),
+                        "f_real_proxy_rate_from_trajectory": float(f_real_proxy_rate),
+                        # Backward-compatible alias (historically mixed by bias_metrics_mode).
+                        "f_real_proxy_from_trajectory": (
+                            float(f_real_proxy_rate)
+                            if str(args.bias_metrics_mode) == "length_normalized"
+                            else float(f_real_proxy_sum)
+                        ),
                         "sign_real_bucket_proxy_sum": int(sign_bucket_real_sum),
                         "sign_real_bucket_proxy_rate": int(sign_bucket_real_rate),
                         "sign_match_real_sum": bool(sign_bucket_real_sum == sign_mc_real),

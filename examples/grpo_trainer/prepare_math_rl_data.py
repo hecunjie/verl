@@ -25,6 +25,7 @@ GPQA-D 会转为四选一格式（末行 ``Answer: X``，X∈{A,B,C,D}）。
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import random
@@ -279,6 +280,7 @@ def _load_gpqa_d_hf(
 ) -> Dataset:
     """Load GPQA-Diamond from HF with fallback dataset/config names."""
     last_err: Exception | None = None
+    attempt_errors: list[str] = []
     factories: list = []
     if dataset_name:
         if dataset_config:
@@ -298,8 +300,6 @@ def _load_gpqa_d_hf(
             lambda: load_dataset("Idavidrein/gpqa", split=dataset_split),
             lambda: load_dataset("openai/gpqa", "diamond", split=dataset_split),
             lambda: load_dataset("openai/gpqa", split=dataset_split),
-            lambda: load_dataset("hendrycks/GPQA", "diamond", split=dataset_split),
-            lambda: load_dataset("hendrycks/GPQA", split=dataset_split),
         )
     )
     for factory in factories:
@@ -310,10 +310,14 @@ def _load_gpqa_d_hf(
             return raw
         except Exception as e:
             last_err = e
+            attempt_errors.append(f"{type(e).__name__}: {e}")
             continue
     assert last_err is not None
     raise RuntimeError(
-        f"无法从 HuggingFace 加载 GPQA-D（diamond）数据集。最后错误: {type(last_err).__name__}: {last_err}"
+        "无法从 HuggingFace 加载 GPQA-D（diamond）数据集。"
+        "该数据集通常是 gated（需在 HF 页面同意条款，并在环境中设置 HF_TOKEN）。"
+        f" 最近错误: {type(last_err).__name__}: {last_err}"
+        + (f" | 尝试记录: {' || '.join(attempt_errors[:3])}" if attempt_errors else "")
     ) from last_err
 
 
@@ -391,18 +395,38 @@ def _extract_gpqa_d_row(ex: dict[str, Any], idx: int) -> tuple[str, list[str], s
     return str(question).strip(), [str(x).strip() for x in options[:4]], gt_letter
 
 
+def _load_gpqa_d_local_csv(csv_path: str) -> list[dict[str, Any]]:
+    p = os.path.expanduser(csv_path)
+    if not os.path.exists(p):
+        raise FileNotFoundError(f"GPQA 本地 CSV 不存在: {p}")
+    rows: list[dict[str, Any]] = []
+    with open(p, "r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            rows.append(dict(row))
+    if not rows:
+        raise ValueError(f"GPQA 本地 CSV 为空: {p}")
+    return rows
+
+
 def iter_gpqa_d_test(
+    gpqa_d_local_csv: str | None = None,
     gpqa_d_dataset: str | None = None,
     gpqa_d_config: str | None = None,
     gpqa_d_split: str | None = None,
 ):
-    ds = _load_gpqa_d_hf(
-        dataset_name=gpqa_d_dataset,
-        dataset_config=gpqa_d_config,
-        dataset_split=gpqa_d_split,
-    )
-    for idx in range(len(ds)):
-        ex = ds[idx]
+    if gpqa_d_local_csv:
+        ds_local = _load_gpqa_d_local_csv(gpqa_d_local_csv)
+        iterator = enumerate(ds_local)
+    else:
+        ds = _load_gpqa_d_hf(
+            dataset_name=gpqa_d_dataset,
+            dataset_config=gpqa_d_config,
+            dataset_split=gpqa_d_split,
+        )
+        iterator = ((idx, ds[idx]) for idx in range(len(ds)))
+
+    for idx, ex in iterator:
         q, choices, gt_letter = _extract_gpqa_d_row(ex, idx)
         yield _row(
             _user_content_gpqa_d(q, choices),
@@ -411,7 +435,7 @@ def iter_gpqa_d_test(
             extra_info={
                 "index": idx,
                 "split": "test",
-                "source": "gpqa_diamond",
+                "source": "gpqa_diamond_csv" if gpqa_d_local_csv else "gpqa_diamond",
                 "subject": ex.get("subject"),
             },
             ability="science",
@@ -422,6 +446,20 @@ def _write_parquet(path: str, gen):
     ds = Dataset.from_generator(gen)
     ds.to_parquet(path)
     return len(ds)
+
+
+def _format_exception_chain(e: BaseException) -> str:
+    parts: list[str] = []
+    cur: BaseException | None = e
+    depth = 0
+    while cur is not None and depth < 8:
+        parts.append(f"{type(cur).__name__}: {cur}")
+        nxt = cur.__cause__ if cur.__cause__ is not None else cur.__context__
+        if nxt is cur:
+            break
+        cur = nxt
+        depth += 1
+    return " <- ".join(parts)
 
 
 def main():
@@ -457,6 +495,12 @@ def main():
         type=str,
         default=None,
         help="可选，手动指定 GPQA 数据集名（如 Idavidrein/gpqa）。",
+    )
+    ap.add_argument(
+        "--gpqa_d_local_csv",
+        type=str,
+        default=None,
+        help="优先使用本地 GPQA-D CSV 文件路径（例如 gpqa_diamond.csv），不走 HF 下载。",
     )
     ap.add_argument(
         "--gpqa_d_config",
@@ -510,21 +554,26 @@ def main():
     if gpqa_enabled:
         print("4/4 GPQA-D (diamond test, multiple-choice) ...")
 
-        def gen_gpqa():
-            yield from iter_gpqa_d_test(
-                gpqa_d_dataset=args.gpqa_d_dataset,
-                gpqa_d_config=args.gpqa_d_config,
-                gpqa_d_split=args.gpqa_d_split,
-            )
-
         try:
-            n4 = _write_parquet(f_gpqa, gen_gpqa)
+            # Pre-materialize to surface the real underlying exception instead of
+            # a generic DatasetGenerationError wrapper from Dataset.from_generator.
+            gpqa_rows = list(
+                iter_gpqa_d_test(
+                    gpqa_d_local_csv=args.gpqa_d_local_csv,
+                    gpqa_d_dataset=args.gpqa_d_dataset,
+                    gpqa_d_config=args.gpqa_d_config,
+                    gpqa_d_split=args.gpqa_d_split,
+                )
+            )
+            ds_gpqa = Dataset.from_list(gpqa_rows)
+            ds_gpqa.to_parquet(f_gpqa)
+            n4 = len(ds_gpqa)
             gpqa_written = True
             print(f"    -> {n4} rows, {f_gpqa}")
         except Exception as e:
             if bool(args.gpqa_d_required):
                 raise
-            print(f"    !! 跳过 GPQA-D：{type(e).__name__}: {e}")
+            print(f"    !! 跳过 GPQA-D：{_format_exception_chain(e)}")
     else:
         print("4/4 GPQA-D (diamond test, multiple-choice) ... skipped (--no-include_gpqa_d)")
 
