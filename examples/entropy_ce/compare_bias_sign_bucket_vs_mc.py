@@ -120,6 +120,57 @@ def _query_fbar_from_refs_by_prefix_sum(refs: list[dict[str, Any]], prefix_sum_t
     return float(np.mean(np.array(picked_sum, dtype=np.float64))), float(np.mean(np.array(picked_rate, dtype=np.float64))), int(len(picked_sum))
 
 
+def _local_entropy_rate_around_step(
+    entropies: list[float],
+    center_idx: int,
+    *,
+    left_tokens: int,
+    right_tokens: int,
+) -> float:
+    """Local proxy around one sampled point: previous `left` + next `right` tokens.
+
+    Note: excludes the center token itself so default window has exactly 40 tokens
+    in the ideal case (20 before + 20 after).
+    """
+    n = len(entropies)
+    if n <= 0:
+        return 0.0
+    c = int(center_idx)
+    l = max(int(left_tokens), 0)
+    r = max(int(right_tokens), 0)
+    lo_prev = max(0, c - l)
+    hi_prev = max(0, min(c, n))
+    lo_next = min(max(c + 1, 0), n)
+    hi_next = min(lo_next + r, n)
+    vals = entropies[lo_prev:hi_prev] + entropies[lo_next:hi_next]
+    if not vals:
+        return 0.0
+    return float(np.mean(np.array(vals, dtype=np.float64)))
+
+
+def _group_local_fbar_at_step(
+    group_rollouts: list[dict[str, Any]],
+    *,
+    step_idx: int,
+    left_tokens: int,
+    right_tokens: int,
+) -> float:
+    if not group_rollouts:
+        return 0.0
+    vals: list[float] = []
+    for rr in group_rollouts:
+        ent = [float(x) for x in rr.get("entropies", [])]
+        vals.append(
+            _local_entropy_rate_around_step(
+                ent,
+                int(step_idx),
+                left_tokens=int(left_tokens),
+                right_tokens=int(right_tokens),
+            )
+        )
+    return float(np.mean(np.array(vals, dtype=np.float64))) if vals else 0.0
+
+
 def _sample_group_rollouts_detailed(
     *,
     llm: Any,
@@ -238,6 +289,18 @@ def main() -> None:
         default="both",
         help="Which proxy metric to report. Retrieval key is always prefix entropy sum.",
     )
+    parser.add_argument(
+        "--local_window_left_tokens",
+        type=int,
+        default=20,
+        help="Local f_bar window: number of tokens before sampled point.",
+    )
+    parser.add_argument(
+        "--local_window_right_tokens",
+        type=int,
+        default=20,
+        help="Local f_bar window: number of tokens after sampled point.",
+    )
 
     parser.add_argument("--save_traces", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
@@ -268,6 +331,8 @@ def main() -> None:
         raise SystemExit("--bucket_num_bins must be >=2.")
     if int(args.bucket_min_points_per_bin) < 1:
         raise SystemExit("--bucket_min_points_per_bin must be >=1.")
+    if int(args.local_window_left_tokens) < 0 or int(args.local_window_right_tokens) < 0:
+        raise SystemExit("--local_window_left_tokens and --local_window_right_tokens must be >=0.")
 
     vllm_standalone = args.vllm_shard_rank is not None and args.vllm_shard_world_size is not None
     if (args.vllm_shard_rank is None) ^ (args.vllm_shard_world_size is None):
@@ -406,13 +471,12 @@ def main() -> None:
         real_is_correct = bool(real_rollout.get("is_correct", False))
         real_entropy_rate_full = float(real_rollout.get("entropy_rate_full", 0.0))
 
+        same_label_rollouts = [r for r in rollouts if bool(r.get("is_correct", False)) == real_is_correct] or [real_rollout]
+
         all_rates = [float(r.get("entropy_rate_full", 0.0)) for r in rollouts]
         correct_rates = [float(r.get("entropy_rate_full", 0.0)) for r in rollouts if bool(r.get("is_correct", False))]
         wrong_rates = [float(r.get("entropy_rate_full", 0.0)) for r in rollouts if not bool(r.get("is_correct", False))]
-        same_label_rates = (
-            [float(r.get("entropy_rate_full", 0.0)) for r in rollouts if bool(r.get("is_correct", False)) == real_is_correct]
-            or [real_entropy_rate_full]
-        )
+        same_label_rates = [float(r.get("entropy_rate_full", 0.0)) for r in same_label_rollouts] or [real_entropy_rate_full]
         fbar_trend_all = float(np.mean(np.array(all_rates if all_rates else [real_entropy_rate_full], dtype=np.float64)))
         fbar_trend_same_label = float(np.mean(np.array(same_label_rates, dtype=np.float64)))
 
@@ -487,8 +551,20 @@ def main() -> None:
                     normalize_by_continuation_length=True,
                 )
             )
-            sign_trend_same_label = _sign(float(fbar_trend_same_label) - float(f_selected_real_proxy))
-            sign_trend_all = _sign(float(fbar_trend_all) - float(f_selected_real_proxy))
+            fbar_local_all = _group_local_fbar_at_step(
+                rollouts,
+                step_idx=int(step_idx),
+                left_tokens=int(args.local_window_left_tokens),
+                right_tokens=int(args.local_window_right_tokens),
+            )
+            fbar_local_same_label = _group_local_fbar_at_step(
+                same_label_rollouts,
+                step_idx=int(step_idx),
+                left_tokens=int(args.local_window_left_tokens),
+                right_tokens=int(args.local_window_right_tokens),
+            )
+            sign_trend_same_label = _sign(float(fbar_local_same_label) - float(f_selected_real_proxy))
+            sign_trend_all = _sign(float(fbar_local_all) - float(f_selected_real_proxy))
 
             summary_cnt["n_eval_steps"] += 1
             summary_cnt["n_match_steps_trend_same_label"] += int(sign_trend_same_label == sign_mc_real)
@@ -513,8 +589,10 @@ def main() -> None:
                         "f_real_mc_128": float(f_real_mc),
                         "sign_real_mc_128": int(sign_mc_real),
                         "f_selected_real_proxy_rate": float(f_selected_real_proxy),
-                        "f_bar_trend_same_label": float(fbar_trend_same_label),
-                        "f_bar_trend_all": float(fbar_trend_all),
+                        "f_bar_trend_same_label": float(fbar_local_same_label),
+                        "f_bar_trend_all": float(fbar_local_all),
+                        "f_bar_trend_same_label_full_traj": float(fbar_trend_same_label),
+                        "f_bar_trend_all_full_traj": float(fbar_trend_all),
                         "sign_real_trend_same_label": int(sign_trend_same_label),
                         "sign_real_trend_all": int(sign_trend_all),
                         "sign_match_real_trend_same_label": bool(sign_trend_same_label == sign_mc_real),
@@ -622,6 +700,8 @@ def main() -> None:
                 "f_sentence_stop": str(args.f_sentence_stop),
                 "bias_metrics_mode": str(args.bias_metrics_mode),
                 "bucket_group_rollouts": int(args.bucket_group_rollouts),
+                "local_window_left_tokens": int(args.local_window_left_tokens),
+                "local_window_right_tokens": int(args.local_window_right_tokens),
             },
         }
         with open(out_dir / "sign_compare_summary.json", "w", encoding="utf-8") as f:
