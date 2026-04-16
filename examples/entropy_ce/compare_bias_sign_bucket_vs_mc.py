@@ -301,6 +301,12 @@ def main() -> None:
         default=20,
         help="Local f_bar window: number of tokens after sampled point.",
     )
+    parser.add_argument(
+        "--fbar_mode",
+        choices=["single_local", "group_local"],
+        default="single_local",
+        help="How to compute f_bar at each sampled step.",
+    )
 
     parser.add_argument("--save_traces", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
@@ -551,18 +557,28 @@ def main() -> None:
                     normalize_by_continuation_length=True,
                 )
             )
-            fbar_local_all = _group_local_fbar_at_step(
-                rollouts,
-                step_idx=int(step_idx),
-                left_tokens=int(args.local_window_left_tokens),
-                right_tokens=int(args.local_window_right_tokens),
-            )
-            fbar_local_same_label = _group_local_fbar_at_step(
-                same_label_rollouts,
-                step_idx=int(step_idx),
-                left_tokens=int(args.local_window_left_tokens),
-                right_tokens=int(args.local_window_right_tokens),
-            )
+            if str(args.fbar_mode) == "single_local":
+                local_real = _local_entropy_rate_around_step(
+                    entropy_seq,
+                    int(step_idx),
+                    left_tokens=int(args.local_window_left_tokens),
+                    right_tokens=int(args.local_window_right_tokens),
+                )
+                fbar_local_all = float(local_real)
+                fbar_local_same_label = float(local_real)
+            else:
+                fbar_local_all = _group_local_fbar_at_step(
+                    rollouts,
+                    step_idx=int(step_idx),
+                    left_tokens=int(args.local_window_left_tokens),
+                    right_tokens=int(args.local_window_right_tokens),
+                )
+                fbar_local_same_label = _group_local_fbar_at_step(
+                    same_label_rollouts,
+                    step_idx=int(step_idx),
+                    left_tokens=int(args.local_window_left_tokens),
+                    right_tokens=int(args.local_window_right_tokens),
+                )
             sign_trend_same_label = _sign(float(fbar_local_same_label) - float(f_selected_real_proxy))
             sign_trend_all = _sign(float(fbar_local_all) - float(f_selected_real_proxy))
 
@@ -613,6 +629,7 @@ def main() -> None:
             "max_branch_steps": int(args.max_branch_steps),
             "mc_m_samples_ref": int(args.mc_m_samples_ref),
             "bucket_group_rollouts": int(args.bucket_group_rollouts),
+            "fbar_mode": str(args.fbar_mode),
             "real_path_mode": "sampled_from_group",
             "real_rollout_index": int(real_idx),
             "real_rollout_is_correct": bool(real_is_correct),
@@ -702,6 +719,7 @@ def main() -> None:
                 "bucket_group_rollouts": int(args.bucket_group_rollouts),
                 "local_window_left_tokens": int(args.local_window_left_tokens),
                 "local_window_right_tokens": int(args.local_window_right_tokens),
+                "fbar_mode": str(args.fbar_mode),
             },
         }
         with open(out_dir / "sign_compare_summary.json", "w", encoding="utf-8") as f:

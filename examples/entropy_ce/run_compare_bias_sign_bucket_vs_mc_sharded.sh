@@ -37,6 +37,9 @@ BUCKET_GROUP_ROLLOUTS="${BUCKET_GROUP_ROLLOUTS:-16}"
 BUCKET_NUM_BINS="${BUCKET_NUM_BINS:-100}"
 BUCKET_MIN_POINTS_PER_BIN="${BUCKET_MIN_POINTS_PER_BIN:-4}"
 BUCKET_PREFIX_KEY_MODE="${BUCKET_PREFIX_KEY_MODE:-sum}"
+LOCAL_WINDOW_LEFT_TOKENS="${LOCAL_WINDOW_LEFT_TOKENS:-20}"
+LOCAL_WINDOW_RIGHT_TOKENS="${LOCAL_WINDOW_RIGHT_TOKENS:-20}"
+FBAR_MODE="${FBAR_MODE:-single_local}"
 
 SAVE_TRACES="${SAVE_TRACES:-1}"
 NO_PROGRESS="${NO_PROGRESS:-0}"
@@ -107,6 +110,9 @@ for ((r = 0; r < NPROC_PER_NODE; r++)); do
     --bucket_num_bins "${BUCKET_NUM_BINS}" \
     --bucket_min_points_per_bin "${BUCKET_MIN_POINTS_PER_BIN}" \
     --bucket_prefix_key_mode "${BUCKET_PREFIX_KEY_MODE}" \
+    --local_window_left_tokens "${LOCAL_WINDOW_LEFT_TOKENS}" \
+    --local_window_right_tokens "${LOCAL_WINDOW_RIGHT_TOKENS}" \
+    --fbar_mode "${FBAR_MODE}" \
     --vllm_shard_rank "${GLOBAL_RANK}" \
     --vllm_shard_world_size "${WORLD_SIZE}" \
     "${EXTRA_ARGS[@]}" \
