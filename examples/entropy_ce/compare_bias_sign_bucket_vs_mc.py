@@ -22,6 +22,7 @@ from entropy_credit_experiment import (
     init_dist,
     load_data,
     purge_all_torchrun_like_env_for_vllm_standalone,
+    vllm_generate_quiet,
 )
 from infer_topk_f_mc_compare import (
     _ground_truth_from_row,
@@ -119,6 +120,29 @@ def _query_fbar_from_refs_by_prefix_sum(refs: list[dict[str, Any]], prefix_sum_t
     return float(np.mean(np.array(picked_sum, dtype=np.float64))), float(np.mean(np.array(picked_rate, dtype=np.float64))), int(len(picked_sum))
 
 
+def _sample_one_token_vllm(
+    *,
+    llm: Any,
+    prefix_ids: list[int],
+    temperature: float,
+    top_p: float,
+) -> int | None:
+    from vllm import SamplingParams
+    from vllm.inputs import TokensPrompt
+
+    sp = SamplingParams(
+        max_tokens=1,
+        temperature=float(temperature),
+        top_p=float(top_p),
+        logprobs=0,
+    )
+    out = vllm_generate_quiet(llm, [TokensPrompt(prompt_token_ids=prefix_ids)], sp)
+    o = out[0].outputs[0]
+    if not o.token_ids:
+        return None
+    return int(o.token_ids[0])
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Compare real-token bias-sign: bucket estimate vs MC reference."
@@ -138,6 +162,12 @@ def main() -> None:
     parser.add_argument("--mc_m_samples_ref", type=int, default=128, help="MC samples for reference sign.")
     parser.add_argument("--mc_temperature", type=float, default=1.0)
     parser.add_argument("--mc_top_p", type=float, default=0.95)
+    parser.add_argument(
+        "--real_path_mode",
+        choices=["sampling", "greedy"],
+        default="sampling",
+        help="How to generate the real trajectory used for f_real proxy.",
+    )
     parser.add_argument("--bias_metrics_mode", choices=["raw", "length_normalized"], default="length_normalized")
     parser.add_argument("--f_continuation_mode", choices=["full", "first_sentence"], default="first_sentence")
     parser.add_argument("--f_sentence_max_new_tokens", type=int, default=256)
@@ -292,7 +322,7 @@ def main() -> None:
         step_lps_seq: list[dict[int, float]] = []
         step_records: list[dict[str, Any]] = []
 
-        # Pass-1: generate one greedy trajectory and cache per-step logprobs.
+        # Pass-1: generate one trajectory (sampling or greedy) and cache per-step logprobs.
         for step_idx in range(int(args.max_new_tokens)):
             prefix = prompt_ids + response_ids
             greedy_token, step_lp = _step_logprobs_vllm(
@@ -304,10 +334,23 @@ def main() -> None:
                 break
 
             entropy_t = float(entropy_from_logprobs_topk(step_lp))
-            response_ids.append(int(greedy_token))
+            if str(args.real_path_mode) == "sampling":
+                sampled_token = _sample_one_token_vllm(
+                    llm=llm,
+                    prefix_ids=prefix,
+                    temperature=float(args.mc_temperature),
+                    top_p=float(args.mc_top_p),
+                )
+                if sampled_token is None:
+                    break
+                next_token = int(sampled_token)
+            else:
+                next_token = int(greedy_token)
+
+            response_ids.append(int(next_token))
             entropy_seq.append(float(entropy_t))
             step_lps_seq.append(dict(step_lp))
-            if tokenizer.eos_token_id is not None and int(greedy_token) == int(tokenizer.eos_token_id):
+            if tokenizer.eos_token_id is not None and int(next_token) == int(tokenizer.eos_token_id):
                 break
 
         # Precompute realized suffix proxy F_t from greedy trajectory itself.
@@ -452,6 +495,7 @@ def main() -> None:
             "bucket_num_bins": int(args.bucket_num_bins),
             "bucket_min_points_per_bin": int(args.bucket_min_points_per_bin),
             "bucket_prefix_key_mode": str(args.bucket_prefix_key_mode),
+            "real_path_mode": str(args.real_path_mode),
             "num_eval_steps": int(len(step_records)) if bool(args.save_traces) else int(branch_count),
         }
         if bool(args.save_traces):
@@ -529,6 +573,7 @@ def main() -> None:
                 "mc_m_samples_ref": int(args.mc_m_samples_ref),
                 "mc_temperature": float(args.mc_temperature),
                 "mc_top_p": float(args.mc_top_p),
+                "real_path_mode": str(args.real_path_mode),
                 "f_continuation_mode": str(args.f_continuation_mode),
                 "f_sentence_max_new_tokens": int(args.f_sentence_max_new_tokens),
                 "f_sentence_stop": str(args.f_sentence_stop),

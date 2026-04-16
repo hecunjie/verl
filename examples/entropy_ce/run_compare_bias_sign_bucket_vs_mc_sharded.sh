@@ -22,6 +22,7 @@ MAX_BRANCH_STEPS="${MAX_BRANCH_STEPS:-64}"
 MC_M_SAMPLES_REF="${MC_M_SAMPLES_REF:-128}"
 MC_TEMPERATURE="${MC_TEMPERATURE:-1.0}"
 MC_TOP_P="${MC_TOP_P:-0.95}"
+REAL_PATH_MODE="${REAL_PATH_MODE:-sampling}"
 BIAS_METRICS_MODE="${BIAS_METRICS_MODE:-length_normalized}"
 F_CONTINUATION_MODE="${F_CONTINUATION_MODE:-first_sentence}"
 F_SENTENCE_MAX_NEW_TOKENS="${F_SENTENCE_MAX_NEW_TOKENS:-256}"
@@ -93,6 +94,7 @@ for ((r = 0; r < NPROC_PER_NODE; r++)); do
     --mc_m_samples_ref "${MC_M_SAMPLES_REF}" \
     --mc_temperature "${MC_TEMPERATURE}" \
     --mc_top_p "${MC_TOP_P}" \
+    --real_path_mode "${REAL_PATH_MODE}" \
     --bias_metrics_mode "${BIAS_METRICS_MODE}" \
     --f_continuation_mode "${F_CONTINUATION_MODE}" \
     --f_sentence_max_new_tokens "${F_SENTENCE_MAX_NEW_TOKENS}" \

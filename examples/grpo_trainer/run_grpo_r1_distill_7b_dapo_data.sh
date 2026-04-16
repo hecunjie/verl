@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# 标准 GRPO：DeepSeek-R1-Distill-Qwen-7B，DAPO 格式数学数据训练，验证集为 MATH-500 + AIME24。
-# 硬件：单机 8 卡。训练 batch 与 PPO mini-batch 按你的要求固定。
+# 标准 GRPO：Qwen3-4B，尽量对齐 DAPO 公开设定（paper-like）。
+# 硬件：单机 8 卡。若显存紧张，可用环境变量下调。
 #
 # 数据准备说明：
 # 1) 训练集：默认 open-r1/DAPO-Math-17k-Processed（约 17k 条），见 prepare_math_rl_data.py。
@@ -16,10 +16,10 @@ set -euo pipefail
 VERL_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "${VERL_ROOT}"
 
-MODEL_PATH="${MODEL_PATH:-/mnt/tidal-alsh01/dataset/zeus/hecunjie/models/Qwen/DeepSeek-R1-Distill-Qwen-7B}"
+MODEL_PATH="${MODEL_PATH:-/mnt/tidal-alsh01/dataset/zeus/hecunjie/models/Qwen/Qwen3-4B}"
 
 PROJECT_NAME="${PROJECT_NAME:-verl}"
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-dapo_train_math500_aime24_val}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-grpo_qwen3_4b_dapo_public_like}"
 
 # Checkpoint 与训练产物本地目录（trainer.default_local_dir）
 OUTPUT_DIR="${OUTPUT_DIR:-${HOME}/verl_checkpoints/${PROJECT_NAME}/${EXPERIMENT_NAME}}"
@@ -35,6 +35,24 @@ AIME24_VAL="${AIME24_VAL:-${HOME}/data/aime24/test.parquet}"
 
 # Actor 学习率 warmup：占总训练步的比例（对应 optim.lr_warmup_steps_ratio）；设为 0 关闭
 WARM_UP_RATIO="${WARM_UP_RATIO:-0.05}"
+TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-128}"
+GEN_BATCH_SIZE="${GEN_BATCH_SIZE:-128}"
+VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-128}"
+MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-2048}"
+MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-4096}"
+ACTOR_LR="${ACTOR_LR:-1e-6}"
+PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-64}"
+PPO_MICRO_BATCH_SIZE_PER_GPU="${PPO_MICRO_BATCH_SIZE_PER_GPU:-4}"
+PPO_EPOCHS="${PPO_EPOCHS:-1}"
+ROLLOUT_LOGPROB_MB_PER_GPU="${ROLLOUT_LOGPROB_MB_PER_GPU:-16}"
+ROLLOUT_TP_SIZE="${ROLLOUT_TP_SIZE:-2}"
+ROLLOUT_GPU_MEM_UTIL="${ROLLOUT_GPU_MEM_UTIL:-0.6}"
+ROLLOUT_N="${ROLLOUT_N:-16}"
+ROLLOUT_TEMPERATURE="${ROLLOUT_TEMPERATURE:-1.0}"
+REF_LOGPROB_MB_PER_GPU="${REF_LOGPROB_MB_PER_GPU:-16}"
+SAVE_FREQ="${SAVE_FREQ:-50}"
+TEST_FREQ="${TEST_FREQ:-50}"
+TOTAL_EPOCHS="${TOTAL_EPOCHS:-5}"
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
@@ -42,21 +60,21 @@ python3 -m verl.trainer.main_ppo \
     algorithm.use_kl_in_reward=False \
     data.train_files="${TRAIN_FILES}" \
     data.val_files="['${MATH500_VAL}','${AIME24_VAL}']" \
-    data.train_batch_size=256 \
-    data.gen_batch_size=256 \
-    data.val_batch_size=128 \
-    data.max_prompt_length=2048 \
-    data.max_response_length=8192 \
+    data.train_batch_size="${TRAIN_BATCH_SIZE}" \
+    data.gen_batch_size="${GEN_BATCH_SIZE}" \
+    data.val_batch_size="${VAL_BATCH_SIZE}" \
+    data.max_prompt_length="${MAX_PROMPT_LENGTH}" \
+    data.max_response_length="${MAX_RESPONSE_LENGTH}" \
     data.filter_overlong_prompts=True \
     data.truncation=error \
     data.reward_fn_key=data_source \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
-    actor_rollout_ref.actor.optim.lr=1e-6 \
+    actor_rollout_ref.actor.optim.lr="${ACTOR_LR}" \
     actor_rollout_ref.actor.optim.lr_warmup_steps_ratio="${WARM_UP_RATIO}" \
     actor_rollout_ref.model.use_remove_padding=True \
-    actor_rollout_ref.actor.ppo_mini_batch_size=128 \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=16 \
-    actor_rollout_ref.actor.ppo_epochs=1 \
+    actor_rollout_ref.actor.ppo_mini_batch_size="${PPO_MINI_BATCH_SIZE}" \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu="${PPO_MICRO_BATCH_SIZE_PER_GPU}" \
+    actor_rollout_ref.actor.ppo_epochs="${PPO_EPOCHS}" \
     actor_rollout_ref.actor.use_kl_loss=True \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
@@ -64,13 +82,13 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
-    actor_rollout_ref.rollout.tensor_model_parallel_size=2 \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu="${ROLLOUT_LOGPROB_MB_PER_GPU}" \
+    actor_rollout_ref.rollout.tensor_model_parallel_size="${ROLLOUT_TP_SIZE}" \
     actor_rollout_ref.rollout.name=vllm \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
-    actor_rollout_ref.rollout.n=8 \
-    actor_rollout_ref.rollout.temperature=1.0 \
-    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
+    actor_rollout_ref.rollout.gpu_memory_utilization="${ROLLOUT_GPU_MEM_UTIL}" \
+    actor_rollout_ref.rollout.n="${ROLLOUT_N}" \
+    actor_rollout_ref.rollout.temperature="${ROLLOUT_TEMPERATURE}" \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu="${REF_LOGPROB_MB_PER_GPU}" \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb"]' \
@@ -79,7 +97,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.default_local_dir="${OUTPUT_DIR}" \
     trainer.n_gpus_per_node=8 \
     trainer.nnodes=1 \
-    trainer.save_freq=50 \
-    trainer.test_freq=5 \
-    trainer.total_epochs=5 \
+    trainer.save_freq="${SAVE_FREQ}" \
+    trainer.test_freq="${TEST_FREQ}" \
+    trainer.total_epochs="${TOTAL_EPOCHS}" \
     "$@"
