@@ -29,6 +29,7 @@ from entropy_credit_experiment import (
 from infer_topk_f_mc_compare import (
     _candidate_lookahead_1step_entropy,
     _ground_truth_from_row,
+    _step_logprobs_vllm,
     _topp_capped_from_step_logprobs,
 )
 
@@ -172,6 +173,40 @@ def _group_local_fbar_at_step(
     return float(np.mean(np.array(vals, dtype=np.float64))) if vals else 0.0
 
 
+def _candidate_lookahead_2step_entropy(
+    *,
+    llm: Any,
+    prefix_ids: list[int],
+    candidate_token_id: int,
+    logprobs_k: int,
+    candidate_top_p: float,
+    candidate_max_k: int,
+) -> float:
+    """Approximate E[H_{t+2} | prefix, x_t=candidate] via top-p capped analytic expectation."""
+    _, step_lp_next = _step_logprobs_vllm(
+        llm=llm,
+        prefix_ids=prefix_ids + [int(candidate_token_id)],
+        logprobs_k=int(logprobs_k),
+    )
+    next_tokens, next_probs = _topp_capped_from_step_logprobs(
+        step_lp_next,
+        top_p=float(candidate_top_p),
+        max_k=int(candidate_max_k),
+    )
+    if not next_tokens:
+        return 0.0
+    exp_h_nextnext = 0.0
+    for tok, p_tok in zip(next_tokens, next_probs, strict=False):
+        _, step_lp_nextnext = _step_logprobs_vllm(
+            llm=llm,
+            prefix_ids=prefix_ids + [int(candidate_token_id), int(tok)],
+            logprobs_k=int(logprobs_k),
+        )
+        h_nextnext = float(entropy_from_logprobs_topk(step_lp_nextnext))
+        exp_h_nextnext += float(p_tok) * h_nextnext
+    return float(exp_h_nextnext)
+
+
 def _sample_group_rollouts_detailed(
     *,
     llm: Any,
@@ -304,13 +339,15 @@ def main() -> None:
     )
     parser.add_argument(
         "--fbar_mode",
-        choices=["single_local", "group_local", "lookahead_1step"],
+        choices=["single_local", "group_local", "lookahead_1step", "lookahead_2step"],
         default="single_local",
         help=(
             "How to compute f_bar vs f_real proxy at each sampled step: "
             "single_local / group_local use local entropy-rate windows vs continuation F; "
             "lookahead_1step uses weighted next-step entropy H(next|prefix+c) over top-p candidates "
-            "vs the chosen branch's next-step entropy (aligned with MC on sign(f_bar-f_real) semantics)."
+            "vs the chosen branch's next-step entropy; "
+            "lookahead_2step uses weighted expected two-step-ahead entropy "
+            "E[H(next-next)|prefix+c] under top-p capped next-token branching."
         ),
     )
 
@@ -565,6 +602,8 @@ def main() -> None:
             )
             fbar_lookahead_1step: float | None = None
             f_real_lookahead_1step: float | None = None
+            fbar_lookahead_2step: float | None = None
+            f_real_lookahead_2step: float | None = None
             if str(args.fbar_mode) == "lookahead_1step":
                 prefix_before_chosen = prompt_ids + response_ids[:step_idx]
                 h_next_per_cand = [
@@ -585,6 +624,29 @@ def main() -> None:
                 fbar_local_same_label = fbar_la
                 fbar_local_all = fbar_la
                 sign_trend_same_label = _sign(fbar_la - f_real_la)
+                sign_trend_all = sign_trend_same_label
+            elif str(args.fbar_mode) == "lookahead_2step":
+                prefix_before_chosen = prompt_ids + response_ids[:step_idx]
+                h_nextnext_exp_per_cand = [
+                    _candidate_lookahead_2step_entropy(
+                        llm=llm,
+                        prefix_ids=prefix_before_chosen,
+                        candidate_token_id=int(t),
+                        logprobs_k=int(args.vllm_logprobs_topk),
+                        candidate_top_p=float(args.candidate_top_p),
+                        candidate_max_k=int(args.candidate_max_k),
+                    )
+                    for t in cands
+                ]
+                fbar_la2 = float(
+                    sum(float(p) * float(h) for p, h in zip(cand_probs, h_nextnext_exp_per_cand, strict=False))
+                )
+                f_real_la2 = float(h_nextnext_exp_per_cand[chosen_idx])
+                fbar_lookahead_2step = fbar_la2
+                f_real_lookahead_2step = f_real_la2
+                fbar_local_same_label = fbar_la2
+                fbar_local_all = fbar_la2
+                sign_trend_same_label = _sign(fbar_la2 - f_real_la2)
                 sign_trend_all = sign_trend_same_label
             elif str(args.fbar_mode) == "single_local":
                 local_real = _local_entropy_rate_around_step(
@@ -638,6 +700,8 @@ def main() -> None:
                         "f_selected_real_proxy_rate": float(f_selected_real_proxy),
                         "f_bar_lookahead_1step": fbar_lookahead_1step,
                         "f_real_lookahead_1step": f_real_lookahead_1step,
+                        "f_bar_lookahead_2step": fbar_lookahead_2step,
+                        "f_real_lookahead_2step": f_real_lookahead_2step,
                         "f_bar_trend_same_label": float(fbar_local_same_label),
                         "f_bar_trend_all": float(fbar_local_all),
                         "f_bar_trend_same_label_full_traj": float(fbar_trend_same_label),
