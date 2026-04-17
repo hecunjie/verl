@@ -27,6 +27,7 @@ from entropy_credit_experiment import (
     vllm_generate_quiet,
 )
 from infer_topk_f_mc_compare import (
+    _candidate_lookahead_1step_entropy,
     _ground_truth_from_row,
     _topp_capped_from_step_logprobs,
 )
@@ -303,9 +304,14 @@ def main() -> None:
     )
     parser.add_argument(
         "--fbar_mode",
-        choices=["single_local", "group_local"],
+        choices=["single_local", "group_local", "lookahead_1step"],
         default="single_local",
-        help="How to compute f_bar at each sampled step.",
+        help=(
+            "How to compute f_bar vs f_real proxy at each sampled step: "
+            "single_local / group_local use local entropy-rate windows vs continuation F; "
+            "lookahead_1step uses weighted next-step entropy H(next|prefix+c) over top-p candidates "
+            "vs the chosen branch's next-step entropy (aligned with MC on sign(f_bar-f_real) semantics)."
+        ),
     )
 
     parser.add_argument("--save_traces", action=argparse.BooleanOptionalAction, default=True)
@@ -557,7 +563,30 @@ def main() -> None:
                     normalize_by_continuation_length=True,
                 )
             )
-            if str(args.fbar_mode) == "single_local":
+            fbar_lookahead_1step: float | None = None
+            f_real_lookahead_1step: float | None = None
+            if str(args.fbar_mode) == "lookahead_1step":
+                prefix_before_chosen = prompt_ids + response_ids[:step_idx]
+                h_next_per_cand = [
+                    _candidate_lookahead_1step_entropy(
+                        llm=llm,
+                        prefix_ids=prefix_before_chosen,
+                        candidate_token_id=int(t),
+                        logprobs_k=int(args.vllm_logprobs_topk),
+                    )
+                    for t in cands
+                ]
+                fbar_la = float(
+                    sum(float(p) * float(h) for p, h in zip(cand_probs, h_next_per_cand, strict=False))
+                )
+                f_real_la = float(h_next_per_cand[chosen_idx])
+                fbar_lookahead_1step = fbar_la
+                f_real_lookahead_1step = f_real_la
+                fbar_local_same_label = fbar_la
+                fbar_local_all = fbar_la
+                sign_trend_same_label = _sign(fbar_la - f_real_la)
+                sign_trend_all = sign_trend_same_label
+            elif str(args.fbar_mode) == "single_local":
                 local_real = _local_entropy_rate_around_step(
                     entropy_seq,
                     int(step_idx),
@@ -566,6 +595,8 @@ def main() -> None:
                 )
                 fbar_local_all = float(local_real)
                 fbar_local_same_label = float(local_real)
+                sign_trend_same_label = _sign(float(fbar_local_same_label) - float(f_selected_real_proxy))
+                sign_trend_all = _sign(float(fbar_local_all) - float(f_selected_real_proxy))
             else:
                 fbar_local_all = _group_local_fbar_at_step(
                     rollouts,
@@ -579,8 +610,8 @@ def main() -> None:
                     left_tokens=int(args.local_window_left_tokens),
                     right_tokens=int(args.local_window_right_tokens),
                 )
-            sign_trend_same_label = _sign(float(fbar_local_same_label) - float(f_selected_real_proxy))
-            sign_trend_all = _sign(float(fbar_local_all) - float(f_selected_real_proxy))
+                sign_trend_same_label = _sign(float(fbar_local_same_label) - float(f_selected_real_proxy))
+                sign_trend_all = _sign(float(fbar_local_all) - float(f_selected_real_proxy))
 
             summary_cnt["n_eval_steps"] += 1
             summary_cnt["n_match_steps_trend_same_label"] += int(sign_trend_same_label == sign_mc_real)
@@ -605,6 +636,8 @@ def main() -> None:
                         "f_real_mc_128": float(f_real_mc),
                         "sign_real_mc_128": int(sign_mc_real),
                         "f_selected_real_proxy_rate": float(f_selected_real_proxy),
+                        "f_bar_lookahead_1step": fbar_lookahead_1step,
+                        "f_real_lookahead_1step": f_real_lookahead_1step,
                         "f_bar_trend_same_label": float(fbar_local_same_label),
                         "f_bar_trend_all": float(fbar_local_all),
                         "f_bar_trend_same_label_full_traj": float(fbar_trend_same_label),

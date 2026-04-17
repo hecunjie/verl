@@ -311,3 +311,28 @@ LOCAL_WINDOW_RIGHT_TOKENS=20 \
 MATH_EVAL_BACKEND=math_verify \
 PROGRESS_ECHO=1 \
 bash verl/examples/entropy_ce/run_compare_bias_sign_bucket_vs_mc_sharded.sh
+
+# 方案 1：候选 token 上 1-step lookahead 下一步熵 H(next|prefix+c) 作为 f_bar / f_real，与 MC 的 sign(f_bar_mc - f_real_mc) 对齐统计
+MAX_SAMPLES=300 \
+MODEL_PATH=/mnt/tidal-alsh01/dataset/zeus/hecunjie/models/Qwen/Qwen3-4B \
+INPUT_DATA=/mnt/ali-sh-1/dataset/zeus/hecunjie/rl_data/grpo/dapo_math_17k_processed_train.parquet \
+OUTPUT_DIR=/mnt/tidal-alsh01/dataset/zeus/hecunjie/entropy_check/compare_bias_sign_lookahead1step_mc_qwen3_4b \
+NPROC_PER_NODE=8 \
+MAX_NEW_TOKENS=8192 \
+ENTROPY_THRESHOLD=1.0 \
+CANDIDATE_TOP_P=0.95 \
+CANDIDATE_MAX_K=5 \
+MAX_BRANCH_STEPS=64 \
+MC_M_SAMPLES_REF=64 \
+MC_TEMPERATURE=1.0 \
+MC_TOP_P=0.95 \
+F_CONTINUATION_MODE=first_sentence \
+F_SENTENCE_MAX_NEW_TOKENS=128 \
+F_SENTENCE_STOP=simple \
+BUCKET_GROUP_ROLLOUTS=1 \
+FBAR_MODE=lookahead_1step \
+LOCAL_WINDOW_LEFT_TOKENS=20 \
+LOCAL_WINDOW_RIGHT_TOKENS=20 \
+MATH_EVAL_BACKEND=math_verify \
+PROGRESS_ECHO=1 \
+bash verl/examples/entropy_ce/run_compare_bias_sign_bucket_vs_mc_sharded.sh
