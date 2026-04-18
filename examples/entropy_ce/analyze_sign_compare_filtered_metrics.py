@@ -2,8 +2,10 @@
 """从 sign_compare_merged.jsonl 统计「符号一致」在两种过滤下的指标。
 
 约定（与 compare_bias_sign_bucket_vs_mc.py 的 trace 字段一致）：
-- 「准确率」侧：只保留 f_bar_lookahead_2step >= threshold 的 step，再算 match 比例。
-- 「召回」侧：只保留 f_bar_mc_128 >= threshold 的 step，再算 match 比例。
+- 「准确率」侧：保留 f_bar_lookahead_2step >= threshold，且去掉
+  |f_bar_lookahead_2step - f_real_lookahead_2step| < margin_threshold 的 step，再算 match 比例。
+- 「召回」侧：保留 f_bar_mc_128 >= threshold，且去掉
+  |f_bar_mc_128 - f_real_mc_128| < margin_threshold 的 step，再算 match 比例。
 
 说明：这里的「准确率 / 召回」按你给的过滤条件分别定义在**不同子集**上的 match rate；
 二者分母不同，不是同一套二分类的 precision/recall 分解，请在论文里写清定义。
@@ -41,6 +43,40 @@ def _get_match(st: dict[str, Any], use_trend_all: bool) -> bool:
     return bool(st.get(key))
 
 
+def _acc_step_ok(st: dict[str, Any], thr: float, margin_thr: float) -> bool:
+    """准确率子集：f_bar_la2>=thr 且 |f_bar-f_real|>=margin（过滤掉差值过小的 step）。"""
+    fb = st.get("f_bar_lookahead_2step")
+    fr = st.get("f_real_lookahead_2step")
+    if fb is None or fr is None:
+        return False
+    try:
+        fbf, frf = float(fb), float(fr)
+    except (TypeError, ValueError):
+        return False
+    if fbf < thr:
+        return False
+    if abs(fbf - frf) < margin_thr:
+        return False
+    return True
+
+
+def _rec_step_ok(st: dict[str, Any], thr: float, margin_thr: float) -> bool:
+    """召回子集：f_bar_mc>=thr 且 |f_bar_mc-f_real_mc|>=margin。"""
+    fb = st.get("f_bar_mc_128")
+    fr = st.get("f_real_mc_128")
+    if fb is None or fr is None:
+        return False
+    try:
+        fbf, frf = float(fb), float(fr)
+    except (TypeError, ValueError):
+        return False
+    if fbf < thr:
+        return False
+    if abs(fbf - frf) < margin_thr:
+        return False
+    return True
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument(
@@ -49,7 +85,13 @@ def main() -> None:
         required=True,
         help="sign_compare_merged.jsonl（每行一条 prompt 记录，含 trace_sign_compare）",
     )
-    p.add_argument("--threshold", type=float, default=0.1, help="过滤阈值（默认 0.1）")
+    p.add_argument("--threshold", type=float, default=0.1, help="f_bar 下限过滤阈值（默认 0.1）")
+    p.add_argument(
+        "--margin_threshold",
+        type=float,
+        default=0.1,
+        help="|f_bar - f_real| 下限：小于此值的 step 会被排除（默认 0.1）",
+    )
     p.add_argument(
         "--use_trend_all",
         action="store_true",
@@ -59,54 +101,25 @@ def main() -> None:
 
     steps = _iter_steps(args.input)
     thr = float(args.threshold)
+    margin_thr = float(args.margin_threshold)
     use_all = bool(args.use_trend_all)
 
-    # 准确率：过滤 f_bar_lookahead_2step < threshold
-    acc_kept: list[dict[str, Any]] = []
-    for st in steps:
-        v = st.get("f_bar_lookahead_2step")
-        if v is None:
-            continue
-        try:
-            fv = float(v)
-        except (TypeError, ValueError):
-            continue
-        if fv >= thr:
-            acc_kept.append(st)
+    # 准确率：f_bar_la2>=thr 且 |f_bar-f_real|>=margin
+    acc_kept = [st for st in steps if _acc_step_ok(st, thr, margin_thr)]
 
     n_acc = len(acc_kept)
     n_acc_match = sum(1 for st in acc_kept if _get_match(st, use_all))
     acc_rate = float(n_acc_match) / float(n_acc) if n_acc > 0 else float("nan")
 
-    # 召回：过滤 f_bar_mc_128 < threshold
-    rec_kept: list[dict[str, Any]] = []
-    for st in steps:
-        v = st.get("f_bar_mc_128")
-        if v is None:
-            continue
-        try:
-            fv = float(v)
-        except (TypeError, ValueError):
-            continue
-        if fv >= thr:
-            rec_kept.append(st)
+    # 召回：f_bar_mc>=thr 且 |f_bar_mc-f_real_mc|>=margin
+    rec_kept = [st for st in steps if _rec_step_ok(st, thr, margin_thr)]
 
     n_rec = len(rec_kept)
     n_rec_match = sum(1 for st in rec_kept if _get_match(st, use_all))
     rec_rate = float(n_rec_match) / float(n_rec) if n_rec > 0 else float("nan")
 
-    # 交集：同一步同时满足两种过滤（便于对照）
-    both: list[dict[str, Any]] = []
-    for st in steps:
-        la = st.get("f_bar_lookahead_2step")
-        mc = st.get("f_bar_mc_128")
-        if la is None or mc is None:
-            continue
-        try:
-            if float(la) >= thr and float(mc) >= thr:
-                both.append(st)
-        except (TypeError, ValueError):
-            continue
+    # 交集：同时满足准确率侧与召回侧的全部过滤条件
+    both = [st for st in steps if _acc_step_ok(st, thr, margin_thr) and _rec_step_ok(st, thr, margin_thr)]
     n_both = len(both)
     n_both_match = sum(1 for st in both if _get_match(st, use_all))
     both_rate = float(n_both_match) / float(n_both) if n_both > 0 else float("nan")
@@ -114,21 +127,29 @@ def main() -> None:
     report = {
         "input": str(args.input.expanduser().resolve()),
         "threshold": thr,
+        "margin_threshold": margin_thr,
         "use_trend_all": use_all,
         "num_steps_total_in_traces": len(steps),
         "accuracy_side": {
-            "description": "keep steps with f_bar_lookahead_2step >= threshold; then match rate",
+            "description": (
+                "keep steps with f_bar_lookahead_2step >= threshold AND "
+                "|f_bar_lookahead_2step - f_real_lookahead_2step| >= margin_threshold; then match rate"
+            ),
             "n_kept": n_acc,
             "n_match": n_acc_match,
             "rate": acc_rate,
         },
         "recall_side": {
-            "description": "keep steps with f_bar_mc_128 >= threshold; then match rate",
+            "description": (
+                "keep steps with f_bar_mc_128 >= threshold AND "
+                "|f_bar_mc_128 - f_real_mc_128| >= margin_threshold; then match rate"
+            ),
             "n_kept": n_rec,
             "n_match": n_rec_match,
             "rate": rec_rate,
         },
         "intersection_both_filters": {
+            "description": "steps satisfying both accuracy_side and recall_side filter conditions",
             "n_kept": n_both,
             "n_match": n_both_match,
             "rate": both_rate,
