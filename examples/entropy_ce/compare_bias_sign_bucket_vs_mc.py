@@ -298,6 +298,15 @@ def main() -> None:
     parser.add_argument("--max_branch_steps", type=int, default=64, help="<=0 means no cap.")
 
     parser.add_argument("--mc_m_samples_ref", type=int, default=128, help="MC samples for reference sign.")
+    parser.add_argument(
+        "--mc_m_samples_compare",
+        type=int,
+        default=0,
+        help=(
+            "If >0, run a second MC estimate on the same prefixes with this many samples (e.g. 1) "
+            "and record agreement between sign(f_bar-f_real) vs the ref run (--mc_m_samples_ref)."
+        ),
+    )
     parser.add_argument("--mc_temperature", type=float, default=1.0)
     parser.add_argument("--mc_top_p", type=float, default=0.95)
     parser.add_argument(
@@ -374,6 +383,8 @@ def main() -> None:
         raise SystemExit("--vllm_request_batch_chunk must be >=1.")
     if int(args.mc_m_samples_ref) < 1:
         raise SystemExit("--mc_m_samples_ref must be >=1.")
+    if int(args.mc_m_samples_compare) < 0:
+        raise SystemExit("--mc_m_samples_compare must be >=0.")
     if int(args.bucket_group_rollouts) < 1:
         raise SystemExit("--bucket_group_rollouts must be >=1.")
     if int(args.bucket_num_bins) < 2:
@@ -451,6 +462,8 @@ def main() -> None:
         "n_match_steps_trend_all": 0,
         "n_match_steps_if_flip_trend_all": 0,
         "n_skipped_chosen_not_in_candidates": 0,
+        "n_match_sign_mc_compare_vs_ref": 0,
+        "n_eval_steps_mc_compare": 0,
     }
 
     sentence_stop_check = None
@@ -588,6 +601,38 @@ def main() -> None:
             f_real_mc = float(f_mc[chosen_idx])
             sign_mc_real = _sign(fbar_mc - f_real_mc)
 
+            f_mc_compare: list[float] | None = None
+            fbar_mc_compare: float | None = None
+            f_real_mc_compare: float | None = None
+            sign_mc_compare: int | None = None
+            sign_match_mc_compare_vs_ref: bool | None = None
+            if int(args.mc_m_samples_compare) > 0:
+                f_cmp = estimate_F_mc_many_prefixes_vllm(
+                    llm=llm,
+                    prefixes=prefixes,
+                    m_samples=int(args.mc_m_samples_compare),
+                    max_new_tokens=remaining,
+                    temperature=float(args.mc_temperature),
+                    top_p=float(args.mc_top_p),
+                    logprobs_k=int(args.vllm_logprobs_topk),
+                    batch_chunk=int(args.vllm_request_batch_chunk),
+                    f_continuation_mode=str(args.f_continuation_mode),
+                    tokenizer=tokenizer if str(args.f_continuation_mode) == "first_sentence" else None,
+                    f_sentence_max_new_tokens=int(args.f_sentence_max_new_tokens),
+                    sentence_stop_check=sentence_stop_check,
+                    normalize_by_continuation_length=(str(args.bias_metrics_mode) == "length_normalized"),
+                )
+                if len(f_cmp) == len(cands):
+                    f_mc_compare = [float(x) for x in f_cmp]
+                    fbar_mc_compare = float(
+                        sum(float(p) * float(v) for p, v in zip(cand_probs, f_cmp, strict=False))
+                    )
+                    f_real_mc_compare = float(f_cmp[chosen_idx])
+                    sign_mc_compare = _sign(float(fbar_mc_compare) - float(f_real_mc_compare))
+                    sign_match_mc_compare_vs_ref = bool(int(sign_mc_compare) == int(sign_mc_real))
+                    summary_cnt["n_eval_steps_mc_compare"] += 1
+                    summary_cnt["n_match_sign_mc_compare_vs_ref"] += int(sign_match_mc_compare_vs_ref)
+
             suffix_gen_ids = [int(t) for t in response_ids[step_idx + 1 :]]
             suffix_step_lps = [dict(d) for d in step_lps_seq[step_idx + 1 :]]
             f_selected_real_proxy = float(
@@ -697,6 +742,15 @@ def main() -> None:
                         "f_bar_mc_128": float(fbar_mc),
                         "f_real_mc_128": float(f_real_mc),
                         "sign_real_mc_128": int(sign_mc_real),
+                        "mc_m_samples_ref": int(args.mc_m_samples_ref),
+                        "f_mc_compare": f_mc_compare,
+                        "f_bar_mc_compare": fbar_mc_compare,
+                        "f_real_mc_compare": f_real_mc_compare,
+                        "sign_mc_compare": sign_mc_compare,
+                        "mc_m_samples_compare": int(args.mc_m_samples_compare)
+                        if int(args.mc_m_samples_compare) > 0
+                        else None,
+                        "sign_match_mc_compare_vs_ref": sign_match_mc_compare_vs_ref,
                         "f_selected_real_proxy_rate": float(f_selected_real_proxy),
                         "f_bar_lookahead_1step": fbar_lookahead_1step,
                         "f_real_lookahead_1step": f_real_lookahead_1step,
@@ -725,6 +779,7 @@ def main() -> None:
             "max_new_tokens": int(args.max_new_tokens),
             "max_branch_steps": int(args.max_branch_steps),
             "mc_m_samples_ref": int(args.mc_m_samples_ref),
+            "mc_m_samples_compare": int(args.mc_m_samples_compare),
             "bucket_group_rollouts": int(args.bucket_group_rollouts),
             "fbar_mode": str(args.fbar_mode),
             "real_path_mode": "sampled_from_group",
@@ -780,6 +835,11 @@ def main() -> None:
         summary = {
             "num_prompts": int(total["n_prompts"]),
             "num_eval_steps": int(total["n_eval_steps"]),
+            "mc_sign_compare_vs_ref_agreement": (
+                _mean_ratio(int(total["n_match_sign_mc_compare_vs_ref"]), int(total["n_eval_steps_mc_compare"]))
+                if int(args.mc_m_samples_compare) > 0
+                else float("nan")
+            ),
             "real_sign_match_acc_all_trend_same_label": (
                 _mean_ratio(int(total["n_match_steps_trend_same_label"]), int(total["n_eval_steps"]))
             ),
@@ -806,6 +866,7 @@ def main() -> None:
                 "max_new_tokens": int(args.max_new_tokens),
                 "max_branch_steps": int(args.max_branch_steps),
                 "mc_m_samples_ref": int(args.mc_m_samples_ref),
+                "mc_m_samples_compare": int(args.mc_m_samples_compare),
                 "mc_temperature": float(args.mc_temperature),
                 "mc_top_p": float(args.mc_top_p),
                 "real_path_mode": str(args.real_path_mode),

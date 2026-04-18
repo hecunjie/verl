@@ -20,6 +20,7 @@ CANDIDATE_MAX_K="${CANDIDATE_MAX_K:-5}"
 MAX_BRANCH_STEPS="${MAX_BRANCH_STEPS:-64}"
 
 MC_M_SAMPLES_REF="${MC_M_SAMPLES_REF:-128}"
+MC_M_SAMPLES_COMPARE="${MC_M_SAMPLES_COMPARE:-0}"
 MC_TEMPERATURE="${MC_TEMPERATURE:-1.0}"
 MC_TOP_P="${MC_TOP_P:-0.95}"
 REAL_PATH_MODE="${REAL_PATH_MODE:-sampling}"
@@ -95,6 +96,7 @@ for ((r = 0; r < NPROC_PER_NODE; r++)); do
     --candidate_max_k "${CANDIDATE_MAX_K}" \
     --max_branch_steps "${MAX_BRANCH_STEPS}" \
     --mc_m_samples_ref "${MC_M_SAMPLES_REF}" \
+    --mc_m_samples_compare "${MC_M_SAMPLES_COMPARE}" \
     --mc_temperature "${MC_TEMPERATURE}" \
     --mc_top_p "${MC_TOP_P}" \
     --real_path_mode "${REAL_PATH_MODE}" \
