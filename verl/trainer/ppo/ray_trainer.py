@@ -686,6 +686,9 @@ class RayPPOTrainer:
             sample_gts.extend(ground_truths)
 
             test_gen_batch = self._get_gen_batch(test_batch)
+            # Per-row flag for agent-loop reward kwargs (async rollout); sync val_reward_fn uses meta_info on DataProto.
+            if self.async_rollout_mode:
+                test_gen_batch.non_tensor_batch["validate"] = np.full(len(test_gen_batch), True, dtype=bool)
             test_gen_batch.meta_info = {
                 "eos_token_id": self.tokenizer.eos_token_id,
                 "pad_token_id": self.tokenizer.pad_token_id,

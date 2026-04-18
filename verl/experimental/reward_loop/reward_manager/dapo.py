@@ -14,6 +14,8 @@
 
 import inspect
 
+import numpy as np
+
 from verl import DataProto
 from verl.experimental.reward_loop.reward_manager import register
 from verl.experimental.reward_loop.reward_manager.base import RewardManagerBase
@@ -54,7 +56,12 @@ class DAPORewardManager(RewardManagerBase):
 
         data_source = data_item.non_tensor_batch["data_source"]
         ground_truth = data_item.non_tensor_batch["reward_model"]["ground_truth"]
-        extra_info = data_item.non_tensor_batch.get("extra_info", {})
+        _raw_extra = data_item.non_tensor_batch.get("extra_info", {}) or {}
+        extra_info = dict(_raw_extra)
+        if "validate" in data_item.non_tensor_batch:
+            extra_info["validate"] = bool(np.asarray(data_item.non_tensor_batch["validate"]).reshape(-1)[0])
+        else:
+            extra_info["validate"] = bool(data_item.meta_info.get("validate", False))
 
         response_str = await self.loop.run_in_executor(
             None, lambda: self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)

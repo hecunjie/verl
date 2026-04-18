@@ -76,7 +76,9 @@ class NaiveRewardManager(AbstractRewardManager):
 
             ground_truth = data_item.non_tensor_batch["reward_model"]["ground_truth"]
             data_source = data_item.non_tensor_batch[self.reward_fn_key]
-            extra_info = data_item.non_tensor_batch.get("extra_info", {})
+            _extra = data_item.non_tensor_batch.get("extra_info", {}) or {}
+            extra_info = dict(_extra)
+            extra_info["validate"] = bool(data_item.meta_info.get("validate", False))
             num_turns = data_item.non_tensor_batch.get("__num_turns__", None)
             rollout_reward_scores = data_item.non_tensor_batch.get("reward_scores", {})
             extra_info["num_turns"] = num_turns

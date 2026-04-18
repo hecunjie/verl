@@ -15,6 +15,7 @@
 import inspect
 import itertools
 
+import numpy as np
 import ray
 
 from verl import DataProto
@@ -82,10 +83,15 @@ class RemoteRewardManager(RewardManagerBase):
 
         data_source = data_item.non_tensor_batch["data_source"]
         ground_truth = data_item.non_tensor_batch["reward_model"]["ground_truth"]
-        extra_info = data_item.non_tensor_batch.get("extra_info", {})
+        _raw_extra = data_item.non_tensor_batch.get("extra_info", {}) or {}
+        extra_info = dict(_raw_extra)
         tool_extra_fields = data_item.non_tensor_batch.get("tool_extra_fields", None)
         if tool_extra_fields is not None:
             extra_info.update(tool_extra_fields.items())
+        if "validate" in data_item.non_tensor_batch:
+            extra_info["validate"] = bool(np.asarray(data_item.non_tensor_batch["validate"]).reshape(-1)[0])
+        else:
+            extra_info["validate"] = bool(data_item.meta_info.get("validate", False))
 
         num_turns = data_item.non_tensor_batch.get("__num_turns__", None)
         rollout_reward_scores = data_item.non_tensor_batch.get("reward_scores", {})
