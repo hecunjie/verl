@@ -67,6 +67,14 @@ if wandb_key:
 runtime_env = {
   "working_dir": os.getcwd(),
   "env_vars": env_vars,
+  # Avoid uploading large or irrelevant local artifacts into Ray runtime_env package.
+  "excludes": [
+    "wandb/**",
+    "outputs/**",
+    ".git/**",
+    "**/__pycache__/**",
+    "*.pyc",
+  ],
 }
 print(json.dumps(runtime_env, ensure_ascii=False))
 PY
