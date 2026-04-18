@@ -2,8 +2,11 @@
 """从 sign_compare_merged.jsonl 统计「符号一致」在两种过滤下的指标。
 
 约定（与 compare_bias_sign_bucket_vs_mc.py 的 trace 字段一致）：
-- 「准确率」侧：保留 f_bar_lookahead_2step >= threshold，且去掉
-  |f_bar_lookahead_2step - f_real_lookahead_2step| < margin_threshold 的 step，再算 match 比例。
+- 「准确率」侧（两种 lookahead 并行统计）：
+  - lookahead_1step：f_bar_lookahead_1step >= threshold，且去掉
+    |f_bar_lookahead_1step - f_real_lookahead_1step| < margin_threshold；
+  - lookahead_2step：f_bar_lookahead_2step >= threshold，且去掉
+    |f_bar_lookahead_2step - f_real_lookahead_2step| < margin_threshold。
 - 「召回」侧：保留 f_bar_mc_128 >= threshold，且去掉
   |f_bar_mc_128 - f_real_mc_128| < margin_threshold 的 step，再算 match 比例。
 
@@ -43,8 +46,25 @@ def _get_match(st: dict[str, Any], use_trend_all: bool) -> bool:
     return bool(st.get(key))
 
 
-def _acc_step_ok(st: dict[str, Any], thr: float, margin_thr: float) -> bool:
-    """准确率子集：f_bar_la2>=thr 且 |f_bar-f_real|>=margin（过滤掉差值过小的 step）。"""
+def _acc_step_ok_1step(st: dict[str, Any], thr: float, margin_thr: float) -> bool:
+    """准确率子集（1-step）：f_bar_la1>=thr 且 |f_bar-f_real|>=margin。"""
+    fb = st.get("f_bar_lookahead_1step")
+    fr = st.get("f_real_lookahead_1step")
+    if fb is None or fr is None:
+        return False
+    try:
+        fbf, frf = float(fb), float(fr)
+    except (TypeError, ValueError):
+        return False
+    if fbf < thr:
+        return False
+    if abs(fbf - frf) < margin_thr:
+        return False
+    return True
+
+
+def _acc_step_ok_2step(st: dict[str, Any], thr: float, margin_thr: float) -> bool:
+    """准确率子集（2-step）：f_bar_la2>=thr 且 |f_bar-f_real|>=margin。"""
     fb = st.get("f_bar_lookahead_2step")
     fr = st.get("f_real_lookahead_2step")
     if fb is None or fr is None:
@@ -104,8 +124,14 @@ def main() -> None:
     margin_thr = float(args.margin_threshold)
     use_all = bool(args.use_trend_all)
 
-    # 准确率：f_bar_la2>=thr 且 |f_bar-f_real|>=margin
-    acc_kept = [st for st in steps if _acc_step_ok(st, thr, margin_thr)]
+    # 准确率（1-step）
+    acc1_kept = [st for st in steps if _acc_step_ok_1step(st, thr, margin_thr)]
+    n_acc1 = len(acc1_kept)
+    n_acc1_match = sum(1 for st in acc1_kept if _get_match(st, use_all))
+    acc1_rate = float(n_acc1_match) / float(n_acc1) if n_acc1 > 0 else float("nan")
+
+    # 准确率（2-step）
+    acc_kept = [st for st in steps if _acc_step_ok_2step(st, thr, margin_thr)]
 
     n_acc = len(acc_kept)
     n_acc_match = sum(1 for st in acc_kept if _get_match(st, use_all))
@@ -118,8 +144,14 @@ def main() -> None:
     n_rec_match = sum(1 for st in rec_kept if _get_match(st, use_all))
     rec_rate = float(n_rec_match) / float(n_rec) if n_rec > 0 else float("nan")
 
-    # 交集：同时满足准确率侧与召回侧的全部过滤条件
-    both = [st for st in steps if _acc_step_ok(st, thr, margin_thr) and _rec_step_ok(st, thr, margin_thr)]
+    # 交集：lookahead_1step 准确率条件 ∧ 召回条件
+    both1 = [st for st in steps if _acc_step_ok_1step(st, thr, margin_thr) and _rec_step_ok(st, thr, margin_thr)]
+    n_both1 = len(both1)
+    n_both1_match = sum(1 for st in both1 if _get_match(st, use_all))
+    both1_rate = float(n_both1_match) / float(n_both1) if n_both1 > 0 else float("nan")
+
+    # 交集：lookahead_2step 准确率条件 ∧ 召回条件
+    both = [st for st in steps if _acc_step_ok_2step(st, thr, margin_thr) and _rec_step_ok(st, thr, margin_thr)]
     n_both = len(both)
     n_both_match = sum(1 for st in both if _get_match(st, use_all))
     both_rate = float(n_both_match) / float(n_both) if n_both > 0 else float("nan")
@@ -130,10 +162,28 @@ def main() -> None:
         "margin_threshold": margin_thr,
         "use_trend_all": use_all,
         "num_steps_total_in_traces": len(steps),
-        "accuracy_side": {
+        "accuracy_side_lookahead_1step": {
+            "description": (
+                "keep steps with f_bar_lookahead_1step >= threshold AND "
+                "|f_bar_lookahead_1step - f_real_lookahead_1step| >= margin_threshold; then match rate"
+            ),
+            "n_kept": n_acc1,
+            "n_match": n_acc1_match,
+            "rate": acc1_rate,
+        },
+        "accuracy_side_lookahead_2step": {
             "description": (
                 "keep steps with f_bar_lookahead_2step >= threshold AND "
                 "|f_bar_lookahead_2step - f_real_lookahead_2step| >= margin_threshold; then match rate"
+            ),
+            "n_kept": n_acc,
+            "n_match": n_acc_match,
+            "rate": acc_rate,
+        },
+        "accuracy_side": {
+            "description": (
+                "alias of accuracy_side_lookahead_2step for backward compatibility "
+                "(same as f_bar_lookahead_2step branch)"
             ),
             "n_kept": n_acc,
             "n_match": n_acc_match,
@@ -148,8 +198,22 @@ def main() -> None:
             "n_match": n_rec_match,
             "rate": rec_rate,
         },
+        "intersection_both_filters_lookahead_1step": {
+            "description": "1step accuracy filters AND recall_side filters",
+            "n_kept": n_both1,
+            "n_match": n_both1_match,
+            "rate": both1_rate,
+        },
+        "intersection_both_filters_lookahead_2step": {
+            "description": "2step accuracy filters AND recall_side filters",
+            "n_kept": n_both,
+            "n_match": n_both_match,
+            "rate": both_rate,
+        },
         "intersection_both_filters": {
-            "description": "steps satisfying both accuracy_side and recall_side filter conditions",
+            "description": (
+                "alias of intersection_both_filters_lookahead_2step for backward compatibility"
+            ),
             "n_kept": n_both,
             "n_match": n_both_match,
             "rate": both_rate,
