@@ -62,6 +62,10 @@ REF_LOGPROB_MB_PER_GPU="${REF_LOGPROB_MB_PER_GPU:-16}"
 SAVE_FREQ="${SAVE_FREQ:-50}"
 TEST_FREQ="${TEST_FREQ:-50}"
 TOTAL_EPOCHS="${TOTAL_EPOCHS:-5}"
+VAL_N="${VAL_N:-32}"
+VAL_DO_SAMPLE="${VAL_DO_SAMPLE:-true}"
+VAL_TEMPERATURE="${VAL_TEMPERATURE:-1.0}"
+VAL_TOP_P="${VAL_TOP_P:-0.95}"
 ROLLOUT_DATA_DIR="${ROLLOUT_DATA_DIR:-${OUTPUT_DIR}/rollout_data}"
 VALIDATION_DATA_DIR="${VALIDATION_DATA_DIR:-${OUTPUT_DIR}/validation_data}"
 
@@ -111,6 +115,10 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.gpu_memory_utilization="${ROLLOUT_GPU_MEM_UTIL}" \
     actor_rollout_ref.rollout.n="${ROLLOUT_N}" \
     actor_rollout_ref.rollout.temperature="${ROLLOUT_TEMPERATURE}" \
+    actor_rollout_ref.rollout.val_kwargs.n="${VAL_N}" \
+    actor_rollout_ref.rollout.val_kwargs.do_sample="${VAL_DO_SAMPLE}" \
+    actor_rollout_ref.rollout.val_kwargs.temperature="${VAL_TEMPERATURE}" \
+    actor_rollout_ref.rollout.val_kwargs.top_p="${VAL_TOP_P}" \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu="${REF_LOGPROB_MB_PER_GPU}" \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     trainer.critic_warmup=0 \

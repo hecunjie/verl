@@ -35,6 +35,10 @@ if [ "${USE_MATH_VERIFY_VAL}" = "1" ]; then
 fi
 
 WARM_UP_RATIO="${WARM_UP_RATIO:-0.05}"
+VAL_N="${VAL_N:-32}"
+VAL_DO_SAMPLE="${VAL_DO_SAMPLE:-true}"
+VAL_TEMPERATURE="${VAL_TEMPERATURE:-1.0}"
+VAL_TOP_P="${VAL_TOP_P:-0.95}"
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=gtpo \
@@ -74,6 +78,10 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
     actor_rollout_ref.rollout.n=8 \
     actor_rollout_ref.rollout.temperature=1.0 \
+    actor_rollout_ref.rollout.val_kwargs.n="${VAL_N}" \
+    actor_rollout_ref.rollout.val_kwargs.do_sample="${VAL_DO_SAMPLE}" \
+    actor_rollout_ref.rollout.val_kwargs.temperature="${VAL_TEMPERATURE}" \
+    actor_rollout_ref.rollout.val_kwargs.top_p="${VAL_TOP_P}" \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     trainer.critic_warmup=0 \
