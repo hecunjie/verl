@@ -32,6 +32,15 @@ TRAIN_FILES="${TRAIN_FILES:-${HOME}/data/math_rl/dapo_math_17k_processed_train.p
 # 验证：两个测试集（OmegaConf 列表字符串）
 MATH500_VAL="${MATH500_VAL:-${HOME}/data/math500/test.parquet}"
 AIME24_VAL="${AIME24_VAL:-${HOME}/data/aime24/test.parquet}"
+USE_MATH_VERIFY_VAL="${USE_MATH_VERIFY_VAL:-1}"
+CUSTOM_REWARD_FUNCTION_PATH="${CUSTOM_REWARD_FUNCTION_PATH:-${VERL_ROOT}/examples/grpo_trainer/math_verify_val_reward.py}"
+
+CUSTOM_REWARD_ARGS=()
+if [ "${USE_MATH_VERIFY_VAL}" = "1" ]; then
+  CUSTOM_REWARD_ARGS+=("custom_reward_function.path=${CUSTOM_REWARD_FUNCTION_PATH}")
+  CUSTOM_REWARD_ARGS+=("custom_reward_function.name=compute_score")
+  echo "Validation scorer routing enabled: ${CUSTOM_REWARD_FUNCTION_PATH}"
+fi
 
 # Actor 学习率 warmup：占总训练步的比例（对应 optim.lr_warmup_steps_ratio）；设为 0 关闭
 WARM_UP_RATIO="${WARM_UP_RATIO:-0.05}"
@@ -53,6 +62,20 @@ REF_LOGPROB_MB_PER_GPU="${REF_LOGPROB_MB_PER_GPU:-16}"
 SAVE_FREQ="${SAVE_FREQ:-50}"
 TEST_FREQ="${TEST_FREQ:-50}"
 TOTAL_EPOCHS="${TOTAL_EPOCHS:-5}"
+ROLLOUT_DATA_DIR="${ROLLOUT_DATA_DIR:-${OUTPUT_DIR}/rollout_data}"
+VALIDATION_DATA_DIR="${VALIDATION_DATA_DIR:-${OUTPUT_DIR}/validation_data}"
+
+DUMP_ARGS=()
+if [ -n "${ROLLOUT_DATA_DIR}" ]; then
+  mkdir -p "${ROLLOUT_DATA_DIR}"
+  DUMP_ARGS+=("trainer.rollout_data_dir=${ROLLOUT_DATA_DIR}")
+  echo "Rollout data dump enabled: ${ROLLOUT_DATA_DIR}"
+fi
+if [ -n "${VALIDATION_DATA_DIR}" ]; then
+  mkdir -p "${VALIDATION_DATA_DIR}"
+  DUMP_ARGS+=("trainer.validation_data_dir=${VALIDATION_DATA_DIR}")
+  echo "Validation generations dump enabled: ${VALIDATION_DATA_DIR}"
+fi
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
@@ -100,4 +123,6 @@ python3 -m verl.trainer.main_ppo \
     trainer.save_freq="${SAVE_FREQ}" \
     trainer.test_freq="${TEST_FREQ}" \
     trainer.total_epochs="${TOTAL_EPOCHS}" \
+    "${CUSTOM_REWARD_ARGS[@]}" \
+    "${DUMP_ARGS[@]}" \
     "$@"

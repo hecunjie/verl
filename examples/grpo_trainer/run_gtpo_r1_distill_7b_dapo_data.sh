@@ -24,6 +24,15 @@ echo "Checkpoint / trainer output dir: ${OUTPUT_DIR}"
 TRAIN_FILES="${TRAIN_FILES:-${HOME}/data/math_rl/dapo_math_17k_processed_train.parquet}"
 MATH500_VAL="${MATH500_VAL:-${HOME}/data/math500/test.parquet}"
 AIME24_VAL="${AIME24_VAL:-${HOME}/data/aime24/test.parquet}"
+USE_MATH_VERIFY_VAL="${USE_MATH_VERIFY_VAL:-1}"
+CUSTOM_REWARD_FUNCTION_PATH="${CUSTOM_REWARD_FUNCTION_PATH:-${VERL_ROOT}/examples/grpo_trainer/math_verify_val_reward.py}"
+
+CUSTOM_REWARD_ARGS=()
+if [ "${USE_MATH_VERIFY_VAL}" = "1" ]; then
+  CUSTOM_REWARD_ARGS+=("custom_reward_function.path=${CUSTOM_REWARD_FUNCTION_PATH}")
+  CUSTOM_REWARD_ARGS+=("custom_reward_function.name=compute_score")
+  echo "Validation scorer routing enabled: ${CUSTOM_REWARD_FUNCTION_PATH}"
+fi
 
 WARM_UP_RATIO="${WARM_UP_RATIO:-0.05}"
 
@@ -77,4 +86,5 @@ python3 -m verl.trainer.main_ppo \
     trainer.save_freq=50 \
     trainer.test_freq=50 \
     trainer.total_epochs=5 \
+    "${CUSTOM_REWARD_ARGS[@]}" \
     "$@"

@@ -13,6 +13,15 @@ cd "${VERL_ROOT}"
 TRAIN_PARQUET="${TRAIN_PARQUET:-${HOME}/data/dapo_math/train.parquet}"
 TEST_PARQUET="${TEST_PARQUET:-${HOME}/data/dapo_math/test.parquet}"
 MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3-8B}"
+USE_MATH_VERIFY_VAL="${USE_MATH_VERIFY_VAL:-1}"
+CUSTOM_REWARD_FUNCTION_PATH="${CUSTOM_REWARD_FUNCTION_PATH:-${VERL_ROOT}/examples/grpo_trainer/math_verify_val_reward.py}"
+
+CUSTOM_REWARD_ARGS=()
+if [ "${USE_MATH_VERIFY_VAL}" = "1" ]; then
+  CUSTOM_REWARD_ARGS+=("custom_reward_function.path=${CUSTOM_REWARD_FUNCTION_PATH}")
+  CUSTOM_REWARD_ARGS+=("custom_reward_function.name=compute_score")
+  echo "Validation scorer routing enabled: ${CUSTOM_REWARD_FUNCTION_PATH}"
+fi
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
@@ -65,4 +74,5 @@ python3 -m verl.trainer.main_ppo \
     trainer.save_freq=20 \
     trainer.test_freq=5 \
     trainer.total_epochs=15 \
+    "${CUSTOM_REWARD_ARGS[@]}" \
     "$@"
