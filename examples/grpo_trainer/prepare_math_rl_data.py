@@ -4,7 +4,7 @@
 **默认训练集**：[`open-r1/DAPO-Math-17k-Processed`](https://huggingface.co/datasets/open-r1/DAPO-Math-17k-Processed)
 （约 1.7 万条，与 DAPO 论文规模一致）。训练样本会统一为 DAPO prompt 指引格式（末行要求 ``Answer: \\boxed{...}``），并将 ``label`` 写入 ``reward_model.ground_truth``。
 
-**测试集**：MATH-500、AIME 2024、GPQA-D（diamond）。
+**测试集**：MATH-500、AIME 2024、AIME 2025、GPQA-D（diamond）。
 其中前两者题干用与上述数据集 **相同** 的 user 文案模板包裹（含 ``\\boxed`` 与末尾 ``Remember to put...``）；
 GPQA-D 会转为四选一格式（末行 ``Answer: X``，X∈{A,B,C,D}）。
 另外新增常见数学测试集：GSM8K（test）、MATH-lighteval（test），同样统一为 DAPO 风格 prompt。
@@ -21,6 +21,7 @@ GPQA-D 会转为四选一格式（末行 ``Answer: X``，X∈{A,B,C,D}）。
   - dapo_math_17k_processed_train.parquet  # 默认：Processed 训练（或 byted 时为 dapo_math_byted_train.parquet）
   - math500_test.parquet
   - aime2024_test.parquet
+  - aime2025_test.parquet
   - gsm8k_test.parquet
   - math_lighteval_test.parquet
   - math_hard_test.parquet
@@ -275,6 +276,25 @@ def iter_aime24_test():
             _gt(a),
             "aime2024",
             extra_info={"index": idx, "split": "aime2024", "source_id": ex.get("id", str(idx))},
+        )
+
+
+def iter_aime25_test():
+    raw = load_dataset("math-ai/aime25")
+    ds = _pick_split(raw) if isinstance(raw, DatasetDict) else raw
+    for idx in range(len(ds)):
+        ex = ds[idx]
+        p = ex.get("problem") or ex.get("question")
+        if p is None:
+            raise KeyError(f"AIME25 idx={idx} keys={list(ex.keys())}")
+        a = ex.get("answer")
+        if a is None:
+            raise KeyError(f"AIME25 idx={idx} no answer")
+        yield _row(
+            _user_content_dapo_processed(str(p).strip()),
+            _gt(a),
+            "aime2025",
+            extra_info={"index": idx, "split": "aime2025", "source_id": ex.get("id", str(idx))},
         )
 
 
@@ -691,6 +711,7 @@ def main():
 
     f_m500 = os.path.join(out, "math500_test.parquet")
     f_aime = os.path.join(out, "aime2024_test.parquet")
+    f_aime25 = os.path.join(out, "aime2025_test.parquet")
     f_gsm8k = os.path.join(out, "gsm8k_test.parquet")
     f_math_lighteval = os.path.join(out, "math_lighteval_test.parquet")
     f_math_hard = os.path.join(out, "math_hard_test.parquet")
@@ -704,7 +725,11 @@ def main():
     n3 = _write_parquet(f_aime, iter_aime24_test)
     print(f"    -> {n3} rows, {f_aime}")
 
-    val_files = [f_m500, f_aime]
+    print("4/5 AIME 2025 (test, 同上) ...")
+    n3b = _write_parquet(f_aime25, iter_aime25_test)
+    print(f"    -> {n3b} rows, {f_aime25}")
+
+    val_files = [f_m500, f_aime, f_aime25]
 
     if bool(args.include_extra_math_tests):
         print("4/6 GSM8K (test, 同款 prompt) ...")
