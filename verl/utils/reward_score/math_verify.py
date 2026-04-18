@@ -31,9 +31,41 @@ def compute_score(model_output: str, ground_truth: str, timeout_score: float = 0
     ground_truth_boxed = "\\boxed{" + ground_truth + "}"
     try:
         ret_score, _ = verify_func([ground_truth_boxed], [model_output])
-    except Exception:
-        pass
     except TimeoutException:
         ret_score = timeout_score
+    except Exception:
+        pass
 
     return ret_score
+
+
+def compute_score_with_pred(
+    model_output: str, ground_truth: str, timeout_score: float = 0
+) -> tuple[float, str | None]:
+    """Same scoring as ``compute_score``, plus the extracted prediction string from Math-Verify.
+
+    The second return of ``math_metric`` is ``(golds, preds)`` flattened string lists; we surface
+    ``preds`` (joined if multiple) as the prediction text used for verification.
+    """
+    verify_func = math_metric(
+        gold_extraction_target=(LatexExtractionConfig(),),
+        pred_extraction_target=(ExprExtractionConfig(), LatexExtractionConfig()),
+    )
+    ret_score = 0.0
+    str_preds: tuple[list[str], list[str]] | None = None
+
+    ground_truth_boxed = "\\boxed{" + ground_truth + "}"
+    try:
+        ret_score, str_preds = verify_func([ground_truth_boxed], [model_output])
+    except TimeoutException:
+        ret_score = timeout_score
+    except Exception:
+        pass
+
+    pred_str: str | None = None
+    if str_preds is not None:
+        _golds, preds = str_preds
+        if preds:
+            pred_str = ", ".join(preds) if len(preds) > 1 else preds[0]
+
+    return ret_score, pred_str

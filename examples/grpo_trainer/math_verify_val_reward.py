@@ -62,7 +62,8 @@ def _score_math_verify(solution_str: str, ground_truth: str) -> dict[str, Any]:
         }
 
     try:
-        score = float(math_verify.compute_score(solution_str, ground_truth))
+        score, pred = math_verify.compute_score_with_pred(solution_str, ground_truth)
+        score = float(score)
     except Exception as e:
         return {
             "score": 0.0,
@@ -77,7 +78,7 @@ def _score_math_verify(solution_str: str, ground_truth: str) -> dict[str, Any]:
     return {
         "score": score,
         "acc": bool(score > 0.5),
-        "pred": None,
+        "pred": pred,
         "format_score": 0.0,
         "from_boxed": False,
         "backend": "math_verify",

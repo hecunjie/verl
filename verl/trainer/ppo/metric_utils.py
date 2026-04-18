@@ -582,6 +582,20 @@ def process_validation_metrics(
     # 3. cache metric results
     data_src2uid2var2metric = {}
 
+    def _can_take_numeric_mean(var_vals: list[Any]) -> bool:
+        """True if all entries are numeric (no None / str); used for mean/std/bootstrap."""
+        if not var_vals:
+            return False
+        for v in var_vals:
+            if v is None or isinstance(v, str):
+                return False
+            if isinstance(v, bool | np.bool_):
+                continue
+            if isinstance(v, int | float | np.integer | np.floating):
+                continue
+            return False
+        return True
+
     # 4. flatten loop
     for data_source, uid2var2vals in data_src2uid2var2vals.items():
         # create uid dict
@@ -589,12 +603,21 @@ def process_validation_metrics(
 
         for uid, var2vals in uid2var2vals.items():
             pred_vals = var2vals.get("pred")
-            has_pred = pred_vals is not None
+            # maj@* needs categorical preds (strings); math_verify etc. may leave pred as None — skip maj in that case
+            has_pred = (
+                pred_vals is not None
+                and len(pred_vals) > 0
+                and isinstance(pred_vals[0], str)
+            )
             var_dict = uid_dict.setdefault(uid, {})
 
             for var_name, var_vals in var2vals.items():
-                # skip empty or string values
-                if not var_vals or isinstance(var_vals[0], str):
+                # skip empty, non-numeric lists (e.g. pred=None from math_verify), or all-string preds handled below
+                if not var_vals:
+                    continue
+                if isinstance(var_vals[0], str):
+                    continue
+                if not _can_take_numeric_mean(var_vals):
                     continue
 
                 # compute mean and std
