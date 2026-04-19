@@ -217,13 +217,43 @@ def run_fepo_advantage_phase(
 
     async_rollout_manager.wake_up()
     try:
-        out = ray.get(async_rollout_manager.server_handles[0].fepo_compute.remote(payload))
+        server_handles = list(getattr(async_rollout_manager, "server_handles", []) or [])
+        if not server_handles:
+            raise RuntimeError("FEPO requires async_rollout_manager.server_handles, but none were found.")
+
+        n_jobs = len(jobs)
+        n_srv = max(1, len(server_handles))
+        # Round-robin sharding to spread FEPO compute across rollout replicas.
+        shard_job_idx: list[list[int]] = [[] for _ in range(n_srv)]
+        for i in range(n_jobs):
+            shard_job_idx[i % n_srv].append(i)
+
+        futures = []
+        for sidx, indices in enumerate(shard_job_idx):
+            if not indices:
+                continue
+            sub_payload = dict(payload)
+            sub_payload["jobs"] = [jobs[i] for i in indices]
+            futures.append((indices, server_handles[sidx].fepo_compute.remote(sub_payload)))
+
+        deltas = [0.0] * n_jobs
+        ok = [False] * n_jobs
+        details: list[dict[str, Any]] = [{} for _ in range(n_jobs)]
+        if futures:
+            results = ray.get([f for _idx, f in futures])
+            for (indices, _fut), out in zip(futures, results, strict=True):
+                sd = out.get("deltas", [])
+                so = out.get("ok", [])
+                st = out.get("details", [])
+                for local_i, global_i in enumerate(indices):
+                    if local_i < len(sd):
+                        deltas[global_i] = float(sd[local_i])
+                    if local_i < len(so):
+                        ok[global_i] = bool(so[local_i])
+                    if local_i < len(st) and isinstance(st[local_i], dict):
+                        details[global_i] = st[local_i]
     finally:
         async_rollout_manager.sleep()
-
-    deltas = out.get("deltas", [])
-    ok = out.get("ok", [])
-    details = out.get("details", [])
     advantages = batch.batch["advantages"]
     bonus = deltas_to_sparse_bonus(
         advantages.size(0),
