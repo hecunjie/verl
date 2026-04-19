@@ -248,20 +248,20 @@ SELECTION_F_MODE=mc \
 MC_M_SAMPLES=10 \
 MATH_EVAL_BACKEND=math_verify \
 MODEL_PATH=/mnt/tidal-alsh01/dataset/zeus/hecunjie/models/Qwen/Qwen3-4B \
-INPUT_DATA=/mnt/ali-sh-1/dataset/zeus/hecunjie/rl_data/grpo/aime2024_test.parquet \
-OUTPUT_DIR=/mnt/tidal-alsh01/dataset/zeus/hecunjie/entropy_check/infer_topk_f_mc_compare_qwen3_4b_instruct_mc10_aime24_test2 \
+INPUT_DATA=/mnt/ali-sh-1/dataset/zeus/hecunjie/rl_data/grpo/aime2025_test.parquet \
+OUTPUT_DIR=/mnt/tidal-alsh01/dataset/zeus/hecunjie/entropy_check/infer_topk_f_mc_compare_qwen3_4b_instruct_mc10_aime25_test1 \
 NPROC_PER_NODE=8 \
 MAX_SAMPLES=2000 \
-MAX_NEW_TOKENS=12288 \
+MAX_NEW_TOKENS=8192 \
 VLLM_MAX_MODEL_LEN=30000 \
 ENTROPY_THRESHOLD=1.0 \
 CANDIDATE_TOP_P=0.95 \
 CANDIDATE_MAX_K=5 \
-MAX_BRANCH_STEPS=96 \
+MAX_BRANCH_STEPS=64 \
 MC_TEMPERATURE=1.0 \
 MC_TOP_P=0.95 \
 F_CONTINUATION_MODE=first_sentence \
-F_SENTENCE_MAX_NEW_TOKENS=128 \
+F_SENTENCE_MAX_NEW_TOKENS=256 \
 BIAS_METRICS_MODE=length_normalized \
 PROGRESS_ECHO=1 \
 bash /mnt/ali-sh-1/dataset/zeus/hecunjie/gitlab-source/verl/examples/entropy_ce/run_infer_topk_f_mc_compare_vllm_sharded.sh
@@ -387,3 +387,9 @@ LOCAL_WINDOW_RIGHT_TOKENS=20 \
 MATH_EVAL_BACKEND=math_verify \
 PROGRESS_ECHO=1 \
 bash verl/examples/entropy_ce/run_compare_bias_sign_bucket_vs_mc_sharded.sh
+
+# 跑完后：在 sign_compare_merged.jsonl 上对比 MC ref(128) 与 MC compare(1) 的召回率，以及 lookahead-2step 准确率子集与二者的交集（阈值/ margin 可调）
+# python3 verl/examples/entropy_ce/analyze_sign_compare_filtered_metrics.py \
+#   --input /mnt/tidal-alsh01/dataset/zeus/hecunjie/entropy_check/compare_bias_sign_mc128_vs_mc1_qwen3_4b/sign_compare_merged.jsonl \
+#   --threshold 0.1 \
+#   --margin_threshold 0.1

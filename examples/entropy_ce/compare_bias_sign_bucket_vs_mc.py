@@ -741,6 +741,10 @@ def main() -> None:
                         "f_mc_128": [float(x) for x in f_mc],
                         "f_bar_mc_128": float(fbar_mc),
                         "f_real_mc_128": float(f_real_mc),
+                        # Semantic aliases (ref M equals mc_m_samples_ref; name no longer implies 128).
+                        "f_bar_mc_ref": float(fbar_mc),
+                        "f_real_mc_ref": float(f_real_mc),
+                        "sign_mc_ref": int(sign_mc_real),
                         "sign_real_mc_128": int(sign_mc_real),
                         "mc_m_samples_ref": int(args.mc_m_samples_ref),
                         "f_mc_compare": f_mc_compare,
@@ -763,6 +767,11 @@ def main() -> None:
                         "sign_real_trend_same_label": int(sign_trend_same_label),
                         "sign_real_trend_all": int(sign_trend_all),
                         "sign_match_real_trend_same_label": bool(sign_trend_same_label == sign_mc_real),
+                        "sign_match_real_trend_same_label_vs_mc_compare": (
+                            bool(int(sign_trend_same_label) == int(sign_mc_compare))
+                            if sign_mc_compare is not None
+                            else None
+                        ),
                         "sign_match_real_trend_all": bool(sign_trend_all == sign_mc_real),
                         "sign_match_real_if_flip_trend_same_label": bool((-sign_trend_same_label) == sign_mc_real),
                         "sign_match_real_if_flip_trend_all": bool((-sign_trend_all) == sign_mc_real),
