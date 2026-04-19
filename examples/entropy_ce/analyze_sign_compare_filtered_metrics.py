@@ -16,16 +16,14 @@
 
 说明：准确率 / 召回 定义在**不同子集**上的 match rate；分母不同。
 
-**sign_match_mc_compare_vs_ref 的 precision / recall**（见 report 中
+**sign_match_mc_compare_vs_ref 的 precision / recall**（见
 ``precision_recall_sign_match_mc_compare_vs_ref``）：
-- 将 **mc_compare** 的符号视为 predict，**mc_ref（如 128）** 的符号视为 gt；
-- **Precision（准确率）**：分母 = 满足 **mc_compare** 上 f_bar/margin 阈值的 step；
-  分子 = 其中 ``sign_match_mc_compare_vs_ref`` 为真（compare 与 ref 同号）。
-- **Recall（召回率）**：分母 = 满足 **mc_ref** 上 f_bar/margin 阈值的 step；
-  分子 = 其中 ``sign_match_mc_compare_vs_ref`` 为真。
-- 仅当 trace 里存在非空的 ``sign_match_mc_compare_vs_ref`` 时计入（需 mc_m_samples_compare>0）。
-- 可额外要求 ``|f_bar - f_real| >= pr_relative_gap_frac * |f_bar|``（precision 用 compare 侧
-  f，recall 用 ref 侧 f），默认 ``pr_relative_gap_frac=0.3``；设为 ``0`` 关闭。
+- predict = mc_compare 符号，gt = mc_ref 符号，Y = ``sign_match_mc_compare_vs_ref``。
+- **仅使用你在命令行显式传入的条件**（``--pr_precision_*`` / ``--pr_recall_*``）；
+  未传的项不参与过滤。若某一侧三个条件都未传，则该侧分母为「``sign_match_mc_compare_vs_ref``
+  非空」的全部 step。
+- 可选条件（均可单独或组合出现）：``min_f_bar``、``min_abs_gap``（|f_bar−f_real| 下限）、
+  ``relative_gap_frac``（|f_bar−f_real| ≥ frac×|f_bar|，且 frac>0 时才生效）。
 """
 
 from __future__ import annotations
@@ -128,10 +126,7 @@ def _rec_step_ok_compare(st: dict[str, Any], thr: float, margin_thr: float) -> b
 
 
 def _relative_gap_ok(f_bar: Any, f_real: Any, rel_frac: float, *, eps: float = 1e-12) -> bool:
-    """|f_bar - f_real| >= rel_frac * |f_bar|；rel_frac<=0 表示不启用相对条件。
-
-    当 |f_bar| 过小（< eps）且 rel_frac>0 时视为不满足（相对比例无意义）。
-    """
+    """|f_bar - f_real| >= rel_frac * |f_bar|（rel_frac>0）。"""
     if rel_frac <= 0:
         return True
     if f_bar is None or f_real is None:
@@ -147,22 +142,64 @@ def _relative_gap_ok(f_bar: Any, f_real: Any, rel_frac: float, *, eps: float = 1
     return abs(fb - fr) >= rel_frac * afb
 
 
-def _pr_step_ok_compare(
-    st: dict[str, Any], thr: float, margin_thr: float, rel_frac: float
+def _passes_optional_fb_fr_filters(
+    fb: Any,
+    fr: Any,
+    min_fbar: float | None,
+    min_abs_gap: float | None,
+    relative_gap_frac: float | None,
 ) -> bool:
-    if not _rec_step_ok_compare(st, thr, margin_thr):
+    """未指定的条件不参与。若至少指定一项，则要求 fb/fr 存在且可解析。"""
+    if min_fbar is None and min_abs_gap is None and relative_gap_frac is None:
+        return True
+    if fb is None or fr is None:
         return False
-    return _relative_gap_ok(st.get("f_bar_mc_compare"), st.get("f_real_mc_compare"), rel_frac)
+    try:
+        fbf, frf = float(fb), float(fr)
+    except (TypeError, ValueError):
+        return False
+    if min_fbar is not None and fbf < float(min_fbar):
+        return False
+    if min_abs_gap is not None and abs(fbf - frf) < float(min_abs_gap):
+        return False
+    if relative_gap_frac is not None and float(relative_gap_frac) > 0:
+        if not _relative_gap_ok(fbf, frf, float(relative_gap_frac)):
+            return False
+    return True
 
 
-def _pr_step_ok_ref(
-    st: dict[str, Any], thr: float, margin_thr: float, rel_frac: float
+def _include_precision_pr_subset(
+    st: dict[str, Any],
+    min_fbar: float | None,
+    min_abs_gap: float | None,
+    relative_gap_frac: float | None,
 ) -> bool:
-    if not _rec_step_ok_ref(st, thr, margin_thr):
+    if _get_sign_match_mc_compare_vs_ref(st) is None:
         return False
+    if min_fbar is None and min_abs_gap is None and relative_gap_frac is None:
+        return True
+    return _passes_optional_fb_fr_filters(
+        st.get("f_bar_mc_compare"),
+        st.get("f_real_mc_compare"),
+        min_fbar,
+        min_abs_gap,
+        relative_gap_frac,
+    )
+
+
+def _include_recall_pr_subset(
+    st: dict[str, Any],
+    min_fbar: float | None,
+    min_abs_gap: float | None,
+    relative_gap_frac: float | None,
+) -> bool:
+    if _get_sign_match_mc_compare_vs_ref(st) is None:
+        return False
+    if min_fbar is None and min_abs_gap is None and relative_gap_frac is None:
+        return True
     fb = st.get("f_bar_mc_ref", st.get("f_bar_mc_128"))
     fr = st.get("f_real_mc_ref", st.get("f_real_mc_128"))
-    return _relative_gap_ok(fb, fr, rel_frac)
+    return _passes_optional_fb_fr_filters(fb, fr, min_fbar, min_abs_gap, relative_gap_frac)
 
 
 def _get_sign_match_mc_compare_vs_ref(st: dict[str, Any]) -> bool | None:
@@ -208,49 +245,52 @@ def main() -> None:
         help="用 sign_match_real_trend_all 代替 sign_match_real_trend_same_label",
     )
     p.add_argument(
-        "--pr_threshold_compare",
+        "--pr_precision_min_f_bar",
         type=float,
         default=None,
-        help="sign_match_mc_compare_vs_ref 的 precision 分母：mc_compare 侧 f_bar 下限（默认与 --threshold 相同）",
+        help="PR precision 分母：仅当传入时要求 f_bar_mc_compare >= 该值",
     )
     p.add_argument(
-        "--pr_margin_compare",
+        "--pr_precision_min_abs_gap",
         type=float,
         default=None,
-        help="precision 分母：mc_compare 侧 |f_bar-f_real| 下限（默认与 --margin_threshold 相同）",
+        help="PR precision 分母：仅当传入时要求 |f_bar_mc_compare - f_real_mc_compare| >= 该值",
     )
     p.add_argument(
-        "--pr_threshold_ref",
+        "--pr_precision_relative_gap_frac",
         type=float,
         default=None,
-        help="sign_match_mc_compare_vs_ref 的 recall 分母：mc_ref 侧 f_bar 下限（默认与 --threshold 相同）",
+        help="PR precision 分母：仅当传入且 >0 时要求 |Δf| >= frac*|f_bar|（compare 侧）",
     )
     p.add_argument(
-        "--pr_margin_ref",
+        "--pr_recall_min_f_bar",
         type=float,
         default=None,
-        help="recall 分母：mc_ref 侧 |f_bar-f_real| 下限（默认与 --margin_threshold 相同）",
+        help="PR recall 分母：仅当传入时要求 f_bar_mc_ref >= 该值",
     )
     p.add_argument(
-        "--pr_relative_gap_frac",
+        "--pr_recall_min_abs_gap",
         type=float,
-        default=0.3,
-        help=(
-            "仅用于 precision_recall_sign_match_mc_compare_vs_ref：额外要求 "
-            "|f_bar - f_real| >= frac * |f_bar|（precision 用 compare 的 f，recall 用 ref 的 f）。"
-            "设为 0 表示不启用相对条件。"
-        ),
+        default=None,
+        help="PR recall 分母：仅当传入时要求 |f_bar_mc_ref - f_real_mc_ref| >= 该值",
+    )
+    p.add_argument(
+        "--pr_recall_relative_gap_frac",
+        type=float,
+        default=None,
+        help="PR recall 分母：仅当传入且 >0 时要求 |Δf| >= frac*|f_bar|（ref 侧）",
     )
     args = p.parse_args()
 
     steps = _iter_steps(args.input)
     thr = float(args.threshold)
     margin_thr = float(args.margin_threshold)
-    thr_c = float(args.pr_threshold_compare) if args.pr_threshold_compare is not None else thr
-    margin_c = float(args.pr_margin_compare) if args.pr_margin_compare is not None else margin_thr
-    thr_r = float(args.pr_threshold_ref) if args.pr_threshold_ref is not None else thr
-    margin_r = float(args.pr_margin_ref) if args.pr_margin_ref is not None else margin_thr
-    pr_rel_frac = float(args.pr_relative_gap_frac)
+    pp_f = args.pr_precision_min_f_bar
+    pp_a = args.pr_precision_min_abs_gap
+    pp_r = args.pr_precision_relative_gap_frac
+    pr_f = args.pr_recall_min_f_bar
+    pr_a = args.pr_recall_min_abs_gap
+    pr_r = args.pr_recall_relative_gap_frac
     use_all = bool(args.use_trend_all)
 
     # 准确率（1-step）
@@ -329,21 +369,13 @@ def main() -> None:
 
     # --- Precision / Recall for sign_match_mc_compare_vs_ref (predict=compare, gt=ref) ---
     prec_pr_steps = [
-        st
-        for st in steps
-        if _pr_step_ok_compare(st, thr_c, margin_c, pr_rel_frac)
-        and _get_sign_match_mc_compare_vs_ref(st) is not None
+        st for st in steps if _include_precision_pr_subset(st, pp_f, pp_a, pp_r)
     ]
     n_pr_prec = len(prec_pr_steps)
     n_pr_prec_pos = sum(1 for st in prec_pr_steps if _get_sign_match_mc_compare_vs_ref(st))
     pr_precision = float(n_pr_prec_pos) / float(n_pr_prec) if n_pr_prec > 0 else float("nan")
 
-    rec_pr_steps = [
-        st
-        for st in steps
-        if _pr_step_ok_ref(st, thr_r, margin_r, pr_rel_frac)
-        and _get_sign_match_mc_compare_vs_ref(st) is not None
-    ]
+    rec_pr_steps = [st for st in steps if _include_recall_pr_subset(st, pr_f, pr_a, pr_r)]
     n_pr_rec = len(rec_pr_steps)
     n_pr_rec_pos = sum(1 for st in rec_pr_steps if _get_sign_match_mc_compare_vs_ref(st))
     pr_recall = float(n_pr_rec_pos) / float(n_pr_rec) if n_pr_rec > 0 else float("nan")
@@ -361,23 +393,28 @@ def main() -> None:
         "input": str(args.input.expanduser().resolve()),
         "threshold": thr,
         "margin_threshold": margin_thr,
-        "pr_precision_threshold_compare": thr_c,
-        "pr_precision_margin_compare": margin_c,
-        "pr_recall_threshold_ref": thr_r,
-        "pr_recall_margin_ref": margin_r,
-        "pr_relative_gap_frac": pr_rel_frac,
+        "pr_filters": {
+            "precision": {
+                "min_f_bar": pp_f,
+                "min_abs_gap": pp_a,
+                "relative_gap_frac": pp_r,
+            },
+            "recall": {
+                "min_f_bar": pr_f,
+                "min_abs_gap": pr_a,
+                "relative_gap_frac": pr_r,
+            },
+            "note": "仅非 null 的项参与过滤；某一侧若全为 null，则该侧使用全部 sign_match 已定义的 step。",
+        },
         "use_trend_all": use_all,
         "num_steps_total_in_traces": len(steps),
         "precision_recall_sign_match_mc_compare_vs_ref": {
             "description": (
-                "predict = sign(f_bar_mc_compare - f_real_mc_compare), "
-                "gt = sign(f_bar_mc_ref - f_real_mc_ref); "
-                "Y = sign_match_mc_compare_vs_ref. "
-                "Precision = mean(Y | mc_compare passes f_bar/margin AND "
-                "|f_bar-f_real| >= pr_relative_gap_frac*|f_bar| on compare). "
-                "Recall = mean(Y | mc_ref passes f_bar/margin AND same relative gap on ref). "
-                "pr_relative_gap_frac=0 disables relative filter. "
-                "Steps with null sign_match_mc_compare_vs_ref are excluded."
+                "predict = sign(mc_compare), gt = sign(mc_ref), Y = sign_match_mc_compare_vs_ref. "
+                "Only CLI args under pr_filters that are non-null apply; unspecified filters are ignored. "
+                "If all precision filters are null, precision denominator = all steps with Y defined. "
+                "If all recall filters are null, recall denominator = same. "
+                "If any filter is set on a side, that side requires valid f_bar/f_real for the checks."
             ),
             "precision": {
                 "denominator_steps": n_pr_prec,
