@@ -25,9 +25,9 @@
 - 可选条件（均可单独或组合出现）：``min_f_bar``、``min_abs_gap``（|f_bar−f_real| 下限）、
   ``relative_gap_frac``（|f_bar−f_real| ≥ frac×|f_bar|，且 frac>0 时才生效）。
 
-报告中的 ``sign_match_value_stratification``：在 precision / recall 分母子集上，按
-``sign_match_mc_compare_vs_ref`` 为真（正确）/ 假（错误）分组，分别输出 compare 或 ref 侧
-f_bar、f_real、|Δf|、相对差分、entropy_t 等的计数与均值。
+报告中的 ``value_stratification_by_real_rollout_is_correct``：在 precision / recall 分母子集上，按
+**该条 prompt 的** ``real_rollout_is_correct``（整题回答是否正确）分组，分别输出 compare / ref 侧
+f_bar、f_real、|Δf|、相对差分、entropy_t 等的计数与均值（与逐步 ``sign_match_mc_compare_vs_ref`` 无关）。
 """
 
 from __future__ import annotations
@@ -50,9 +50,11 @@ def _iter_steps(path: Path) -> list[dict[str, Any]]:
             trace = rec.get("trace_sign_compare")
             if not trace:
                 continue
+            parent_rc = rec.get("real_rollout_is_correct")
             for st in trace:
                 if isinstance(st, dict):
-                    out.append(st)
+                    # 来自 prompt 级字段，供按「整题是否正确」分层统计
+                    out.append({**st, "real_rollout_is_correct": parent_rc})
     return out
 
 
@@ -298,42 +300,55 @@ def _summarize_ref_trace_steps(steps: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def _build_sign_match_value_stratification(
+def _build_value_stratification_by_real_rollout(
     prec_pr_steps: list[dict[str, Any]],
     rec_pr_steps: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """按 Y=sign_match_mc_compare_vs_ref 分正确/错误，分别汇总 compare / ref 侧数值。"""
+    """按 prompt 级 ``real_rollout_is_correct`` 分答对/答错/未知，分别汇总 compare / ref 侧数值。"""
 
-    def _split_y(steps: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        ok = [st for st in steps if _get_sign_match_mc_compare_vs_ref(st) is True]
-        bad = [st for st in steps if _get_sign_match_mc_compare_vs_ref(st) is False]
-        return ok, bad
+    def _split_rollout(
+        steps: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+        corr = [st for st in steps if st.get("real_rollout_is_correct") is True]
+        wrong = [st for st in steps if st.get("real_rollout_is_correct") is False]
+        unk = [st for st in steps if st.get("real_rollout_is_correct") is None]
+        return corr, wrong, unk
 
-    p_ok, p_bad = _split_y(prec_pr_steps)
-    r_ok, r_bad = _split_y(rec_pr_steps)
+    p_corr, p_wrong, p_unk = _split_rollout(prec_pr_steps)
+    r_corr, r_wrong, r_unk = _split_rollout(rec_pr_steps)
     return {
         "description": (
-            "Within PR precision/recall denominators, split by sign_match_mc_compare_vs_ref "
-            "(true=预测与 ref 同号, false=不同号). Compare fields use f_bar_mc_compare; ref fields use f_bar_mc_ref."
+            "Within PR precision/recall denominators, split by parent prompt field real_rollout_is_correct "
+            "(whole-answer correctness), not by sign_match_mc_compare_vs_ref. "
+            "Compare fields: f_bar_mc_compare; ref fields: f_bar_mc_ref. "
+            "unknown = field missing or null on merged jsonl row."
         ),
         "precision_denominator": {
-            "sign_match_true": {
-                "count": len(p_ok),
-                "compare_side_fields": _summarize_compare_trace_steps(p_ok),
+            "real_rollout_is_correct_true": {
+                "count": len(p_corr),
+                "compare_side_fields": _summarize_compare_trace_steps(p_corr),
             },
-            "sign_match_false": {
-                "count": len(p_bad),
-                "compare_side_fields": _summarize_compare_trace_steps(p_bad),
+            "real_rollout_is_correct_false": {
+                "count": len(p_wrong),
+                "compare_side_fields": _summarize_compare_trace_steps(p_wrong),
+            },
+            "real_rollout_is_correct_unknown": {
+                "count": len(p_unk),
+                "compare_side_fields": _summarize_compare_trace_steps(p_unk),
             },
         },
         "recall_denominator": {
-            "sign_match_true": {
-                "count": len(r_ok),
-                "ref_side_fields": _summarize_ref_trace_steps(r_ok),
+            "real_rollout_is_correct_true": {
+                "count": len(r_corr),
+                "ref_side_fields": _summarize_ref_trace_steps(r_corr),
             },
-            "sign_match_false": {
-                "count": len(r_bad),
-                "ref_side_fields": _summarize_ref_trace_steps(r_bad),
+            "real_rollout_is_correct_false": {
+                "count": len(r_wrong),
+                "ref_side_fields": _summarize_ref_trace_steps(r_wrong),
+            },
+            "real_rollout_is_correct_unknown": {
+                "count": len(r_unk),
+                "ref_side_fields": _summarize_ref_trace_steps(r_unk),
             },
         },
     }
@@ -516,7 +531,9 @@ def main() -> None:
     else:
         pr_f1 = float("nan")
 
-    sign_match_value_stratification = _build_sign_match_value_stratification(prec_pr_steps, rec_pr_steps)
+    value_stratification_by_real_rollout_is_correct = _build_value_stratification_by_real_rollout(
+        prec_pr_steps, rec_pr_steps
+    )
 
     report = {
         "input": str(args.input.expanduser().resolve()),
@@ -557,7 +574,7 @@ def main() -> None:
             },
             "f1": pr_f1,
         },
-        "sign_match_value_stratification": sign_match_value_stratification,
+        "value_stratification_by_real_rollout_is_correct": value_stratification_by_real_rollout_is_correct,
         "accuracy_side_lookahead_1step": {
             "description": (
                 "keep steps with f_bar_lookahead_1step >= threshold AND "
