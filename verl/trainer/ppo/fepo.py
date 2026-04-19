@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
 from typing import Any, Optional
 
 import numpy as np
@@ -63,38 +64,52 @@ def build_fepo_jobs(
     Continuation MC cap matches ``compare_bias_sign_bucket_vs_mc`` style:
     ``min(f_sentence_max_new_tokens, mc_max_new_tokens, response_length - t - 1)``.
     """
-    input_ids = batch.batch["input_ids"]
-    responses = batch.batch["responses"]
-    response_mask = batch.batch["response_mask"]
-    pl = batch.batch["prompts"].size(1)
+    input_ids = batch.batch["input_ids"].detach().cpu()
+    responses = batch.batch["responses"].detach().cpu()
+    response_mask = batch.batch["response_mask"].detach().cpu().bool()
+    entropy_cpu = entropy.detach().cpu()
+    pl = int(batch.batch["prompts"].size(1))
 
     jobs: list[dict[str, Any]] = []
     coord: list[tuple[int, int]] = []
+
+    # Group points by sample id so each sample row is materialized once.
+    pos_by_b: dict[int, list[int]] = defaultdict(list)
     for b, t in positions:
-        if not response_mask[b, t]:
+        pos_by_b[int(b)].append(int(t))
+
+    for b, ts in pos_by_b.items():
+        row_mask = response_mask[b]
+        valid_len = int(row_mask.sum().item())
+        if valid_len <= 1:
             continue
-        prefix_before = input_ids[b, : pl + t].detach().cpu().tolist()
-        chosen_token = int(responses[b, t].item())
-        suffix_after: list[int] = []
-        for j in range(int(t) + 1, responses.size(1)):
-            if not bool(response_mask[b, j]):
-                break
-            suffix_after.append(int(responses[b, j].item()))
-        rem = len(suffix_after)
-        if rem <= 0:
-            continue
-        cont_max = min(int(f_sentence_max_new_tokens), int(mc_max_new_tokens), rem)
-        cont_max = max(1, cont_max)
-        jobs.append(
-            {
-                "prefix_before": prefix_before,
-                "chosen_token": chosen_token,
-                "cont_max_new_tokens": cont_max,
-                "h_t": float(entropy[b, t].item()),
-                "suffix_after": suffix_after[:cont_max],
-            }
-        )
-        coord.append((b, int(t)))
+
+        # Materialize sample rows once; reuse cheap Python slicing for each point.
+        input_row = input_ids[b].tolist()
+        resp_row = responses[b].tolist()
+        for t in ts:
+            if t < 0 or t >= valid_len:
+                continue
+
+            rem = valid_len - (t + 1)
+            if rem <= 0:
+                continue
+
+            cont_max = min(int(f_sentence_max_new_tokens), int(mc_max_new_tokens), rem)
+            cont_max = max(1, cont_max)
+            prefix_before = input_row[: pl + t]
+            chosen_token = int(resp_row[t])
+            suffix_after = resp_row[t + 1 : t + 1 + cont_max]
+            jobs.append(
+                {
+                    "prefix_before": prefix_before,
+                    "chosen_token": chosen_token,
+                    "cont_max_new_tokens": cont_max,
+                    "h_t": float(entropy_cpu[b, t].item()),
+                    "suffix_after": [int(x) for x in suffix_after],
+                }
+            )
+            coord.append((b, t))
     return jobs, coord
 
 
