@@ -17,6 +17,7 @@ import inspect
 import json
 import logging
 import os
+import uuid
 from pprint import pprint
 from typing import Any, Callable, Optional
 
@@ -665,6 +666,405 @@ class vLLMHttpServer:
         except Exception as e:
             logger.error(f"Error aborting request {request_id}: {e}")
             return {"aborted": False, "request_id": request_id, "error": str(e)}
+
+    async def _fepo_raw_generate(
+        self,
+        prompt_ids: list[int],
+        *,
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        logprobs_k: int | None,
+    ) -> RequestOutput:
+        """Single vLLM async generate returning full ``RequestOutput`` (for FEPO MC / teacher forcing)."""
+        max_possible_tokens = self.config.max_model_len - len(prompt_ids)
+        if max_possible_tokens < 0:
+            raise ValueError(
+                f"Prompt length ({len(prompt_ids)}) exceeds the model's maximum context length "
+                f"({self.config.max_model_len})."
+            )
+        max_tokens = max(0, min(int(max_tokens), max_possible_tokens))
+        sp = SamplingParams(
+            max_tokens=max_tokens,
+            temperature=float(temperature),
+            top_p=float(top_p),
+            logprobs=logprobs_k,
+            repetition_penalty=self.config.get("repetition_penalty", 1.0),
+        )
+        prompt_ids = _qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
+        prompt = TokensPrompt(prompt_token_ids=prompt_ids, multi_modal_data={})
+
+        lora_request = None
+        if self.model_config.lora_rank > 0 or (
+            self.model_config.lora.get("rank", 0) > 0 and not self.model_config.lora.get("merge", False)
+        ):
+            lora_loaded = VLLM_LORA_INT_ID in await self.engine.list_loras()
+            if lora_loaded:
+                lora_request = LoRARequest(
+                    lora_name=VLLM_LORA_NAME, lora_int_id=VLLM_LORA_INT_ID, lora_path=VLLM_LORA_PATH
+                )
+
+        generator = self.engine.generate(
+            prompt=prompt,
+            sampling_params=sp,
+            request_id=uuid.uuid4().hex,
+            lora_request=lora_request,
+            priority=0,
+        )
+        final_res: Optional[RequestOutput] = None
+        async for output in generator:
+            final_res = output
+        assert final_res is not None
+        return final_res
+
+    async def _fepo_mc_mean_f_per_prefix(
+        self,
+        prefixes: list[list[int]],
+        *,
+        m_samples: int,
+        gen_cap: int,
+        mc_temperature: float,
+        mc_top_p: float,
+        k_lp: int,
+        f_mode: str,
+        norm_len: bool,
+        tokenizer: Any,
+        stop_fn: Any,
+        batch_chunk: int,
+    ) -> list[float]:
+        """Per prefix: MC mean of continuation-F (same definition as ``entropy_credit_experiment``)."""
+        from verl.utils.fepo_math import continuation_F_from_gen_ids_and_step_logprobs, vllm_request_step_logprobs_to_float_dicts
+
+        if not prefixes:
+            return []
+        m_samples = max(1, int(m_samples))
+        flat_prompts: list[list[int]] = []
+        flat_pref_idx: list[int] = []
+        for pi, pref in enumerate(prefixes):
+            for _ in range(m_samples):
+                flat_prompts.append(list(pref))
+                flat_pref_idx.append(pi)
+        n_total = len(flat_prompts)
+        per_pref: list[list[float]] = [[] for _ in range(len(prefixes))]
+        bc = max(1, int(batch_chunk))
+
+        async def _one_mc_sample(pref_ids: list[int], pi: int) -> tuple[int, float]:
+            out = await self._fepo_raw_generate(
+                pref_ids,
+                max_tokens=int(gen_cap),
+                temperature=float(mc_temperature),
+                top_p=float(mc_top_p),
+                logprobs_k=int(k_lp),
+            )
+            o = out.outputs[0]
+            gen_ids = list(o.token_ids)
+            step_lps = vllm_request_step_logprobs_to_float_dicts(o)
+            while len(step_lps) < len(gen_ids):
+                step_lps.append({})
+            val = continuation_F_from_gen_ids_and_step_logprobs(
+                gen_ids,
+                step_lps,
+                f_continuation_mode=f_mode,
+                tokenizer=tokenizer if f_mode == "first_sentence" else None,
+                stop_fn=stop_fn if f_mode == "first_sentence" else None,
+                normalize_by_continuation_length=norm_len,
+            )
+            return pi, float(val)
+
+        for start in range(0, n_total, bc):
+            end = min(start + bc, n_total)
+            chunk_results = await asyncio.gather(
+                *[_one_mc_sample(flat_prompts[j], flat_pref_idx[j]) for j in range(start, end)]
+            )
+            for pi, val in chunk_results:
+                per_pref[pi].append(val)
+        return [float(np.mean(xs)) if xs else 0.0 for xs in per_pref]
+
+    async def _fepo_mc_mean_future_rate_minus_ht(
+        self,
+        prefixes: list[list[int]],
+        *,
+        m_samples: int,
+        gen_cap: int,
+        mc_temperature: float,
+        mc_top_p: float,
+        k_lp: int,
+        f_mode: str,
+        tokenizer: Any,
+        stop_fn: Any,
+        batch_chunk: int,
+        h_t_values: list[float],
+    ) -> list[float]:
+        """Per prefix: MC mean of ``(sum_H - H_t) / (len-1)`` after continuation truncation."""
+        from verl.utils.fepo_math import entropy_from_logprobs_topk, vllm_request_step_logprobs_to_float_dicts
+        from verl.utils.fepo_sentence_stop import truncate_gen_ids_to_first_sentence
+
+        if not prefixes:
+            return []
+        m_samples = max(1, int(m_samples))
+        flat_prompts: list[list[int]] = []
+        flat_pref_idx: list[int] = []
+        for pi, pref in enumerate(prefixes):
+            for _ in range(m_samples):
+                flat_prompts.append(list(pref))
+                flat_pref_idx.append(pi)
+        n_total = len(flat_prompts)
+        per_pref: list[list[float]] = [[] for _ in range(len(prefixes))]
+        bc = max(1, int(batch_chunk))
+
+        async def _one_mc_sample(pref_ids: list[int], pi: int) -> tuple[int, float]:
+            out = await self._fepo_raw_generate(
+                pref_ids,
+                max_tokens=int(gen_cap),
+                temperature=float(mc_temperature),
+                top_p=float(mc_top_p),
+                logprobs_k=int(k_lp),
+            )
+            o = out.outputs[0]
+            gen_ids = list(o.token_ids)
+            step_lps = vllm_request_step_logprobs_to_float_dicts(o)
+            while len(step_lps) < len(gen_ids):
+                step_lps.append({})
+
+            if f_mode == "first_sentence":
+                keep_k = truncate_gen_ids_to_first_sentence(gen_ids, tokenizer, stop_fn)
+            else:
+                keep_k = len(gen_ids)
+            keep_k = max(0, int(keep_k))
+            if keep_k <= 1:
+                return pi, 0.0
+
+            s = 0.0
+            for i in range(keep_k):
+                s += float(entropy_from_logprobs_topk(step_lps[i]))
+            h_t = float(h_t_values[pi])
+            val = (s - h_t) / float(max(keep_k - 1, 1))
+            return pi, float(val)
+
+        for start in range(0, n_total, bc):
+            end = min(start + bc, n_total)
+            chunk_results = await asyncio.gather(
+                *[_one_mc_sample(flat_prompts[j], flat_pref_idx[j]) for j in range(start, end)]
+            )
+            for pi, val in chunk_results:
+                per_pref[pi].append(val)
+        return [float(np.mean(xs)) if xs else 0.0 for xs in per_pref]
+
+    async def _fepo_teacher_forced_f_real(
+        self,
+        *,
+        prefix_after_chosen: list[int],
+        suffix_after: list[int],
+        k_lp: int,
+        f_mode: str,
+        norm_len: bool,
+        tokenizer: Any,
+        stop_fn: Any,
+    ) -> float:
+        """Teacher-forced f_real on the actual rollout suffix (same continuation F/truncation)."""
+        from verl.utils.fepo_math import continuation_F_from_gen_ids_and_step_logprobs, vllm_request_step_logprobs_to_float_dicts
+
+        if not suffix_after:
+            return 0.0
+        cur = list(prefix_after_chosen)
+        step_lps_tf: list[dict[int, float]] = []
+        for tok in suffix_after:
+            out_tf = await self._fepo_raw_generate(
+                cur,
+                max_tokens=1,
+                temperature=0.0,
+                top_p=1.0,
+                logprobs_k=int(k_lp),
+            )
+            o0 = out_tf.outputs[0]
+            per_step = vllm_request_step_logprobs_to_float_dicts(o0)
+            if per_step:
+                step_lps_tf.append(per_step[0])
+            else:
+                step_lps_tf.append({})
+            cur.append(int(tok))
+        return float(
+            continuation_F_from_gen_ids_and_step_logprobs(
+                list(suffix_after),
+                step_lps_tf,
+                f_continuation_mode=f_mode,
+                tokenizer=tokenizer if f_mode == "first_sentence" else None,
+                stop_fn=stop_fn if f_mode == "first_sentence" else None,
+                normalize_by_continuation_length=norm_len,
+            )
+        )
+
+    async def fepo_compute(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """FEPO branching: ``f_bar = E_c[ F_MC(prefix+c) ]``, ``f_real = F_MC(prefix+chosen)`` (``compare_bias``)."""
+        from verl.utils.fepo_branching import topp_capped_candidates_from_step_logprobs
+        from verl.utils.fepo_math import clamp_vllm_logprobs_topk
+        from verl.utils.fepo_sentence_stop import completion_should_stop_after_first_sentence_simple
+
+        tokenizer = self.model_config.tokenizer
+        jobs = payload["jobs"]
+        mc_m = max(1, int(payload.get("mc_m", 1)))
+        mc_temperature = float(payload.get("mc_temperature", 1.0))
+        mc_top_p = float(payload.get("mc_top_p", 0.95))
+        k_lp = clamp_vllm_logprobs_topk(int(payload.get("logprobs_k", 20)))
+        f_mode = str(payload.get("f_continuation_mode", "first_sentence"))
+        norm_len = bool(payload.get("normalize_by_continuation_length", True))
+        candidate_top_p = float(payload.get("candidate_top_p", 0.95))
+        candidate_max_k = int(payload.get("candidate_max_k", 20))
+        min_candidates = max(2, int(payload.get("min_candidates", 2)))
+        batch_chunk = max(1, int(payload.get("mc_batch_chunk", 32)))
+        f_bar_mode = str(payload.get("f_bar_mode", "branching"))
+        f_real_mode = str(payload.get("f_real_mode", "chosen_branch_mc"))
+        if f_bar_mode not in {"branching", "prefix_minus_ht"}:
+            f_bar_mode = "branching"
+        if f_real_mode not in {"chosen_branch_mc", "teacher_forced_real_path"}:
+            f_real_mode = "chosen_branch_mc"
+
+        stop_fn = completion_should_stop_after_first_sentence_simple if f_mode == "first_sentence" else None
+
+        deltas: list[float] = []
+        ok_flags: list[bool] = []
+        details: list[dict[str, Any]] = []
+
+        for job in jobs:
+            pb = list(job["prefix_before"])
+            chosen = int(job["chosen_token"])
+            gen_cap = max(1, int(job["cont_max_new_tokens"]))
+            suffix_after = list(job.get("suffix_after", []))
+            job_batch_chunk = int(batch_chunk)
+            if not suffix_after:
+                deltas.append(0.0)
+                ok_flags.append(False)
+                details.append({"reason": "empty_suffix", "f_bar_mode": f_bar_mode, "f_real_mode": f_real_mode})
+                continue
+
+            cands: list[int] = []
+            cand_probs: list[float] = []
+            f_mc: list[float] = []
+            need_cands = (f_bar_mode == "branching") or (f_real_mode == "chosen_branch_mc")
+            if need_cands:
+                out0 = await self._fepo_raw_generate(
+                    pb,
+                    max_tokens=1,
+                    temperature=0.0,
+                    top_p=1.0,
+                    logprobs_k=k_lp,
+                )
+                o0 = out0.outputs[0]
+                step_lp: dict[int, float] = {}
+                if o0.logprobs and len(o0.logprobs) > 0:
+                    for tid, info in o0.logprobs[0].items():
+                        step_lp[int(tid)] = float(info.logprob)
+                cands, cand_probs = topp_capped_candidates_from_step_logprobs(
+                    step_lp, candidate_top_p, candidate_max_k
+                )
+                if len(cands) < min_candidates:
+                    deltas.append(0.0)
+                    ok_flags.append(False)
+                    details.append(
+                        {
+                            "reason": "insufficient_candidates",
+                            "f_bar_mode": f_bar_mode,
+                            "f_real_mode": f_real_mode,
+                            "cands": cands,
+                            "cand_probs": cand_probs,
+                        }
+                    )
+                    continue
+                prefixes = [pb + [int(c)] for c in cands]
+                f_mc = await self._fepo_mc_mean_f_per_prefix(
+                    prefixes,
+                    m_samples=mc_m,
+                    gen_cap=gen_cap,
+                    mc_temperature=mc_temperature,
+                    mc_top_p=mc_top_p,
+                    k_lp=k_lp,
+                    f_mode=f_mode,
+                    norm_len=norm_len,
+                    tokenizer=tokenizer,
+                    stop_fn=stop_fn,
+                    batch_chunk=job_batch_chunk,
+                )
+                if len(f_mc) != len(cands):
+                    deltas.append(0.0)
+                    ok_flags.append(False)
+                    details.append(
+                        {
+                            "reason": "mc_size_mismatch",
+                            "f_bar_mode": f_bar_mode,
+                            "f_real_mode": f_real_mode,
+                            "cands": cands,
+                            "cand_probs": cand_probs,
+                            "f_mc": f_mc,
+                        }
+                    )
+                    continue
+
+            if f_bar_mode == "prefix_minus_ht":
+                f_bar_list = await self._fepo_mc_mean_future_rate_minus_ht(
+                    [pb],
+                    m_samples=mc_m,
+                    gen_cap=max(1, gen_cap + 1),
+                    mc_temperature=mc_temperature,
+                    mc_top_p=mc_top_p,
+                    k_lp=k_lp,
+                    f_mode=f_mode,
+                    tokenizer=tokenizer,
+                    stop_fn=stop_fn,
+                    batch_chunk=job_batch_chunk,
+                    h_t_values=[float(job.get("h_t", 0.0))],
+                )
+                f_bar = float(f_bar_list[0]) if f_bar_list else 0.0
+            else:
+                if not cands:
+                    deltas.append(0.0)
+                    ok_flags.append(False)
+                    details.append({"reason": "no_candidates", "f_bar_mode": f_bar_mode, "f_real_mode": f_real_mode})
+                    continue
+                f_bar = float(sum(float(p) * float(f_mc[i]) for i, p in enumerate(cand_probs)))
+
+            if f_real_mode == "teacher_forced_real_path":
+                f_real = await self._fepo_teacher_forced_f_real(
+                    prefix_after_chosen=pb + [chosen],
+                    suffix_after=suffix_after[:gen_cap],
+                    k_lp=k_lp,
+                    f_mode=f_mode,
+                    norm_len=norm_len,
+                    tokenizer=tokenizer,
+                    stop_fn=stop_fn,
+                )
+            else:
+                if chosen not in cands:
+                    deltas.append(0.0)
+                    ok_flags.append(False)
+                    details.append(
+                        {
+                            "reason": "chosen_not_in_candidates",
+                            "f_bar_mode": f_bar_mode,
+                            "f_real_mode": f_real_mode,
+                            "cands": cands,
+                            "cand_probs": cand_probs,
+                            "f_mc": f_mc,
+                        }
+                    )
+                    continue
+                f_real = float(f_mc[cands.index(chosen)])
+            deltas.append(float(f_bar - f_real))
+            ok_flags.append(True)
+            details.append(
+                {
+                    "f_bar_mode": f_bar_mode,
+                    "f_real_mode": f_real_mode,
+                    "f_bar": float(f_bar),
+                    "f_real": float(f_real),
+                    "branch_min_f_mc": float(min(f_mc)) if f_mc else None,
+                    "cands": [int(x) for x in cands] if cands else [],
+                    "cand_probs": [float(x) for x in cand_probs] if cand_probs else [],
+                    "f_mc": [float(x) for x in f_mc] if f_mc else [],
+                    "mc_batch_chunk_used": int(job_batch_chunk),
+                }
+            )
+
+        return {"deltas": deltas, "ok": ok_flags, "details": details}
 
 
 _rollout_worker_actor_cls = ray.remote(ServerAdapter)

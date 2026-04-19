@@ -630,3 +630,5 @@ class AlgoConfig(BaseConfig):
     # Rollout Correction: corrects off-policy issues (policy mismatch, model staleness, distribution shifts)
     # Set to None to disable, use RolloutCorrectionConfig presets (e.g., .tis(), .mis()), or pass dict
     rollout_correction: Optional[RolloutCorrectionConfig] = None
+    # FEPO (Future Entropy PO): token-level sparse bonus added to advantages after GRPO (see ``verl.trainer.ppo.fepo``).
+    fepo: dict[str, Any] = field(default_factory=dict)

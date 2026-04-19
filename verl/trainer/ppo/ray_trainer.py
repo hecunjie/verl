@@ -22,6 +22,7 @@ import json
 import os
 import uuid
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pprint import pprint
@@ -515,6 +516,36 @@ class RayPPOTrainer:
             f.write("\n".join(lines) + "\n")
 
         print(f"Dumped generations to {filename}")
+
+    @staticmethod
+    def _to_jsonable(x):
+        if isinstance(x, np.generic):
+            return x.item()
+        if isinstance(x, np.ndarray):
+            return x.tolist()
+        if isinstance(x, dict):
+            return {kk: RayPPOTrainer._to_jsonable(vv) for kk, vv in x.items()}
+        if isinstance(x, (list, tuple)):
+            return [RayPPOTrainer._to_jsonable(vv) for vv in x]
+        return x
+
+    def _dump_fepo_points(self, points: list[dict[str, Any]], dump_path: str):
+        """Dump FEPO sampled points to ``<dump_path>/<global_step>.jsonl``."""
+        if not points:
+            return
+        os.makedirs(dump_path, exist_ok=True)
+        filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
+        lines = [json.dumps(self._to_jsonable({"step": self.global_steps, **p}), ensure_ascii=False) for p in points]
+        with open(filename, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        print(f"Dumped FEPO points to {filename}")
+
+    def _dump_fepo_points_async(self, points: list[dict[str, Any]], dump_path: str):
+        if not points:
+            return
+        if not hasattr(self, "_fepo_dump_executor"):
+            self._fepo_dump_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="fepo_dump")
+        self._fepo_dump_executor.submit(self._dump_fepo_points, points, dump_path)
 
     def _log_rollout_data(
         self, batch: DataProto, reward_extra_infos_dict: dict, timing_raw: dict, rollout_data_dir: str
@@ -1580,6 +1611,7 @@ class RayPPOTrainer:
                     #   Note: π_old computed once per data batch, serves as stable reference during mini-batch updates
                     rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
                     bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
+                    fepo_enable = bool(self.config.algorithm.get("fepo", {}).get("enable", False))
                     if bypass_recomputing_logprobs:  # Use `rollout_log_probs`
                         from verl.trainer.ppo.rollout_corr_helper import apply_bypass_mode
 
@@ -1588,6 +1620,15 @@ class RayPPOTrainer:
                             rollout_corr_config=rollout_corr_config,
                             policy_loss_config=self.config.actor_rollout_ref.actor.policy_loss,
                         )
+                        if fepo_enable:
+                            if "rollout_log_probs" not in batch.batch:
+                                raise ValueError(
+                                    "FEPO with rollout_correction bypass_mode requires rollout_log_probs "
+                                    "for high-entropy position selection (proxy: -log pi_rollout)."
+                                )
+                            batch.batch["fepo_token_entropy"] = (-batch.batch["rollout_log_probs"].float()).clamp(
+                                min=0.0
+                            )
                     else:  # Recompute old_log_probs
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
                             old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
@@ -1610,6 +1651,8 @@ class RayPPOTrainer:
                                 AdvantageEstimator.GTPO,
                             ):
                                 batch.batch["token_entropy"] = entropys.detach().clone()
+                            if fepo_enable:
+                                batch.batch["fepo_token_entropy"] = entropys.detach().clone()
                             old_log_prob.batch.pop("entropys")
                             batch = batch.union(old_log_prob)
                             if "rollout_log_probs" in batch.batch.keys():
@@ -1691,6 +1734,23 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+
+                        if bool(self.config.algorithm.get("fepo", {}).get("enable", False)):
+                            from verl.trainer.ppo.fepo import run_fepo_advantage_phase
+
+                            _fepo_cfg = self.config.algorithm.get("fepo", {}) or {}
+                            fepo_cfg = OmegaConf.to_container(_fepo_cfg, resolve=True)
+                            batch, fepo_metrics, fepo_point_records = run_fepo_advantage_phase(
+                                batch,
+                                self.tokenizer,
+                                fepo_cfg,
+                                self.async_rollout_manager if self.async_rollout_mode else None,
+                            )
+                            metrics.update(fepo_metrics)
+                            fepo_data_dir = self.config.trainer.get("fepo_data_dir", None)
+                            if fepo_data_dir is None:
+                                fepo_data_dir = os.path.join(self.config.trainer.default_local_dir, "fepo_data")
+                            self._dump_fepo_points_async(fepo_point_records, fepo_data_dir)
 
                     # update critic
                     if self.use_critic:
