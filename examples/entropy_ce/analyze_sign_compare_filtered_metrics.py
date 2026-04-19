@@ -15,12 +15,22 @@
   match 用 trend 与 **MC compare** 的符号是否一致（或由 sign_mc_compare 与 trend 现场比对）。
 
 说明：准确率 / 召回 定义在**不同子集**上的 match rate；分母不同。
+
+**sign_match_mc_compare_vs_ref 的 precision / recall**（见 report 中
+``precision_recall_sign_match_mc_compare_vs_ref``）：
+- 将 **mc_compare** 的符号视为 predict，**mc_ref（如 128）** 的符号视为 gt；
+- **Precision（准确率）**：分母 = 满足 **mc_compare** 上 f_bar/margin 阈值的 step；
+  分子 = 其中 ``sign_match_mc_compare_vs_ref`` 为真（compare 与 ref 同号）。
+- **Recall（召回率）**：分母 = 满足 **mc_ref** 上 f_bar/margin 阈值的 step；
+  分子 = 其中 ``sign_match_mc_compare_vs_ref`` 为真。
+- 仅当 trace 里存在非空的 ``sign_match_mc_compare_vs_ref`` 时计入（需 mc_m_samples_compare>0）。
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -115,6 +125,16 @@ def _rec_step_ok_compare(st: dict[str, Any], thr: float, margin_thr: float) -> b
     return True
 
 
+def _get_sign_match_mc_compare_vs_ref(st: dict[str, Any]) -> bool | None:
+    """None = 未计算（未跑 compare 或字段缺失）。"""
+    if "sign_match_mc_compare_vs_ref" not in st:
+        return None
+    v = st.get("sign_match_mc_compare_vs_ref")
+    if v is None:
+        return None
+    return bool(v)
+
+
 def _get_match_vs_mc_compare(st: dict[str, Any], use_trend_all: bool) -> bool:
     """trend 符号是否与 MC compare 的 sign(f_bar_mc - f_real_mc) 一致。"""
     sc = st.get("sign_mc_compare")
@@ -147,11 +167,39 @@ def main() -> None:
         action="store_true",
         help="用 sign_match_real_trend_all 代替 sign_match_real_trend_same_label",
     )
+    p.add_argument(
+        "--pr_threshold_compare",
+        type=float,
+        default=None,
+        help="sign_match_mc_compare_vs_ref 的 precision 分母：mc_compare 侧 f_bar 下限（默认与 --threshold 相同）",
+    )
+    p.add_argument(
+        "--pr_margin_compare",
+        type=float,
+        default=None,
+        help="precision 分母：mc_compare 侧 |f_bar-f_real| 下限（默认与 --margin_threshold 相同）",
+    )
+    p.add_argument(
+        "--pr_threshold_ref",
+        type=float,
+        default=None,
+        help="sign_match_mc_compare_vs_ref 的 recall 分母：mc_ref 侧 f_bar 下限（默认与 --threshold 相同）",
+    )
+    p.add_argument(
+        "--pr_margin_ref",
+        type=float,
+        default=None,
+        help="recall 分母：mc_ref 侧 |f_bar-f_real| 下限（默认与 --margin_threshold 相同）",
+    )
     args = p.parse_args()
 
     steps = _iter_steps(args.input)
     thr = float(args.threshold)
     margin_thr = float(args.margin_threshold)
+    thr_c = float(args.pr_threshold_compare) if args.pr_threshold_compare is not None else thr
+    margin_c = float(args.pr_margin_compare) if args.pr_margin_compare is not None else margin_thr
+    thr_r = float(args.pr_threshold_ref) if args.pr_threshold_ref is not None else thr
+    margin_r = float(args.pr_margin_ref) if args.pr_margin_ref is not None else margin_thr
     use_all = bool(args.use_trend_all)
 
     # 准确率（1-step）
@@ -228,12 +276,65 @@ def main() -> None:
         float(n_both2_cmp_match_vs_ref) / float(n_both2_cmp) if n_both2_cmp > 0 else float("nan")
     )
 
+    # --- Precision / Recall for sign_match_mc_compare_vs_ref (predict=compare, gt=ref) ---
+    prec_pr_steps = [
+        st
+        for st in steps
+        if _rec_step_ok_compare(st, thr_c, margin_c) and _get_sign_match_mc_compare_vs_ref(st) is not None
+    ]
+    n_pr_prec = len(prec_pr_steps)
+    n_pr_prec_pos = sum(1 for st in prec_pr_steps if _get_sign_match_mc_compare_vs_ref(st))
+    pr_precision = float(n_pr_prec_pos) / float(n_pr_prec) if n_pr_prec > 0 else float("nan")
+
+    rec_pr_steps = [
+        st
+        for st in steps
+        if _rec_step_ok_ref(st, thr_r, margin_r) and _get_sign_match_mc_compare_vs_ref(st) is not None
+    ]
+    n_pr_rec = len(rec_pr_steps)
+    n_pr_rec_pos = sum(1 for st in rec_pr_steps if _get_sign_match_mc_compare_vs_ref(st))
+    pr_recall = float(n_pr_rec_pos) / float(n_pr_rec) if n_pr_rec > 0 else float("nan")
+
+    if (
+        math.isfinite(pr_precision)
+        and math.isfinite(pr_recall)
+        and (pr_precision + pr_recall) > 0
+    ):
+        pr_f1 = 2.0 * pr_precision * pr_recall / (pr_precision + pr_recall)
+    else:
+        pr_f1 = float("nan")
+
     report = {
         "input": str(args.input.expanduser().resolve()),
         "threshold": thr,
         "margin_threshold": margin_thr,
+        "pr_precision_threshold_compare": thr_c,
+        "pr_precision_margin_compare": margin_c,
+        "pr_recall_threshold_ref": thr_r,
+        "pr_recall_margin_ref": margin_r,
         "use_trend_all": use_all,
         "num_steps_total_in_traces": len(steps),
+        "precision_recall_sign_match_mc_compare_vs_ref": {
+            "description": (
+                "predict = sign(f_bar_mc_compare - f_real_mc_compare), "
+                "gt = sign(f_bar_mc_ref - f_real_mc_ref); "
+                "Y = sign_match_mc_compare_vs_ref. "
+                "Precision = mean(Y | mc_compare passes f_bar/margin). "
+                "Recall = mean(Y | mc_ref passes f_bar/margin). "
+                "Steps with null sign_match_mc_compare_vs_ref are excluded."
+            ),
+            "precision": {
+                "denominator_steps": n_pr_prec,
+                "numerator_positive": n_pr_prec_pos,
+                "rate": pr_precision,
+            },
+            "recall": {
+                "denominator_steps": n_pr_rec,
+                "numerator_positive": n_pr_rec_pos,
+                "rate": pr_recall,
+            },
+            "f1": pr_f1,
+        },
         "accuracy_side_lookahead_1step": {
             "description": (
                 "keep steps with f_bar_lookahead_1step >= threshold AND "

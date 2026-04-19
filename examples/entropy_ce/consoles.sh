@@ -389,7 +389,7 @@ PROGRESS_ECHO=1 \
 bash verl/examples/entropy_ce/run_compare_bias_sign_bucket_vs_mc_sharded.sh
 
 # 跑完后：在 sign_compare_merged.jsonl 上对比 MC ref(128) 与 MC compare(1) 的召回率，以及 lookahead-2step 准确率子集与二者的交集（阈值/ margin 可调）
-# python3 verl/examples/entropy_ce/analyze_sign_compare_filtered_metrics.py \
-#   --input /mnt/tidal-alsh01/dataset/zeus/hecunjie/entropy_check/compare_bias_sign_mc128_vs_mc1_qwen3_4b/sign_compare_merged.jsonl \
-#   --threshold 0.1 \
-#   --margin_threshold 0.1
+python3 examples/entropy_ce/analyze_sign_compare_filtered_metrics.py \
+  --input /mnt/tidal-alsh01/dataset/zeus/hecunjie/entropy_check/compare_bias_sign_mc128_vs_mc1_qwen3_4b/sign_compare_merged.jsonl \
+  --threshold 0.2 \
+  --margin_threshold 0.1
