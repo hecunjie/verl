@@ -116,7 +116,7 @@ if [ -n "${VALIDATION_DATA_DIR}" ]; then
 fi
 if [ -n "${FEPO_DATA_DIR}" ]; then
   mkdir -p "${FEPO_DATA_DIR}"
-  DUMP_ARGS+=("trainer.fepo_data_dir=${FEPO_DATA_DIR}")
+  DUMP_ARGS+=("+trainer.fepo_data_dir=${FEPO_DATA_DIR}")
   echo "FEPO sampled points dump enabled: ${FEPO_DATA_DIR}"
 fi
 
