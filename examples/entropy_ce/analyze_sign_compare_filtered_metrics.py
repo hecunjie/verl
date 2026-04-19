@@ -24,6 +24,8 @@
 - **Recall（召回率）**：分母 = 满足 **mc_ref** 上 f_bar/margin 阈值的 step；
   分子 = 其中 ``sign_match_mc_compare_vs_ref`` 为真。
 - 仅当 trace 里存在非空的 ``sign_match_mc_compare_vs_ref`` 时计入（需 mc_m_samples_compare>0）。
+- 可额外要求 ``|f_bar - f_real| >= pr_relative_gap_frac * |f_bar|``（precision 用 compare 侧
+  f，recall 用 ref 侧 f），默认 ``pr_relative_gap_frac=0.3``；设为 ``0`` 关闭。
 """
 
 from __future__ import annotations
@@ -125,6 +127,44 @@ def _rec_step_ok_compare(st: dict[str, Any], thr: float, margin_thr: float) -> b
     return True
 
 
+def _relative_gap_ok(f_bar: Any, f_real: Any, rel_frac: float, *, eps: float = 1e-12) -> bool:
+    """|f_bar - f_real| >= rel_frac * |f_bar|；rel_frac<=0 表示不启用相对条件。
+
+    当 |f_bar| 过小（< eps）且 rel_frac>0 时视为不满足（相对比例无意义）。
+    """
+    if rel_frac <= 0:
+        return True
+    if f_bar is None or f_real is None:
+        return False
+    try:
+        fb = float(f_bar)
+        fr = float(f_real)
+    except (TypeError, ValueError):
+        return False
+    afb = abs(fb)
+    if afb < eps:
+        return False
+    return abs(fb - fr) >= rel_frac * afb
+
+
+def _pr_step_ok_compare(
+    st: dict[str, Any], thr: float, margin_thr: float, rel_frac: float
+) -> bool:
+    if not _rec_step_ok_compare(st, thr, margin_thr):
+        return False
+    return _relative_gap_ok(st.get("f_bar_mc_compare"), st.get("f_real_mc_compare"), rel_frac)
+
+
+def _pr_step_ok_ref(
+    st: dict[str, Any], thr: float, margin_thr: float, rel_frac: float
+) -> bool:
+    if not _rec_step_ok_ref(st, thr, margin_thr):
+        return False
+    fb = st.get("f_bar_mc_ref", st.get("f_bar_mc_128"))
+    fr = st.get("f_real_mc_ref", st.get("f_real_mc_128"))
+    return _relative_gap_ok(fb, fr, rel_frac)
+
+
 def _get_sign_match_mc_compare_vs_ref(st: dict[str, Any]) -> bool | None:
     """None = 未计算（未跑 compare 或字段缺失）。"""
     if "sign_match_mc_compare_vs_ref" not in st:
@@ -191,6 +231,16 @@ def main() -> None:
         default=None,
         help="recall 分母：mc_ref 侧 |f_bar-f_real| 下限（默认与 --margin_threshold 相同）",
     )
+    p.add_argument(
+        "--pr_relative_gap_frac",
+        type=float,
+        default=0.3,
+        help=(
+            "仅用于 precision_recall_sign_match_mc_compare_vs_ref：额外要求 "
+            "|f_bar - f_real| >= frac * |f_bar|（precision 用 compare 的 f，recall 用 ref 的 f）。"
+            "设为 0 表示不启用相对条件。"
+        ),
+    )
     args = p.parse_args()
 
     steps = _iter_steps(args.input)
@@ -200,6 +250,7 @@ def main() -> None:
     margin_c = float(args.pr_margin_compare) if args.pr_margin_compare is not None else margin_thr
     thr_r = float(args.pr_threshold_ref) if args.pr_threshold_ref is not None else thr
     margin_r = float(args.pr_margin_ref) if args.pr_margin_ref is not None else margin_thr
+    pr_rel_frac = float(args.pr_relative_gap_frac)
     use_all = bool(args.use_trend_all)
 
     # 准确率（1-step）
@@ -280,7 +331,8 @@ def main() -> None:
     prec_pr_steps = [
         st
         for st in steps
-        if _rec_step_ok_compare(st, thr_c, margin_c) and _get_sign_match_mc_compare_vs_ref(st) is not None
+        if _pr_step_ok_compare(st, thr_c, margin_c, pr_rel_frac)
+        and _get_sign_match_mc_compare_vs_ref(st) is not None
     ]
     n_pr_prec = len(prec_pr_steps)
     n_pr_prec_pos = sum(1 for st in prec_pr_steps if _get_sign_match_mc_compare_vs_ref(st))
@@ -289,7 +341,8 @@ def main() -> None:
     rec_pr_steps = [
         st
         for st in steps
-        if _rec_step_ok_ref(st, thr_r, margin_r) and _get_sign_match_mc_compare_vs_ref(st) is not None
+        if _pr_step_ok_ref(st, thr_r, margin_r, pr_rel_frac)
+        and _get_sign_match_mc_compare_vs_ref(st) is not None
     ]
     n_pr_rec = len(rec_pr_steps)
     n_pr_rec_pos = sum(1 for st in rec_pr_steps if _get_sign_match_mc_compare_vs_ref(st))
@@ -312,6 +365,7 @@ def main() -> None:
         "pr_precision_margin_compare": margin_c,
         "pr_recall_threshold_ref": thr_r,
         "pr_recall_margin_ref": margin_r,
+        "pr_relative_gap_frac": pr_rel_frac,
         "use_trend_all": use_all,
         "num_steps_total_in_traces": len(steps),
         "precision_recall_sign_match_mc_compare_vs_ref": {
@@ -319,8 +373,10 @@ def main() -> None:
                 "predict = sign(f_bar_mc_compare - f_real_mc_compare), "
                 "gt = sign(f_bar_mc_ref - f_real_mc_ref); "
                 "Y = sign_match_mc_compare_vs_ref. "
-                "Precision = mean(Y | mc_compare passes f_bar/margin). "
-                "Recall = mean(Y | mc_ref passes f_bar/margin). "
+                "Precision = mean(Y | mc_compare passes f_bar/margin AND "
+                "|f_bar-f_real| >= pr_relative_gap_frac*|f_bar| on compare). "
+                "Recall = mean(Y | mc_ref passes f_bar/margin AND same relative gap on ref). "
+                "pr_relative_gap_frac=0 disables relative filter. "
                 "Steps with null sign_match_mc_compare_vs_ref are excluded."
             ),
             "precision": {
