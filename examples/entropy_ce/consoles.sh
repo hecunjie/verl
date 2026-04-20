@@ -245,11 +245,11 @@ bash /mnt/ali-sh-1/dataset/zeus/hecunjie/gitlab-source/verl/examples/entropy_ce/
 SAMPLING_TEMPERATURE=1.0 \
 SAMPLING_TOP_P=0.95 \
 SELECTION_F_MODE=mc \
-MC_M_SAMPLES=2 \
+MC_M_SAMPLES=3 \
 MATH_EVAL_BACKEND=math_verify \
 MODEL_PATH=/mnt/tidal-alsh01/dataset/zeus/hecunjie/models/Qwen/Qwen3-4B \
 INPUT_DATA=/mnt/ali-sh-1/dataset/zeus/hecunjie/rl_data/grpo/aime2024_test.parquet \
-OUTPUT_DIR=/mnt/tidal-alsh01/dataset/zeus/hecunjie/entropy_check/infer_topk_f_mc_compare_qwen3_4b_instruct_mc2_aime24 \
+OUTPUT_DIR=/mnt/tidal-alsh01/dataset/zeus/hecunjie/entropy_check/infer_topk_f_mc_compare_qwen3_4b_instruct_mc3_aime24 \
 NPROC_PER_NODE=8 \
 MAX_SAMPLES=2000 \
 MAX_NEW_TOKENS=8192 \

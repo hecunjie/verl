@@ -70,6 +70,13 @@ def build_fepo_jobs(
     entropy_cpu = entropy.detach().cpu()
     pl = int(batch.batch["prompts"].size(1))
 
+    # Prompt side is LEFT-padded in verl (input_ids = [pad...pad, prompt, response]).
+    # We must strip leading pad tokens using attention_mask, otherwise the prefix sent to vLLM
+    # will include pad tokens and produce a next-token distribution very different from rollout.
+    attn_mask = batch.batch.get("attention_mask", None)
+    if attn_mask is not None:
+        attn_mask = attn_mask.detach().cpu().bool()
+
     jobs: list[dict[str, Any]] = []
     coord: list[tuple[int, int]] = []
 
@@ -87,6 +94,15 @@ def build_fepo_jobs(
         # Materialize sample rows once; reuse cheap Python slicing for each point.
         input_row = input_ids[b].tolist()
         resp_row = responses[b].tolist()
+
+        # Locate where the real (non-pad) prompt starts within the left-padded prompt block.
+        if attn_mask is not None:
+            prompt_attn = attn_mask[b, :pl]
+            nonzero = prompt_attn.nonzero(as_tuple=False)
+            prompt_start = int(nonzero[0].item()) if nonzero.numel() > 0 else 0
+        else:
+            prompt_start = 0
+
         for t in ts:
             if t < 0 or t >= valid_len:
                 continue
@@ -97,7 +113,7 @@ def build_fepo_jobs(
 
             cont_max = min(int(f_sentence_max_new_tokens), int(mc_max_new_tokens), rem)
             cont_max = max(1, cont_max)
-            prefix_before = input_row[: pl + t]
+            prefix_before = input_row[prompt_start : pl + t]
             chosen_token = int(resp_row[t])
             suffix_after = resp_row[t + 1 : t + 1 + cont_max]
             jobs.append(
@@ -209,8 +225,10 @@ def run_fepo_advantage_phase(
         "mc_max_new_tokens": mc_cap,
         "candidate_top_p": float(fepo_cfg.get("candidate_top_p", 0.95)),
         "candidate_max_k": int(fepo_cfg.get("candidate_max_k", 20)),
+        "candidate_min_prob": float(fepo_cfg.get("candidate_min_prob", 0.0)),
         "min_candidates": int(fepo_cfg.get("min_candidates", 2)),
         "mc_batch_chunk": int(fepo_cfg.get("mc_batch_chunk", 32)),
+        "fepo_job_concurrency": int(fepo_cfg.get("job_concurrency", 8)),
         "f_bar_mode": str(fepo_cfg.get("f_bar_mode", "branching")),
         "f_real_mode": str(fepo_cfg.get("f_real_mode", "chosen_branch_mc")),
     }

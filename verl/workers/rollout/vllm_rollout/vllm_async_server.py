@@ -950,6 +950,7 @@ class vLLMHttpServer:
         norm_len = bool(payload.get("normalize_by_continuation_length", True))
         candidate_top_p = float(payload.get("candidate_top_p", 0.95))
         candidate_max_k = int(payload.get("candidate_max_k", 20))
+        candidate_min_prob = float(payload.get("candidate_min_prob", 0.0))
         min_candidates = max(2, int(payload.get("min_candidates", 2)))
         batch_chunk = max(1, int(payload.get("mc_batch_chunk", 32)))
         f_bar_mode = str(payload.get("f_bar_mode", "branching"))
@@ -993,6 +994,22 @@ class vLLMHttpServer:
             )
             for local_i, (cands, cand_probs) in enumerate(cand_results):
                 jidx = probe_owner_idx[local_i]
+                # Drop low-probability candidates to reduce MC cost, but always keep ``chosen``
+                # if it is present so that f_real for chosen_branch_mc stays available.
+                if candidate_min_prob > 0.0 and cands:
+                    chosen_tok = int(jobs[jidx]["chosen_token"])
+                    kept: list[int] = []
+                    kept_p: list[float] = []
+                    for c, p in zip(cands, cand_probs, strict=True):
+                        if float(p) >= candidate_min_prob or int(c) == chosen_tok:
+                            kept.append(int(c))
+                            kept_p.append(float(p))
+                    if kept:
+                        s = float(sum(kept_p))
+                        if s > 0.0 and np.isfinite(s):
+                            kept_p = [float(x) / s for x in kept_p]
+                        cands = kept
+                        cand_probs = kept_p
                 cands_by_job[jidx] = cands
                 cand_probs_by_job[jidx] = cand_probs
 
