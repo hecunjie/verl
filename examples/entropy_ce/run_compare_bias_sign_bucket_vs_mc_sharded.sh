@@ -12,6 +12,8 @@ NNODES="${NNODES:-1}"
 NODE_RANK="${NODE_RANK:-0}"
 MAX_SAMPLES="${MAX_SAMPLES:-300}"
 SEED="${SEED:-42}"
+GPUS_PER_PROCESS="${GPUS_PER_PROCESS:-1}"                  # 1 / 2
+RM_GPU_LOCAL_INDEX="${RM_GPU_LOCAL_INDEX:-1}"             # when GPUS_PER_PROCESS=2, RM uses this CUDA index in visible set
 
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-8192}"
 ENTROPY_THRESHOLD="${ENTROPY_THRESHOLD:-1.0}"
@@ -52,6 +54,8 @@ RM_SELECT_MAX_NEW_TOKENS="${RM_SELECT_MAX_NEW_TOKENS:-256}"
 RM_SELECT_TEMPERATURE="${RM_SELECT_TEMPERATURE:-1.0}"
 RM_SELECT_TOP_P="${RM_SELECT_TOP_P:-0.95}"
 RM_SELECT_TIE_BREAK="${RM_SELECT_TIE_BREAK:-candidate_prob}" # candidate_prob / first
+RM_MC_COMPARE="${RM_MC_COMPARE:-0}"                       # 1: compute RM-vs-MC token agreement
+MC_TOKEN_SELECT_OBJECTIVE="${MC_TOKEN_SELECT_OBJECTIVE:-min_f}" # min_f / max_f
 
 SAVE_TRACES="${SAVE_TRACES:-1}"
 NO_PROGRESS="${NO_PROGRESS:-0}"
@@ -74,6 +78,14 @@ if ! [[ "${NPROC_PER_NODE}" =~ ^[0-9]+$ ]] || [ "${NPROC_PER_NODE}" -lt 1 ]; the
   echo "Invalid NPROC_PER_NODE=${NPROC_PER_NODE} (must be >=1)" >&2
   exit 1
 fi
+if ! [[ "${GPUS_PER_PROCESS}" =~ ^[0-9]+$ ]] || { [ "${GPUS_PER_PROCESS}" -ne 1 ] && [ "${GPUS_PER_PROCESS}" -ne 2 ]; }; then
+  echo "Invalid GPUS_PER_PROCESS=${GPUS_PER_PROCESS} (must be 1 or 2)" >&2
+  exit 1
+fi
+if ! [[ "${RM_GPU_LOCAL_INDEX}" =~ ^[0-9]+$ ]] || [ "${RM_GPU_LOCAL_INDEX}" -lt 0 ]; then
+  echo "Invalid RM_GPU_LOCAL_INDEX=${RM_GPU_LOCAL_INDEX} (must be >=0)" >&2
+  exit 1
+fi
 
 WORLD_SIZE=$((NNODES * NPROC_PER_NODE))
 echo "[compare_bias_sign_bucket_vs_mc] NODE_RANK=${NODE_RANK}/${NNODES} NPROC_PER_NODE=${NPROC_PER_NODE} WORLD_SIZE=${WORLD_SIZE}" >&2
@@ -81,6 +93,17 @@ echo "[compare_bias_sign_bucket_vs_mc] NODE_RANK=${NODE_RANK}/${NNODES} NPROC_PE
 PIDS=()
 for ((r = 0; r < NPROC_PER_NODE; r++)); do
   GLOBAL_RANK=$((NODE_RANK * NPROC_PER_NODE + r))
+  MAIN_GPU="${r}"
+  RM_DEVICE_ARG="${RM_MODEL_DEVICE}"
+  CUDA_VISIBLE_DEVICES_ARG="${MAIN_GPU}"
+  if [ "${GPUS_PER_PROCESS}" = "2" ]; then
+    MAIN_GPU=$((2 * r))
+    RM_GPU=$((2 * r + 1))
+    CUDA_VISIBLE_DEVICES_ARG="${MAIN_GPU},${RM_GPU}"
+    if [ "${RM_MODEL_DEVICE}" = "cuda" ] || [ "${RM_MODEL_DEVICE}" = "auto" ]; then
+      RM_DEVICE_ARG="cuda:${RM_GPU_LOCAL_INDEX}"
+    fi
+  fi
   EXTRA_ARGS=()
   if [ "${SAVE_TRACES}" != "1" ]; then
     EXTRA_ARGS+=(--no-save_traces)
@@ -94,8 +117,11 @@ for ((r = 0; r < NPROC_PER_NODE; r++)); do
   if [ "${PROGRESS_ECHO}" = "1" ]; then
     EXTRA_ARGS+=(--progress_echo)
   fi
+  if [ "${RM_MC_COMPARE}" = "1" ]; then
+    EXTRA_ARGS+=(--rm_mc_compare)
+  fi
 
-  CUDA_VISIBLE_DEVICES="${r}" python3 examples/entropy_ce/compare_bias_sign_bucket_vs_mc.py \
+  CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES_ARG}" python3 examples/entropy_ce/compare_bias_sign_bucket_vs_mc.py \
     --input_data "${INPUT_DATA}" \
     --model_path "${MODEL_PATH}" \
     --output_dir "${OUTPUT_DIR}" \
@@ -130,13 +156,14 @@ for ((r = 0; r < NPROC_PER_NODE; r++)); do
     --rm_score_backend "${RM_SCORE_BACKEND}" \
     --rm_model_path "${RM_MODEL_PATH}" \
     --rm_model_tokenizer_path "${RM_MODEL_TOKENIZER_PATH}" \
-    --rm_model_device "${RM_MODEL_DEVICE}" \
+    --rm_model_device "${RM_DEVICE_ARG}" \
     --rm_model_max_length "${RM_MODEL_MAX_LENGTH}" \
     --rm_select_decode_mode "${RM_SELECT_DECODE_MODE}" \
     --rm_select_max_new_tokens "${RM_SELECT_MAX_NEW_TOKENS}" \
     --rm_select_temperature "${RM_SELECT_TEMPERATURE}" \
     --rm_select_top_p "${RM_SELECT_TOP_P}" \
     --rm_select_tie_break "${RM_SELECT_TIE_BREAK}" \
+    --mc_token_select_objective "${MC_TOKEN_SELECT_OBJECTIVE}" \
     --vllm_shard_rank "${GLOBAL_RANK}" \
     --vllm_shard_world_size "${WORLD_SIZE}" \
     "${EXTRA_ARGS[@]}" \

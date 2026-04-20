@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import random
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -78,6 +79,51 @@ def _append_boxed_instruction(prompt_text: str) -> str:
     if "\\boxed" in prompt_text:
         return prompt_text
     return f"{prompt_text.rstrip()}{suffix}"
+
+
+def _extract_last_boxed_content(text: str) -> str | None:
+    """Extract the content of the last \\boxed{...} occurrence."""
+    if not text:
+        return None
+    starts = [m.start() for m in re.finditer(r"\\boxed\s*\{", text)]
+    if not starts:
+        return None
+    for st in reversed(starts):
+        brace_start = text.find("{", st)
+        if brace_start < 0:
+            continue
+        depth = 0
+        for i in range(brace_start, len(text)):
+            ch = text[i]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    inner = text[brace_start + 1 : i].strip()
+                    return inner if inner else None
+    return None
+
+
+def _evaluate_final_boxed_only(
+    *,
+    data_source: str,
+    solution_str: str,
+    ground_truth: str,
+    math_eval_backend: str,
+) -> tuple[bool, dict[str, Any], str | None]:
+    """Strict evaluator: only score the last boxed answer."""
+    boxed = _extract_last_boxed_content(solution_str)
+    if boxed is None:
+        return False, {"mode": "final_boxed_only", "reason": "no_boxed_found"}, None
+    boxed_solution = f"Answer: \\boxed{{{boxed}}}"
+    ok, eval_info = evaluate_solution_acc(
+        data_source=data_source,
+        solution_str=boxed_solution,
+        ground_truth=ground_truth,
+        math_eval_backend=math_eval_backend,
+    )
+    return bool(ok), {"mode": "final_boxed_only", "inner_eval": eval_info}, boxed
 
 
 def _step_logprobs_vllm(llm: Any, prefix_ids: list[int], logprobs_k: int) -> tuple[int | None, dict[int, float]]:
@@ -720,6 +766,9 @@ def main() -> None:
     acc_minf: list[float] = []
     acc_rand: list[float] = []
     acc_greedy: list[float] = []
+    acc_minf_boxed: list[float] = []
+    acc_rand_boxed: list[float] = []
+    acc_greedy_boxed: list[float] = []
     branch_count_minf: list[float] = []
     branch_count_rand: list[float] = []
     branch_count_greedy: list[float] = []
@@ -886,9 +935,30 @@ def main() -> None:
             ground_truth=ground_truth,
             math_eval_backend=str(args.math_eval_backend),
         )
+        ok_minf_boxed, eval_minf_boxed, minf_boxed_answer = _evaluate_final_boxed_only(
+            data_source=data_source,
+            solution_str=text_minf,
+            ground_truth=ground_truth,
+            math_eval_backend=str(args.math_eval_backend),
+        )
+        ok_rand_boxed, eval_rand_boxed, rand_boxed_answer = _evaluate_final_boxed_only(
+            data_source=data_source,
+            solution_str=text_rand,
+            ground_truth=ground_truth,
+            math_eval_backend=str(args.math_eval_backend),
+        )
+        ok_greedy_boxed, eval_greedy_boxed, greedy_boxed_answer = _evaluate_final_boxed_only(
+            data_source=data_source,
+            solution_str=text_greedy,
+            ground_truth=ground_truth,
+            math_eval_backend=str(args.math_eval_backend),
+        )
         acc_minf.append(1.0 if ok_minf else 0.0)
         acc_rand.append(1.0 if ok_rand else 0.0)
         acc_greedy.append(1.0 if ok_greedy else 0.0)
+        acc_minf_boxed.append(1.0 if ok_minf_boxed else 0.0)
+        acc_rand_boxed.append(1.0 if ok_rand_boxed else 0.0)
+        acc_greedy_boxed.append(1.0 if ok_greedy_boxed else 0.0)
         branch_count_minf.append(float(len(trace_minf)))
         branch_count_rand.append(float(len(trace_rand)))
         branch_count_greedy.append(float(len(trace_greedy)))
@@ -922,6 +992,9 @@ def main() -> None:
             "result_min_f_mc": {
                 "is_correct": bool(ok_minf),
                 "eval": eval_minf,
+                "is_correct_final_boxed_only": bool(ok_minf_boxed),
+                "final_boxed_eval": eval_minf_boxed,
+                "final_boxed_answer": minf_boxed_answer,
                 "response_text": text_minf,
                 "response_len_tokens": int(len(response_minf)),
                 "num_branch_steps": int(len(trace_minf)),
@@ -929,6 +1002,9 @@ def main() -> None:
             "result_random_sampling": {
                 "is_correct": bool(ok_rand),
                 "eval": eval_rand,
+                "is_correct_final_boxed_only": bool(ok_rand_boxed),
+                "final_boxed_eval": eval_rand_boxed,
+                "final_boxed_answer": rand_boxed_answer,
                 "response_text": text_rand,
                 "response_len_tokens": int(len(response_rand)),
                 "num_branch_steps": int(len(trace_rand)),
@@ -937,6 +1013,9 @@ def main() -> None:
             "result_random_topk": {
                 "is_correct": bool(ok_rand),
                 "eval": eval_rand,
+                "is_correct_final_boxed_only": bool(ok_rand_boxed),
+                "final_boxed_eval": eval_rand_boxed,
+                "final_boxed_answer": rand_boxed_answer,
                 "response_text": text_rand,
                 "response_len_tokens": int(len(response_rand)),
                 "num_branch_steps": int(len(trace_rand)),
@@ -944,6 +1023,9 @@ def main() -> None:
             "result_greedy_baseline": {
                 "is_correct": bool(ok_greedy),
                 "eval": eval_greedy,
+                "is_correct_final_boxed_only": bool(ok_greedy_boxed),
+                "final_boxed_eval": eval_greedy_boxed,
+                "final_boxed_answer": greedy_boxed_answer,
                 "response_text": text_greedy,
                 "response_len_tokens": int(len(response_greedy)),
                 "num_branch_steps": int(len(trace_greedy)),
@@ -988,13 +1070,29 @@ def main() -> None:
         n = len(merged)
         if n > 0:
             acc_minf_all = [1.0 if x["result_min_f_mc"]["is_correct"] else 0.0 for x in merged]
+            acc_minf_boxed_all = [
+                1.0 if x["result_min_f_mc"].get("is_correct_final_boxed_only", False) else 0.0 for x in merged
+            ]
             acc_rand_all = [
                 1.0
                 if (x.get("result_random_sampling", x.get("result_random_topk", {})).get("is_correct", False))
                 else 0.0
                 for x in merged
             ]
+            acc_rand_boxed_all = [
+                1.0
+                if (
+                    x.get("result_random_sampling", x.get("result_random_topk", {})).get(
+                        "is_correct_final_boxed_only", False
+                    )
+                )
+                else 0.0
+                for x in merged
+            ]
             acc_greedy_all = [1.0 if x["result_greedy_baseline"]["is_correct"] else 0.0 for x in merged]
+            acc_greedy_boxed_all = [
+                1.0 if x["result_greedy_baseline"].get("is_correct_final_boxed_only", False) else 0.0 for x in merged
+            ]
             branch_minf_all = [float(x["result_min_f_mc"]["num_branch_steps"]) for x in merged]
             branch_rand_all = [
                 float(x.get("result_random_sampling", x.get("result_random_topk", {})).get("num_branch_steps", 0.0))
@@ -1009,8 +1107,11 @@ def main() -> None:
             len_greedy_all = [float(x["result_greedy_baseline"]["response_len_tokens"]) for x in merged]
         else:
             acc_minf_all = acc_minf
+            acc_minf_boxed_all = acc_minf_boxed
             acc_rand_all = acc_rand
+            acc_rand_boxed_all = acc_rand_boxed
             acc_greedy_all = acc_greedy
+            acc_greedy_boxed_all = acc_greedy_boxed
             branch_minf_all = branch_count_minf
             branch_rand_all = branch_count_rand
             branch_greedy_all = branch_count_greedy
@@ -1021,12 +1122,17 @@ def main() -> None:
         summary = {
             "num_prompts": int(n),
             "accuracy_min_f_mc": _mean(acc_minf_all),
+            "accuracy_min_f_mc_final_boxed_only": _mean(acc_minf_boxed_all),
             "accuracy_random_sampling": _mean(acc_rand_all),
+            "accuracy_random_sampling_final_boxed_only": _mean(acc_rand_boxed_all),
             # Backward-compatible alias.
             "accuracy_random_topk": _mean(acc_rand_all),
             "accuracy_greedy_baseline": _mean(acc_greedy_all),
+            "accuracy_greedy_baseline_final_boxed_only": _mean(acc_greedy_boxed_all),
             "accuracy_gain_abs": _mean(acc_minf_all) - _mean(acc_rand_all),
+            "accuracy_gain_abs_final_boxed_only": _mean(acc_minf_boxed_all) - _mean(acc_rand_boxed_all),
             "accuracy_gain_abs_vs_greedy": _mean(acc_minf_all) - _mean(acc_greedy_all),
+            "accuracy_gain_abs_vs_greedy_final_boxed_only": _mean(acc_minf_boxed_all) - _mean(acc_greedy_boxed_all),
             "paired_improve_count": int(paired_improve),
             "paired_regress_count": int(paired_regress),
             "paired_net_gain": int(paired_improve - paired_regress),
@@ -1043,6 +1149,15 @@ def main() -> None:
             # Backward-compatible alias.
             "avg_response_len_random_topk": _mean(len_rand_all),
             "avg_response_len_greedy_baseline": _mean(len_greedy_all),
+            "hit_max_len_rate_min_f_mc": _mean(
+                [1.0 if float(v) >= float(args.max_new_tokens) else 0.0 for v in len_minf_all]
+            ),
+            "hit_max_len_rate_random_sampling": _mean(
+                [1.0 if float(v) >= float(args.max_new_tokens) else 0.0 for v in len_rand_all]
+            ),
+            "hit_max_len_rate_greedy_baseline": _mean(
+                [1.0 if float(v) >= float(args.max_new_tokens) else 0.0 for v in len_greedy_all]
+            ),
             "config": {
                 "entropy_threshold": float(args.entropy_threshold),
                 "candidate_top_p": float(args.candidate_top_p),

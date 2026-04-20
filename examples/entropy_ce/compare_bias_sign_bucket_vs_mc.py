@@ -332,6 +332,9 @@ def _decode_candidate_completion_vllm(
     decode_mode: str,
     temperature: float,
     top_p: float,
+    continuation_mode: str,
+    tokenizer: Any | None,
+    sentence_stop_check: Any | None,
 ) -> list[int]:
     from vllm import SamplingParams
     from vllm.inputs import TokensPrompt
@@ -349,7 +352,39 @@ def _decode_candidate_completion_vllm(
         )
     out = vllm_generate_quiet(llm, [TokensPrompt(prompt_token_ids=prefix_ids)], sp)
     o = out[0].outputs[0]
-    return [int(t) for t in (o.token_ids or [])]
+    gen_ids = [int(t) for t in (o.token_ids or [])]
+    if str(continuation_mode) == "first_sentence":
+        if tokenizer is None or sentence_stop_check is None:
+            raise ValueError("tokenizer and sentence_stop_check are required for first_sentence continuation mode.")
+        from sentence_stop_utils import truncate_gen_ids_to_first_sentence
+
+        keep_k = int(truncate_gen_ids_to_first_sentence(gen_ids, tokenizer, sentence_stop_check))
+        gen_ids = gen_ids[: max(0, keep_k)]
+    return gen_ids
+
+
+def _select_mc_token_by_objective(
+    *,
+    cands: list[int],
+    cand_probs: list[float],
+    f_vals: list[float],
+    objective: str,
+) -> tuple[int, float]:
+    if not cands or len(cands) != len(f_vals) or len(cands) != len(cand_probs):
+        raise ValueError("cands/cand_probs/f_vals must be non-empty and have equal length.")
+    better = (lambda cur, best: cur < best) if str(objective) == "min_f" else (lambda cur, best: cur > best)
+    best_i = 0
+    best_v = float(f_vals[0])
+    best_p = float(cand_probs[0])
+    for i in range(1, len(cands)):
+        v = float(f_vals[i])
+        p = float(cand_probs[i])
+        if better(v, best_v):
+            best_i, best_v, best_p = i, v, p
+            continue
+        if abs(v - best_v) <= 1e-12 and p > best_p:
+            best_i, best_v, best_p = i, v, p
+    return int(cands[best_i]), float(best_v)
 
 
 def _reward_scalar_from_eval(ok: bool, score_info: dict[str, Any]) -> float:
@@ -476,9 +511,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--rm_model_device",
-        choices=["auto", "cpu", "cuda"],
+        type=str,
         default="cpu",
-        help="Device for open-source reward model inference.",
+        help="Device for open-source reward model inference (e.g. auto/cpu/cuda/cuda:1).",
     )
     parser.add_argument(
         "--rm_model_max_length",
@@ -517,6 +552,17 @@ def main() -> None:
         help="Tie-break rule when multiple candidates have same reward score.",
     )
     parser.add_argument(
+        "--rm_mc_compare",
+        action="store_true",
+        help="Also compute RM-selected token vs MC-selected token agreement at each eval step.",
+    )
+    parser.add_argument(
+        "--mc_token_select_objective",
+        choices=["min_f", "max_f"],
+        default="min_f",
+        help="How MC picks token from candidate continuations for RM-vs-MC agreement.",
+    )
+    parser.add_argument(
         "--math_eval_backend",
         choices=["auto", "math_dapo", "math_verify"],
         default="auto",
@@ -548,7 +594,10 @@ def main() -> None:
         raise SystemExit("--bucket_min_points_per_bin must be >=1.")
     if int(args.local_window_left_tokens) < 0 or int(args.local_window_right_tokens) < 0:
         raise SystemExit("--local_window_left_tokens and --local_window_right_tokens must be >=0.")
-    if str(args.branch_token_selector) == "reward_model" and str(args.rm_score_backend) == "open_source_rm":
+    if (
+        str(args.rm_score_backend) == "open_source_rm"
+        and (str(args.branch_token_selector) == "reward_model" or bool(args.rm_mc_compare))
+    ):
         if not str(args.rm_model_path).strip():
             raise SystemExit("--rm_model_path is required when --rm_score_backend=open_source_rm.")
 
@@ -622,6 +671,8 @@ def main() -> None:
         "n_skipped_chosen_not_in_candidates": 0,
         "n_match_sign_mc_compare_vs_ref": 0,
         "n_eval_steps_mc_compare": 0,
+        "n_eval_steps_rm_mc_compare": 0,
+        "n_match_rm_vs_mc_token": 0,
     }
 
     sentence_stop_check = None
@@ -635,7 +686,11 @@ def main() -> None:
         sentence_stop_check = completion_should_stop_after_first_sentence_simple
 
     rm_scorer = None
-    if str(args.branch_token_selector) == "reward_model" and str(args.rm_score_backend) == "open_source_rm":
+    need_open_source_rm = (
+        str(args.rm_score_backend) == "open_source_rm"
+        and (str(args.branch_token_selector) == "reward_model" or bool(args.rm_mc_compare))
+    )
+    if need_open_source_rm:
         rm_scorer = _build_open_source_rm_scorer(
             model_path=str(args.rm_model_path),
             tokenizer_path=str(args.rm_model_tokenizer_path) or None,
@@ -745,12 +800,14 @@ def main() -> None:
             branch_selected_by = "real_path"
             rm_candidate_scores: list[float] | None = None
             rm_selected_score: float | None = None
+            rm_selected_token: int | None = None
+            need_rm_scoring = bool(args.rm_mc_compare) or str(args.branch_token_selector) == "reward_model"
             if str(args.branch_token_selector) == "real_path":
                 if chosen_token not in cands:
                     summary_cnt["n_skipped_chosen_not_in_candidates"] += 1
                     continue
-            else:
-                # Reward-model branch selection at each split point.
+            if need_rm_scoring:
+                # Reward-model candidate scoring at each split point.
                 prefix_before = prompt_ids + response_ids[:step_idx]
                 decode_cap = int(min(max(1, int(args.rm_select_max_new_tokens)), remaining))
                 score_pairs: list[tuple[float, int, float]] = []
@@ -764,6 +821,9 @@ def main() -> None:
                         decode_mode=str(args.rm_select_decode_mode),
                         temperature=float(args.rm_select_temperature),
                         top_p=float(args.rm_select_top_p),
+                        continuation_mode=str(args.f_continuation_mode),
+                        tokenizer=tokenizer if str(args.f_continuation_mode) == "first_sentence" else None,
+                        sentence_stop_check=sentence_stop_check if str(args.f_continuation_mode) == "first_sentence" else None,
                     )
                     branch_response_ids = response_ids[:step_idx] + [int(tok)] + gen_ids
                     branch_response_text = tokenizer.decode(branch_response_ids, skip_special_tokens=True)
@@ -785,9 +845,11 @@ def main() -> None:
                 if not score_pairs:
                     continue
                 score_pairs_sorted = sorted(score_pairs, key=lambda x: (x[0], x[1]), reverse=True)
-                chosen_token = int(score_pairs_sorted[0][2])
+                rm_selected_token = int(score_pairs_sorted[0][2])
                 rm_selected_score = float(score_pairs_sorted[0][0])
-                branch_selected_by = "reward_model"
+                if str(args.branch_token_selector) == "reward_model":
+                    chosen_token = int(rm_selected_token)
+                    branch_selected_by = "reward_model"
                 if chosen_token not in cands:
                     # Defensive guard (shouldn't happen).
                     continue
@@ -814,6 +876,17 @@ def main() -> None:
             fbar_mc = float(sum(float(p) * float(v) for p, v in zip(cand_probs, f_mc, strict=False)))
             f_real_mc = float(f_mc[chosen_idx])
             sign_mc_real = _sign(fbar_mc - f_real_mc)
+            mc_selected_token, mc_selected_f = _select_mc_token_by_objective(
+                cands=[int(x) for x in cands],
+                cand_probs=[float(x) for x in cand_probs],
+                f_vals=[float(x) for x in f_mc],
+                objective=str(args.mc_token_select_objective),
+            )
+            rm_vs_mc_token_match: bool | None = None
+            if rm_selected_token is not None:
+                rm_vs_mc_token_match = bool(int(rm_selected_token) == int(mc_selected_token))
+                summary_cnt["n_eval_steps_rm_mc_compare"] += 1
+                summary_cnt["n_match_rm_vs_mc_token"] += int(rm_vs_mc_token_match)
 
             f_mc_compare: list[float] | None = None
             fbar_mc_compare: float | None = None
@@ -957,7 +1030,12 @@ def main() -> None:
                         "chosen_text_real_path": tokenizer.decode([int(chosen_token_real_path)], skip_special_tokens=True),
                         "branch_selected_by": branch_selected_by,
                         "rm_candidate_scores": rm_candidate_scores,
+                        "rm_selected_token": int(rm_selected_token) if rm_selected_token is not None else None,
                         "rm_selected_score": rm_selected_score,
+                        "mc_selected_token": int(mc_selected_token),
+                        "mc_selected_text": tokenizer.decode([int(mc_selected_token)], skip_special_tokens=True),
+                        "mc_selected_f_ref": float(mc_selected_f),
+                        "rm_vs_mc_token_match": rm_vs_mc_token_match,
                         "candidate_count": int(len(cands)),
                         "candidates": [int(x) for x in cands],
                         "candidate_probs_renorm_topp": [float(x) for x in cand_probs],
@@ -1079,6 +1157,10 @@ def main() -> None:
                 if int(args.mc_m_samples_compare) > 0
                 else float("nan")
             ),
+            "rm_vs_mc_token_agreement": _mean_ratio(
+                int(total["n_match_rm_vs_mc_token"]),
+                int(total["n_eval_steps_rm_mc_compare"]),
+            ),
             "real_sign_match_acc_all_trend_same_label": (
                 _mean_ratio(int(total["n_match_steps_trend_same_label"]), int(total["n_eval_steps"]))
             ),
@@ -1117,6 +1199,8 @@ def main() -> None:
                 "local_window_left_tokens": int(args.local_window_left_tokens),
                 "local_window_right_tokens": int(args.local_window_right_tokens),
                 "fbar_mode": str(args.fbar_mode),
+                "rm_mc_compare": bool(args.rm_mc_compare),
+                "mc_token_select_objective": str(args.mc_token_select_objective),
             },
         }
         with open(out_dir / "sign_compare_summary.json", "w", encoding="utf-8") as f:
