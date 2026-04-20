@@ -956,6 +956,7 @@ class vLLMHttpServer:
         probe_batch_chunk = max(1, int(payload.get("probe_batch_chunk", mc_batch_chunk)))
         f_bar_mode = str(payload.get("f_bar_mode", "branching"))
         f_real_mode = str(payload.get("f_real_mode", "chosen_branch_mc"))
+        detail_full = bool(payload.get("detail_full", False))
         if f_bar_mode not in {"branching", "prefix_minus_ht"}:
             f_bar_mode = "branching"
         if f_real_mode not in {"chosen_branch_mc", "teacher_forced_real_path"}:
@@ -1022,25 +1023,99 @@ class vLLMHttpServer:
             chosen = int(job["chosen_token"])
 
             if need_cands and len(cands) < min_candidates:
-                details[jidx] = {
-                    "reason": "insufficient_candidates",
-                    "f_bar_mode": f_bar_mode,
-                    "f_real_mode": f_real_mode,
-                    "cands": cands,
-                    "cand_probs": cand_probs,
-                }
+                d = {"reason": "insufficient_candidates", "f_bar_mode": f_bar_mode, "f_real_mode": f_real_mode}
+                if detail_full:
+                    d["cands"] = cands
+                    d["cand_probs"] = cand_probs
+                details[jidx] = d
                 continue
             # Early reject before expensive MC when chosen branch is unavailable.
             if f_real_mode == "chosen_branch_mc" and chosen not in cands:
-                details[jidx] = {
-                    "reason": "chosen_not_in_candidates",
-                    "f_bar_mode": f_bar_mode,
-                    "f_real_mode": f_real_mode,
-                    "cands": cands,
-                    "cand_probs": cand_probs,
-                }
+                d = {"reason": "chosen_not_in_candidates", "f_bar_mode": f_bar_mode, "f_real_mode": f_real_mode}
+                if detail_full:
+                    d["cands"] = cands
+                    d["cand_probs"] = cand_probs
+                details[jidx] = d
                 continue
             compute_idx.append(jidx)
+
+        # Global pooling: aggregate branch MC requests across jobs, then scatter results back.
+        # This keeps FEPO math unchanged while reducing per-job request overhead.
+        f_mc_by_job: list[list[float] | None] = [None for _ in range(n_jobs)]
+        if need_cands and compute_idx:
+            gen_cap_groups: dict[int, list[int]] = {}
+            for jidx in compute_idx:
+                gc = max(1, int(jobs[jidx]["cont_max_new_tokens"]))
+                gen_cap_groups.setdefault(gc, []).append(jidx)
+
+            next_compute_idx: list[int] = []
+            for gc, gidx in gen_cap_groups.items():
+                pooled_prefixes: list[list[int]] = []
+                pooled_owner_and_len: list[tuple[int, int, int]] = []
+                for jidx in gidx:
+                    job = jobs[jidx]
+                    pb = list(job["prefix_before"])
+                    cands = cands_by_job[jidx]
+                    start = len(pooled_prefixes)
+                    pooled_prefixes.extend([pb + [int(c)] for c in cands])
+                    pooled_owner_and_len.append((jidx, start, len(cands)))
+
+                if not pooled_prefixes:
+                    continue
+
+                pooled_vals = await self._fepo_mc_mean_f_per_prefix(
+                    pooled_prefixes,
+                    m_samples=mc_m,
+                    gen_cap=int(gc),
+                    mc_temperature=mc_temperature,
+                    mc_top_p=mc_top_p,
+                    k_lp=k_lp,
+                    f_mode=f_mode,
+                    norm_len=norm_len,
+                    tokenizer=tokenizer,
+                    stop_fn=stop_fn,
+                    batch_chunk=int(mc_batch_chunk),
+                )
+                for jidx, start, cnt in pooled_owner_and_len:
+                    sub = pooled_vals[start : start + cnt]
+                    if len(sub) != cnt:
+                        d = {"reason": "mc_size_mismatch", "f_bar_mode": f_bar_mode, "f_real_mode": f_real_mode}
+                        if detail_full:
+                            d["cands"] = cands_by_job[jidx]
+                            d["cand_probs"] = cand_probs_by_job[jidx]
+                            d["f_mc"] = sub
+                        details[jidx] = d
+                        continue
+                    f_mc_by_job[jidx] = [float(x) for x in sub]
+                    next_compute_idx.append(jidx)
+            compute_idx = next_compute_idx
+
+        # Optional pooling for prefix_minus_ht f_bar (grouped by gen_cap).
+        f_bar_pmht_by_job: list[float | None] = [None for _ in range(n_jobs)]
+        if f_bar_mode == "prefix_minus_ht" and compute_idx:
+            gen_cap_groups: dict[int, list[int]] = {}
+            for jidx in compute_idx:
+                gc = max(1, int(jobs[jidx]["cont_max_new_tokens"]) + 1)
+                gen_cap_groups.setdefault(gc, []).append(jidx)
+            for gc, gidx in gen_cap_groups.items():
+                prefixes = [list(jobs[j]["prefix_before"]) for j in gidx]
+                hvals = [float(jobs[j].get("h_t", 0.0)) for j in gidx]
+                vals = await self._fepo_mc_mean_future_rate_minus_ht(
+                    prefixes,
+                    m_samples=mc_m,
+                    gen_cap=int(gc),
+                    mc_temperature=mc_temperature,
+                    mc_top_p=mc_top_p,
+                    k_lp=k_lp,
+                    f_mode=f_mode,
+                    tokenizer=tokenizer,
+                    stop_fn=stop_fn,
+                    batch_chunk=int(mc_batch_chunk),
+                    h_t_values=hvals,
+                )
+                for local_i, jidx in enumerate(gidx):
+                    if local_i < len(vals):
+                        f_bar_pmht_by_job[jidx] = float(vals[local_i])
 
         job_concurrency = max(1, min(int(payload.get("fepo_job_concurrency", 8)), len(compute_idx) if compute_idx else 1))
 
@@ -1050,57 +1125,22 @@ class vLLMHttpServer:
             chosen = int(job["chosen_token"])
             gen_cap = max(1, int(job["cont_max_new_tokens"]))
             suffix_after = list(job.get("suffix_after", []))
-            job_batch_chunk = int(mc_batch_chunk)
-
             cands = cands_by_job[jidx]
             cand_probs = cand_probs_by_job[jidx]
             f_mc: list[float] = []
-
             if need_cands:
-                prefixes = [pb + [int(c)] for c in cands]
-                f_mc = await self._fepo_mc_mean_f_per_prefix(
-                    prefixes,
-                    m_samples=mc_m,
-                    gen_cap=gen_cap,
-                    mc_temperature=mc_temperature,
-                    mc_top_p=mc_top_p,
-                    k_lp=k_lp,
-                    f_mode=f_mode,
-                    norm_len=norm_len,
-                    tokenizer=tokenizer,
-                    stop_fn=stop_fn,
-                    batch_chunk=job_batch_chunk,
-                )
-                if len(f_mc) != len(cands):
-                    return (
-                        jidx,
-                        0.0,
-                        False,
-                        {
-                            "reason": "mc_size_mismatch",
-                            "f_bar_mode": f_bar_mode,
-                            "f_real_mode": f_real_mode,
-                            "cands": cands,
-                            "cand_probs": cand_probs,
-                            "f_mc": f_mc,
-                        },
-                    )
+                cached = f_mc_by_job[jidx]
+                if cached is None:
+                    d = {"reason": "mc_not_precomputed", "f_bar_mode": f_bar_mode, "f_real_mode": f_real_mode}
+                    if detail_full:
+                        d["cands"] = cands
+                        d["cand_probs"] = cand_probs
+                    return (jidx, 0.0, False, d)
+                f_mc = cached
 
             if f_bar_mode == "prefix_minus_ht":
-                f_bar_list = await self._fepo_mc_mean_future_rate_minus_ht(
-                    [pb],
-                    m_samples=mc_m,
-                    gen_cap=max(1, gen_cap + 1),
-                    mc_temperature=mc_temperature,
-                    mc_top_p=mc_top_p,
-                    k_lp=k_lp,
-                    f_mode=f_mode,
-                    tokenizer=tokenizer,
-                    stop_fn=stop_fn,
-                    batch_chunk=job_batch_chunk,
-                    h_t_values=[float(job.get("h_t", 0.0))],
-                )
-                f_bar = float(f_bar_list[0]) if f_bar_list else 0.0
+                cached_bar = f_bar_pmht_by_job[jidx]
+                f_bar = float(cached_bar) if cached_bar is not None else 0.0
             else:
                 if not cands:
                     return (
@@ -1124,22 +1164,20 @@ class vLLMHttpServer:
             else:
                 f_real = float(f_mc[cands.index(chosen)])
 
-            return (
-                jidx,
-                float(f_bar - f_real),
-                True,
-                {
-                    "f_bar_mode": f_bar_mode,
-                    "f_real_mode": f_real_mode,
-                    "f_bar": float(f_bar),
-                    "f_real": float(f_real),
-                    "branch_min_f_mc": float(min(f_mc)) if f_mc else None,
-                    "cands": [int(x) for x in cands] if cands else [],
-                    "cand_probs": [float(x) for x in cand_probs] if cand_probs else [],
-                    "f_mc": [float(x) for x in f_mc] if f_mc else [],
-                    "mc_batch_chunk_used": int(job_batch_chunk),
-                },
-            )
+            detail: dict[str, Any] = {
+                "f_bar_mode": f_bar_mode,
+                "f_real_mode": f_real_mode,
+                "f_bar": float(f_bar),
+                "f_real": float(f_real),
+                "branch_min_f_mc": float(min(f_mc)) if f_mc else None,
+                "mc_batch_chunk_used": int(mc_batch_chunk),
+            }
+            if detail_full:
+                detail["cands"] = [int(x) for x in cands] if cands else []
+                detail["cand_probs"] = [float(x) for x in cand_probs] if cand_probs else []
+                detail["f_mc"] = [float(x) for x in f_mc] if f_mc else []
+
+            return (jidx, float(f_bar - f_real), True, detail)
 
         for start in range(0, len(compute_idx), job_concurrency):
             end = min(start + job_concurrency, len(compute_idx))

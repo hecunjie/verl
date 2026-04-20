@@ -1740,6 +1740,10 @@ class RayPPOTrainer:
 
                             _fepo_cfg = self.config.algorithm.get("fepo", {}) or {}
                             fepo_cfg = OmegaConf.to_container(_fepo_cfg, resolve=True)
+                            fepo_dump_freq = int(self.config.trainer.get("fepo_dump_freq", 50))
+                            fepo_should_dump = fepo_dump_freq > 0 and self.global_steps % fepo_dump_freq == 0
+                            fepo_cfg = dict(fepo_cfg)
+                            fepo_cfg["__collect_point_records"] = bool(fepo_should_dump)
                             batch, fepo_metrics, fepo_point_records = run_fepo_advantage_phase(
                                 batch,
                                 self.tokenizer,
@@ -1747,8 +1751,7 @@ class RayPPOTrainer:
                                 self.async_rollout_manager if self.async_rollout_mode else None,
                             )
                             metrics.update(fepo_metrics)
-                            fepo_dump_freq = int(self.config.trainer.get("fepo_dump_freq", 50))
-                            if fepo_dump_freq > 0 and self.global_steps % fepo_dump_freq == 0:
+                            if fepo_should_dump:
                                 fepo_data_dir = self.config.trainer.get("fepo_data_dir", None)
                                 if fepo_data_dir is None:
                                     fepo_data_dir = os.path.join(self.config.trainer.default_local_dir, "fepo_data")

@@ -172,6 +172,7 @@ def run_fepo_advantage_phase(
     enable = bool(fepo_cfg.get("enable", False))
     if not enable:
         return batch, {}, []
+    collect_point_records = bool(fepo_cfg.get("__collect_point_records", True))
 
     h_threshold = float(fepo_cfg.get("h_threshold", 2.0))
     max_points = int(fepo_cfg.get("max_points_per_seq", 4))
@@ -230,6 +231,7 @@ def run_fepo_advantage_phase(
         "probe_batch_chunk": int(fepo_cfg.get("probe_batch_chunk", int(fepo_cfg.get("mc_batch_chunk", 32)))),
         "mc_batch_chunk": int(fepo_cfg.get("mc_batch_chunk", 32)),
         "fepo_job_concurrency": int(fepo_cfg.get("job_concurrency", 8)),
+        "detail_full": bool(collect_point_records),
         "f_bar_mode": str(fepo_cfg.get("f_bar_mode", "branching")),
         "f_real_mode": str(fepo_cfg.get("f_real_mode", "chosen_branch_mc")),
     }
@@ -321,34 +323,35 @@ def run_fepo_advantage_phase(
     for rk, rv in fail_reasons.items():
         metrics[f"fepo/fail_{rk}"] = float(rv)
     point_records: list[dict[str, Any]] = []
-    for i, ((b, t), job) in enumerate(zip(coord, jobs, strict=False)):
-        d = details[i] if i < len(details) and isinstance(details[i], dict) else {}
-        rec: dict[str, Any] = {
-            "batch_index": int(b),
-            "response_t": int(t),
-            "ok": bool(ok[i]) if i < len(ok) else False,
-            "delta": float(deltas[i]) if i < len(deltas) else None,
-            "h_t": float(job.get("h_t", 0.0)),
-            "prefix_before_token_ids": list(job.get("prefix_before", [])),
-            "chosen_token_id": int(job.get("chosen_token", -1)),
-            "suffix_after_token_ids": list(job.get("suffix_after", [])),
-            "f_bar": d.get("f_bar"),
-            "f_real": d.get("f_real"),
-            "branch_min_f_mc": d.get("branch_min_f_mc"),
-            "f_bar_mode": d.get("f_bar_mode"),
-            "f_real_mode": d.get("f_real_mode"),
-            "cands": d.get("cands"),
-            "cand_probs": d.get("cand_probs"),
-            "f_mc": d.get("f_mc"),
-            "reason": d.get("reason"),
-        }
-        # Keep readable context for offline inspection.
-        try:
-            rec["prefix_before_text"] = tokenizer.decode(rec["prefix_before_token_ids"], skip_special_tokens=True)
-            rec["chosen_token_text"] = tokenizer.decode([rec["chosen_token_id"]], skip_special_tokens=True)
-            rec["suffix_after_text"] = tokenizer.decode(rec["suffix_after_token_ids"], skip_special_tokens=True)
-            rec["context_text"] = rec["prefix_before_text"] + rec["chosen_token_text"]
-        except Exception:
-            pass
-        point_records.append(rec)
+    if collect_point_records:
+        for i, ((b, t), job) in enumerate(zip(coord, jobs, strict=False)):
+            d = details[i] if i < len(details) and isinstance(details[i], dict) else {}
+            rec: dict[str, Any] = {
+                "batch_index": int(b),
+                "response_t": int(t),
+                "ok": bool(ok[i]) if i < len(ok) else False,
+                "delta": float(deltas[i]) if i < len(deltas) else None,
+                "h_t": float(job.get("h_t", 0.0)),
+                "prefix_before_token_ids": list(job.get("prefix_before", [])),
+                "chosen_token_id": int(job.get("chosen_token", -1)),
+                "suffix_after_token_ids": list(job.get("suffix_after", [])),
+                "f_bar": d.get("f_bar"),
+                "f_real": d.get("f_real"),
+                "branch_min_f_mc": d.get("branch_min_f_mc"),
+                "f_bar_mode": d.get("f_bar_mode"),
+                "f_real_mode": d.get("f_real_mode"),
+                "cands": d.get("cands"),
+                "cand_probs": d.get("cand_probs"),
+                "f_mc": d.get("f_mc"),
+                "reason": d.get("reason"),
+            }
+            # Keep readable context for offline inspection.
+            try:
+                rec["prefix_before_text"] = tokenizer.decode(rec["prefix_before_token_ids"], skip_special_tokens=True)
+                rec["chosen_token_text"] = tokenizer.decode([rec["chosen_token_id"]], skip_special_tokens=True)
+                rec["suffix_after_text"] = tokenizer.decode(rec["suffix_after_token_ids"], skip_special_tokens=True)
+                rec["context_text"] = rec["prefix_before_text"] + rec["chosen_token_text"]
+            except Exception:
+                pass
+            point_records.append(rec)
     return batch, metrics, point_records
