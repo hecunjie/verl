@@ -952,7 +952,8 @@ class vLLMHttpServer:
         candidate_max_k = int(payload.get("candidate_max_k", 20))
         candidate_min_prob = float(payload.get("candidate_min_prob", 0.0))
         min_candidates = max(2, int(payload.get("min_candidates", 2)))
-        batch_chunk = max(1, int(payload.get("mc_batch_chunk", 32)))
+        mc_batch_chunk = max(1, int(payload.get("mc_batch_chunk", 32)))
+        probe_batch_chunk = max(1, int(payload.get("probe_batch_chunk", mc_batch_chunk)))
         f_bar_mode = str(payload.get("f_bar_mode", "branching"))
         f_real_mode = str(payload.get("f_real_mode", "chosen_branch_mc"))
         if f_bar_mode not in {"branching", "prefix_minus_ht"}:
@@ -990,7 +991,7 @@ class vLLMHttpServer:
                 k_lp=k_lp,
                 candidate_top_p=candidate_top_p,
                 candidate_max_k=candidate_max_k,
-                batch_chunk=batch_chunk,
+                batch_chunk=probe_batch_chunk,
             )
             for local_i, (cands, cand_probs) in enumerate(cand_results):
                 jidx = probe_owner_idx[local_i]
@@ -1049,7 +1050,7 @@ class vLLMHttpServer:
             chosen = int(job["chosen_token"])
             gen_cap = max(1, int(job["cont_max_new_tokens"]))
             suffix_after = list(job.get("suffix_after", []))
-            job_batch_chunk = int(batch_chunk)
+            job_batch_chunk = int(mc_batch_chunk)
 
             cands = cands_by_job[jidx]
             cand_probs = cand_probs_by_job[jidx]

@@ -227,6 +227,7 @@ def run_fepo_advantage_phase(
         "candidate_max_k": int(fepo_cfg.get("candidate_max_k", 20)),
         "candidate_min_prob": float(fepo_cfg.get("candidate_min_prob", 0.0)),
         "min_candidates": int(fepo_cfg.get("min_candidates", 2)),
+        "probe_batch_chunk": int(fepo_cfg.get("probe_batch_chunk", int(fepo_cfg.get("mc_batch_chunk", 32)))),
         "mc_batch_chunk": int(fepo_cfg.get("mc_batch_chunk", 32)),
         "fepo_job_concurrency": int(fepo_cfg.get("job_concurrency", 8)),
         "f_bar_mode": str(fepo_cfg.get("f_bar_mode", "branching")),

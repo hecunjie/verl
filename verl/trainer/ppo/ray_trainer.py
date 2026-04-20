@@ -1747,10 +1747,12 @@ class RayPPOTrainer:
                                 self.async_rollout_manager if self.async_rollout_mode else None,
                             )
                             metrics.update(fepo_metrics)
-                            fepo_data_dir = self.config.trainer.get("fepo_data_dir", None)
-                            if fepo_data_dir is None:
-                                fepo_data_dir = os.path.join(self.config.trainer.default_local_dir, "fepo_data")
-                            self._dump_fepo_points_async(fepo_point_records, fepo_data_dir)
+                            fepo_dump_freq = int(self.config.trainer.get("fepo_dump_freq", 50))
+                            if fepo_dump_freq > 0 and self.global_steps % fepo_dump_freq == 0:
+                                fepo_data_dir = self.config.trainer.get("fepo_data_dir", None)
+                                if fepo_data_dir is None:
+                                    fepo_data_dir = os.path.join(self.config.trainer.default_local_dir, "fepo_data")
+                                self._dump_fepo_points_async(fepo_point_records, fepo_data_dir)
 
                     # update critic
                     if self.use_critic:

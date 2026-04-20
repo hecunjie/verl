@@ -93,6 +93,7 @@ FEPO_CANDIDATE_TOP_P="${FEPO_CANDIDATE_TOP_P:-0.95}"
 FEPO_CANDIDATE_MAX_K="${FEPO_CANDIDATE_MAX_K:-5}"
 FEPO_CANDIDATE_MIN_PROB="${FEPO_CANDIDATE_MIN_PROB:-0.05}"  # 丢弃 p_c<该阈值的候选（保留 chosen）
 FEPO_MIN_CANDIDATES="${FEPO_MIN_CANDIDATES:-2}"
+FEPO_PROBE_BATCH_CHUNK="${FEPO_PROBE_BATCH_CHUNK:-64}"  # 候选探测并发 chunk
 FEPO_MC_BATCH_CHUNK="${FEPO_MC_BATCH_CHUNK:-64}"
 FEPO_JOB_CONCURRENCY="${FEPO_JOB_CONCURRENCY:-16}"  # 单副本内并发执行的 FEPO job 数
 FEPO_F_BAR_MODE="${FEPO_F_BAR_MODE:-branching}"  # branching / prefix_minus_ht
@@ -101,6 +102,7 @@ FEPO_DELTA_POS_THRESHOLD="${FEPO_DELTA_POS_THRESHOLD:-0.1}"
 FEPO_DELTA_NEG_THRESHOLD="${FEPO_DELTA_NEG_THRESHOLD:-0.1}"
 FEPO_BONUS_POS="${FEPO_BONUS_POS:-0.02}"
 FEPO_BONUS_NEG="${FEPO_BONUS_NEG:-0.02}"
+FEPO_DUMP_FREQ="${FEPO_DUMP_FREQ:-50}"  # 每隔多少 step 落一次 fepo jsonl
 
 # 注意：动态控制的是 FEPO_MAX_POINTS_PER_SEQ（当其 <=0 时按 max_points_ratio），
 # FEPO_MC_BATCH_CHUNK 使用固定值。
@@ -142,6 +144,7 @@ python3 -m verl.trainer.main_ppo \
     +algorithm.fepo.candidate_max_k="${FEPO_CANDIDATE_MAX_K}" \
     +algorithm.fepo.candidate_min_prob="${FEPO_CANDIDATE_MIN_PROB}" \
     +algorithm.fepo.min_candidates="${FEPO_MIN_CANDIDATES}" \
+    +algorithm.fepo.probe_batch_chunk="${FEPO_PROBE_BATCH_CHUNK}" \
     +algorithm.fepo.mc_batch_chunk="${FEPO_MC_BATCH_CHUNK}" \
     +algorithm.fepo.job_concurrency="${FEPO_JOB_CONCURRENCY}" \
     +algorithm.fepo.f_bar_mode="${FEPO_F_BAR_MODE}" \
@@ -191,6 +194,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.project_name="${PROJECT_NAME}" \
     trainer.experiment_name="${EXPERIMENT_NAME}" \
     trainer.default_local_dir="${OUTPUT_DIR}" \
+    +trainer.fepo_dump_freq="${FEPO_DUMP_FREQ}" \
     trainer.n_gpus_per_node=8 \
     trainer.nnodes=1 \
     trainer.save_freq="${SAVE_FREQ}" \
