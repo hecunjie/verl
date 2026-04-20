@@ -8,7 +8,8 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from transformers import AutoTokenizer
+import torch
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 from entropy_credit_experiment import (
     _configure_vllm_ipc_for_single_node,
@@ -281,6 +282,91 @@ def _sample_one_token_vllm(
     return int(o.token_ids[0])
 
 
+def _build_open_source_rm_scorer(
+    *,
+    model_path: str,
+    tokenizer_path: str | None,
+    device: str,
+    max_length: int,
+):
+    tok = AutoTokenizer.from_pretrained(tokenizer_path or model_path, trust_remote_code=True)
+    target_device = "cuda" if (device == "auto" and torch.cuda.is_available()) else ("cpu" if device == "auto" else device)
+    dtype = torch.bfloat16 if target_device == "cuda" else torch.float32
+    model = AutoModelForSequenceClassification.from_pretrained(
+        model_path,
+        trust_remote_code=True,
+        torch_dtype=dtype,
+    )
+    model.to(target_device)
+    model.eval()
+
+    def _score(prompt_text: str, response_text: str) -> float:
+        # Generic prompt-response packing for open-source RM heads.
+        packed = f"User:\n{prompt_text}\n\nAssistant:\n{response_text}"
+        enc = tok(
+            packed,
+            return_tensors="pt",
+            truncation=True,
+            max_length=int(max_length),
+        )
+        enc = {k: v.to(target_device) for k, v in enc.items()}
+        with torch.no_grad():
+            out = model(**enc)
+            logits = out.logits
+            if logits.ndim == 1:
+                return float(logits[0].item())
+            if logits.shape[-1] == 1:
+                return float(logits[0, 0].item())
+            if logits.shape[-1] == 2:
+                return float((logits[0, 1] - logits[0, 0]).item())
+            return float(logits[0, -1].item())
+
+    return _score
+
+
+def _decode_candidate_completion_vllm(
+    *,
+    llm: Any,
+    prefix_ids: list[int],
+    max_new_tokens: int,
+    decode_mode: str,
+    temperature: float,
+    top_p: float,
+) -> list[int]:
+    from vllm import SamplingParams
+    from vllm.inputs import TokensPrompt
+
+    if int(max_new_tokens) <= 0:
+        return []
+    if str(decode_mode) == "greedy":
+        sp = SamplingParams(max_tokens=int(max_new_tokens), temperature=0.0, top_p=1.0, logprobs=0)
+    else:
+        sp = SamplingParams(
+            max_tokens=int(max_new_tokens),
+            temperature=float(temperature),
+            top_p=float(top_p),
+            logprobs=0,
+        )
+    out = vllm_generate_quiet(llm, [TokensPrompt(prompt_token_ids=prefix_ids)], sp)
+    o = out[0].outputs[0]
+    return [int(t) for t in (o.token_ids or [])]
+
+
+def _reward_scalar_from_eval(ok: bool, score_info: dict[str, Any]) -> float:
+    if isinstance(score_info, dict):
+        s = score_info.get("score")
+        if isinstance(s, (float, int)):
+            return float(s)
+        raw = score_info.get("raw_result")
+        if isinstance(raw, dict):
+            rs = raw.get("score")
+            if isinstance(rs, (float, int)):
+                return float(rs)
+        if isinstance(raw, (float, int)):
+            return float(raw)
+    return 1.0 if bool(ok) else 0.0
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Compare real-token bias-sign: bucket estimate vs MC reference."
@@ -362,6 +448,75 @@ def main() -> None:
 
     parser.add_argument("--save_traces", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
+        "--branch_token_selector",
+        choices=["real_path", "reward_model"],
+        default="real_path",
+        help=(
+            "How to choose the branch token at each sampled split: "
+            "real_path uses the token from sampled rollout; reward_model scores each candidate branch and picks best."
+        ),
+    )
+    parser.add_argument(
+        "--rm_score_backend",
+        choices=["task_reward", "open_source_rm"],
+        default="task_reward",
+        help="Reward source for branch_token_selector=reward_model.",
+    )
+    parser.add_argument(
+        "--rm_model_path",
+        type=str,
+        default="",
+        help="HF path of open-source reward model (required when --rm_score_backend=open_source_rm).",
+    )
+    parser.add_argument(
+        "--rm_model_tokenizer_path",
+        type=str,
+        default="",
+        help="Optional tokenizer path for open-source reward model.",
+    )
+    parser.add_argument(
+        "--rm_model_device",
+        choices=["auto", "cpu", "cuda"],
+        default="cpu",
+        help="Device for open-source reward model inference.",
+    )
+    parser.add_argument(
+        "--rm_model_max_length",
+        type=int,
+        default=4096,
+        help="Max length for open-source reward model scoring input.",
+    )
+    parser.add_argument(
+        "--rm_select_decode_mode",
+        choices=["greedy", "sampling"],
+        default="greedy",
+        help="Candidate branch decode policy when --branch_token_selector=reward_model.",
+    )
+    parser.add_argument(
+        "--rm_select_max_new_tokens",
+        type=int,
+        default=256,
+        help="Upper bound for candidate branch decode length for reward-model branch selection.",
+    )
+    parser.add_argument(
+        "--rm_select_temperature",
+        type=float,
+        default=1.0,
+        help="Used only when --rm_select_decode_mode=sampling.",
+    )
+    parser.add_argument(
+        "--rm_select_top_p",
+        type=float,
+        default=0.95,
+        help="Used only when --rm_select_decode_mode=sampling.",
+    )
+    parser.add_argument(
+        "--rm_select_tie_break",
+        choices=["candidate_prob", "first"],
+        default="candidate_prob",
+        help="Tie-break rule when multiple candidates have same reward score.",
+    )
+    parser.add_argument(
         "--math_eval_backend",
         choices=["auto", "math_dapo", "math_verify"],
         default="auto",
@@ -393,6 +548,9 @@ def main() -> None:
         raise SystemExit("--bucket_min_points_per_bin must be >=1.")
     if int(args.local_window_left_tokens) < 0 or int(args.local_window_right_tokens) < 0:
         raise SystemExit("--local_window_left_tokens and --local_window_right_tokens must be >=0.")
+    if str(args.branch_token_selector) == "reward_model" and str(args.rm_score_backend) == "open_source_rm":
+        if not str(args.rm_model_path).strip():
+            raise SystemExit("--rm_model_path is required when --rm_score_backend=open_source_rm.")
 
     vllm_standalone = args.vllm_shard_rank is not None and args.vllm_shard_world_size is not None
     if (args.vllm_shard_rank is None) ^ (args.vllm_shard_world_size is None):
@@ -475,6 +633,15 @@ def main() -> None:
         from sentence_stop_utils import completion_should_stop_after_first_sentence_simple
 
         sentence_stop_check = completion_should_stop_after_first_sentence_simple
+
+    rm_scorer = None
+    if str(args.branch_token_selector) == "reward_model" and str(args.rm_score_backend) == "open_source_rm":
+        rm_scorer = _build_open_source_rm_scorer(
+            model_path=str(args.rm_model_path),
+            tokenizer_path=str(args.rm_model_tokenizer_path) or None,
+            device=str(args.rm_model_device),
+            max_length=int(args.rm_model_max_length),
+        )
 
     for local_i, row in p_iter:
         global_idx = local_i * world_size + rank
@@ -569,14 +736,61 @@ def main() -> None:
                 top_p=float(args.candidate_top_p),
                 max_k=int(args.candidate_max_k),
             )
-            chosen_token = int(response_ids[step_idx])
-            if chosen_token not in cands:
-                summary_cnt["n_skipped_chosen_not_in_candidates"] += 1
-                continue
 
             remaining = int(args.max_new_tokens) - step_idx - 1
             if remaining <= 0:
                 continue
+            chosen_token_real_path = int(response_ids[step_idx])
+            chosen_token = int(chosen_token_real_path)
+            branch_selected_by = "real_path"
+            rm_candidate_scores: list[float] | None = None
+            rm_selected_score: float | None = None
+            if str(args.branch_token_selector) == "real_path":
+                if chosen_token not in cands:
+                    summary_cnt["n_skipped_chosen_not_in_candidates"] += 1
+                    continue
+            else:
+                # Reward-model branch selection at each split point.
+                prefix_before = prompt_ids + response_ids[:step_idx]
+                decode_cap = int(min(max(1, int(args.rm_select_max_new_tokens)), remaining))
+                score_pairs: list[tuple[float, int, float]] = []
+                rm_candidate_scores = []
+                for tok, p_tok in zip(cands, cand_probs, strict=False):
+                    branch_prefix = prefix_before + [int(tok)]
+                    gen_ids = _decode_candidate_completion_vllm(
+                        llm=llm,
+                        prefix_ids=branch_prefix,
+                        max_new_tokens=decode_cap,
+                        decode_mode=str(args.rm_select_decode_mode),
+                        temperature=float(args.rm_select_temperature),
+                        top_p=float(args.rm_select_top_p),
+                    )
+                    branch_response_ids = response_ids[:step_idx] + [int(tok)] + gen_ids
+                    branch_response_text = tokenizer.decode(branch_response_ids, skip_special_tokens=True)
+                    if str(args.rm_score_backend) == "open_source_rm":
+                        assert rm_scorer is not None
+                        score_rm = float(rm_scorer(prompt_text, branch_response_text))
+                    else:
+                        ok_rm, score_info_rm = evaluate_solution_acc(
+                            data_source=data_source,
+                            solution_str=branch_response_text,
+                            ground_truth=gt,
+                            math_eval_backend=str(args.math_eval_backend),
+                        )
+                        score_rm = float(_reward_scalar_from_eval(ok_rm, score_info_rm))
+                    rm_candidate_scores.append(score_rm)
+                    # tie-break by candidate probability (larger is better), then earlier candidate index.
+                    tie_val = float(p_tok) if str(args.rm_select_tie_break) == "candidate_prob" else float(-len(score_pairs))
+                    score_pairs.append((score_rm, tie_val, int(tok)))
+                if not score_pairs:
+                    continue
+                score_pairs_sorted = sorted(score_pairs, key=lambda x: (x[0], x[1]), reverse=True)
+                chosen_token = int(score_pairs_sorted[0][2])
+                rm_selected_score = float(score_pairs_sorted[0][0])
+                branch_selected_by = "reward_model"
+                if chosen_token not in cands:
+                    # Defensive guard (shouldn't happen).
+                    continue
             prefixes = [prompt_ids + response_ids[:step_idx] + [int(t)] for t in cands]
             f_mc = estimate_F_mc_many_prefixes_vllm(
                 llm=llm,
@@ -633,18 +847,22 @@ def main() -> None:
                     summary_cnt["n_eval_steps_mc_compare"] += 1
                     summary_cnt["n_match_sign_mc_compare_vs_ref"] += int(sign_match_mc_compare_vs_ref)
 
-            suffix_gen_ids = [int(t) for t in response_ids[step_idx + 1 :]]
-            suffix_step_lps = [dict(d) for d in step_lps_seq[step_idx + 1 :]]
-            f_selected_real_proxy = float(
-                continuation_F_from_gen_ids_and_step_logprobs(
-                    gen_ids=suffix_gen_ids,
-                    step_lps_float=suffix_step_lps,
-                    f_continuation_mode=str(args.f_continuation_mode),
-                    tokenizer=tokenizer if str(args.f_continuation_mode) == "first_sentence" else None,
-                    stop_fn=sentence_stop_check if str(args.f_continuation_mode) == "first_sentence" else None,
-                    normalize_by_continuation_length=True,
+            if str(args.branch_token_selector) == "reward_model":
+                # For RM-selected branch, use MC-estimated f_real as real-path proxy for local metrics.
+                f_selected_real_proxy = float(f_real_mc)
+            else:
+                suffix_gen_ids = [int(t) for t in response_ids[step_idx + 1 :]]
+                suffix_step_lps = [dict(d) for d in step_lps_seq[step_idx + 1 :]]
+                f_selected_real_proxy = float(
+                    continuation_F_from_gen_ids_and_step_logprobs(
+                        gen_ids=suffix_gen_ids,
+                        step_lps_float=suffix_step_lps,
+                        f_continuation_mode=str(args.f_continuation_mode),
+                        tokenizer=tokenizer if str(args.f_continuation_mode) == "first_sentence" else None,
+                        stop_fn=sentence_stop_check if str(args.f_continuation_mode) == "first_sentence" else None,
+                        normalize_by_continuation_length=True,
+                    )
                 )
-            )
             fbar_lookahead_1step: float | None = None
             f_real_lookahead_1step: float | None = None
             fbar_lookahead_2step: float | None = None
@@ -735,6 +953,11 @@ def main() -> None:
                         "entropy_t": float(entropy_seq[step_idx]),
                         "chosen_token": int(chosen_token),
                         "chosen_text": tokenizer.decode([int(chosen_token)], skip_special_tokens=True),
+                        "chosen_token_real_path": int(chosen_token_real_path),
+                        "chosen_text_real_path": tokenizer.decode([int(chosen_token_real_path)], skip_special_tokens=True),
+                        "branch_selected_by": branch_selected_by,
+                        "rm_candidate_scores": rm_candidate_scores,
+                        "rm_selected_score": rm_selected_score,
                         "candidate_count": int(len(cands)),
                         "candidates": [int(x) for x in cands],
                         "candidate_probs_renorm_topp": [float(x) for x in cand_probs],
@@ -791,6 +1014,13 @@ def main() -> None:
             "mc_m_samples_compare": int(args.mc_m_samples_compare),
             "bucket_group_rollouts": int(args.bucket_group_rollouts),
             "fbar_mode": str(args.fbar_mode),
+            "branch_token_selector": str(args.branch_token_selector),
+            "rm_score_backend": str(args.rm_score_backend),
+            "rm_model_path": str(args.rm_model_path),
+            "rm_select_decode_mode": str(args.rm_select_decode_mode),
+            "rm_select_max_new_tokens": int(args.rm_select_max_new_tokens),
+            "rm_select_temperature": float(args.rm_select_temperature),
+            "rm_select_top_p": float(args.rm_select_top_p),
             "real_path_mode": "sampled_from_group",
             "real_rollout_index": int(real_idx),
             "real_rollout_is_correct": bool(real_is_correct),

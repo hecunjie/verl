@@ -96,6 +96,7 @@ FEPO_MIN_CANDIDATES="${FEPO_MIN_CANDIDATES:-2}"
 FEPO_PROBE_BATCH_CHUNK="${FEPO_PROBE_BATCH_CHUNK:-64}"  # 候选探测并发 chunk
 FEPO_MC_BATCH_CHUNK="${FEPO_MC_BATCH_CHUNK:-64}"
 FEPO_JOB_CONCURRENCY="${FEPO_JOB_CONCURRENCY:-16}"  # 单副本内并发执行的 FEPO job 数
+FEPO_GLOBAL_POOLING="${FEPO_GLOBAL_POOLING:-false}"  # 是否启用跨job全局MC池化
 FEPO_F_BAR_MODE="${FEPO_F_BAR_MODE:-branching}"  # branching / prefix_minus_ht
 FEPO_F_REAL_MODE="${FEPO_F_REAL_MODE:-teacher_forced_real_path}"  # chosen_branch_mc / teacher_forced_real_path
 FEPO_DELTA_POS_THRESHOLD="${FEPO_DELTA_POS_THRESHOLD:-0.1}"
@@ -147,6 +148,7 @@ python3 -m verl.trainer.main_ppo \
     +algorithm.fepo.probe_batch_chunk="${FEPO_PROBE_BATCH_CHUNK}" \
     +algorithm.fepo.mc_batch_chunk="${FEPO_MC_BATCH_CHUNK}" \
     +algorithm.fepo.job_concurrency="${FEPO_JOB_CONCURRENCY}" \
+    +algorithm.fepo.global_pooling="${FEPO_GLOBAL_POOLING}" \
     +algorithm.fepo.f_bar_mode="${FEPO_F_BAR_MODE}" \
     +algorithm.fepo.f_real_mode="${FEPO_F_REAL_MODE}" \
     +algorithm.fepo.delta_pos_threshold="${FEPO_DELTA_POS_THRESHOLD}" \

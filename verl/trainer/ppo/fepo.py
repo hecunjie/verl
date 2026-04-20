@@ -231,6 +231,7 @@ def run_fepo_advantage_phase(
         "probe_batch_chunk": int(fepo_cfg.get("probe_batch_chunk", int(fepo_cfg.get("mc_batch_chunk", 32)))),
         "mc_batch_chunk": int(fepo_cfg.get("mc_batch_chunk", 32)),
         "fepo_job_concurrency": int(fepo_cfg.get("job_concurrency", 8)),
+        "global_pooling": bool(fepo_cfg.get("global_pooling", False)),
         "detail_full": bool(collect_point_records),
         "f_bar_mode": str(fepo_cfg.get("f_bar_mode", "branching")),
         "f_real_mode": str(fepo_cfg.get("f_real_mode", "chosen_branch_mc")),

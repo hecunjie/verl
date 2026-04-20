@@ -41,6 +41,17 @@ BUCKET_PREFIX_KEY_MODE="${BUCKET_PREFIX_KEY_MODE:-sum}"
 LOCAL_WINDOW_LEFT_TOKENS="${LOCAL_WINDOW_LEFT_TOKENS:-20}"
 LOCAL_WINDOW_RIGHT_TOKENS="${LOCAL_WINDOW_RIGHT_TOKENS:-20}"
 FBAR_MODE="${FBAR_MODE:-single_local}"
+BRANCH_TOKEN_SELECTOR="${BRANCH_TOKEN_SELECTOR:-real_path}"  # real_path / reward_model
+RM_SCORE_BACKEND="${RM_SCORE_BACKEND:-task_reward}"          # task_reward / open_source_rm
+RM_MODEL_PATH="${RM_MODEL_PATH:-}"
+RM_MODEL_TOKENIZER_PATH="${RM_MODEL_TOKENIZER_PATH:-}"
+RM_MODEL_DEVICE="${RM_MODEL_DEVICE:-cpu}"                    # auto / cpu / cuda
+RM_MODEL_MAX_LENGTH="${RM_MODEL_MAX_LENGTH:-4096}"
+RM_SELECT_DECODE_MODE="${RM_SELECT_DECODE_MODE:-greedy}"     # greedy / sampling
+RM_SELECT_MAX_NEW_TOKENS="${RM_SELECT_MAX_NEW_TOKENS:-256}"
+RM_SELECT_TEMPERATURE="${RM_SELECT_TEMPERATURE:-1.0}"
+RM_SELECT_TOP_P="${RM_SELECT_TOP_P:-0.95}"
+RM_SELECT_TIE_BREAK="${RM_SELECT_TIE_BREAK:-candidate_prob}" # candidate_prob / first
 
 SAVE_TRACES="${SAVE_TRACES:-1}"
 NO_PROGRESS="${NO_PROGRESS:-0}"
@@ -115,6 +126,17 @@ for ((r = 0; r < NPROC_PER_NODE; r++)); do
     --local_window_left_tokens "${LOCAL_WINDOW_LEFT_TOKENS}" \
     --local_window_right_tokens "${LOCAL_WINDOW_RIGHT_TOKENS}" \
     --fbar_mode "${FBAR_MODE}" \
+    --branch_token_selector "${BRANCH_TOKEN_SELECTOR}" \
+    --rm_score_backend "${RM_SCORE_BACKEND}" \
+    --rm_model_path "${RM_MODEL_PATH}" \
+    --rm_model_tokenizer_path "${RM_MODEL_TOKENIZER_PATH}" \
+    --rm_model_device "${RM_MODEL_DEVICE}" \
+    --rm_model_max_length "${RM_MODEL_MAX_LENGTH}" \
+    --rm_select_decode_mode "${RM_SELECT_DECODE_MODE}" \
+    --rm_select_max_new_tokens "${RM_SELECT_MAX_NEW_TOKENS}" \
+    --rm_select_temperature "${RM_SELECT_TEMPERATURE}" \
+    --rm_select_top_p "${RM_SELECT_TOP_P}" \
+    --rm_select_tie_break "${RM_SELECT_TIE_BREAK}" \
     --vllm_shard_rank "${GLOBAL_RANK}" \
     --vllm_shard_world_size "${WORLD_SIZE}" \
     "${EXTRA_ARGS[@]}" \

@@ -956,6 +956,7 @@ class vLLMHttpServer:
         probe_batch_chunk = max(1, int(payload.get("probe_batch_chunk", mc_batch_chunk)))
         f_bar_mode = str(payload.get("f_bar_mode", "branching"))
         f_real_mode = str(payload.get("f_real_mode", "chosen_branch_mc"))
+        global_pooling = bool(payload.get("global_pooling", False))
         detail_full = bool(payload.get("detail_full", False))
         if f_bar_mode not in {"branching", "prefix_minus_ht"}:
             f_bar_mode = "branching"
@@ -1039,10 +1040,9 @@ class vLLMHttpServer:
                 continue
             compute_idx.append(jidx)
 
-        # Global pooling: aggregate branch MC requests across jobs, then scatter results back.
-        # This keeps FEPO math unchanged while reducing per-job request overhead.
         f_mc_by_job: list[list[float] | None] = [None for _ in range(n_jobs)]
-        if need_cands and compute_idx:
+        # Optional global pooling: aggregate branch MC requests across jobs, then scatter.
+        if global_pooling and need_cands and compute_idx:
             gen_cap_groups: dict[int, list[int]] = {}
             for jidx in compute_idx:
                 gc = max(1, int(jobs[jidx]["cont_max_new_tokens"]))
@@ -1092,7 +1092,7 @@ class vLLMHttpServer:
 
         # Optional pooling for prefix_minus_ht f_bar (grouped by gen_cap).
         f_bar_pmht_by_job: list[float | None] = [None for _ in range(n_jobs)]
-        if f_bar_mode == "prefix_minus_ht" and compute_idx:
+        if global_pooling and f_bar_mode == "prefix_minus_ht" and compute_idx:
             gen_cap_groups: dict[int, list[int]] = {}
             for jidx in compute_idx:
                 gc = max(1, int(jobs[jidx]["cont_max_new_tokens"]) + 1)
@@ -1127,20 +1127,60 @@ class vLLMHttpServer:
             suffix_after = list(job.get("suffix_after", []))
             cands = cands_by_job[jidx]
             cand_probs = cand_probs_by_job[jidx]
+            job_batch_chunk = int(mc_batch_chunk)
             f_mc: list[float] = []
             if need_cands:
-                cached = f_mc_by_job[jidx]
-                if cached is None:
-                    d = {"reason": "mc_not_precomputed", "f_bar_mode": f_bar_mode, "f_real_mode": f_real_mode}
-                    if detail_full:
-                        d["cands"] = cands
-                        d["cand_probs"] = cand_probs
-                    return (jidx, 0.0, False, d)
-                f_mc = cached
+                if global_pooling:
+                    cached = f_mc_by_job[jidx]
+                    if cached is None:
+                        d = {"reason": "mc_not_precomputed", "f_bar_mode": f_bar_mode, "f_real_mode": f_real_mode}
+                        if detail_full:
+                            d["cands"] = cands
+                            d["cand_probs"] = cand_probs
+                        return (jidx, 0.0, False, d)
+                    f_mc = cached
+                else:
+                    prefixes = [pb + [int(c)] for c in cands]
+                    f_mc = await self._fepo_mc_mean_f_per_prefix(
+                        prefixes,
+                        m_samples=mc_m,
+                        gen_cap=gen_cap,
+                        mc_temperature=mc_temperature,
+                        mc_top_p=mc_top_p,
+                        k_lp=k_lp,
+                        f_mode=f_mode,
+                        norm_len=norm_len,
+                        tokenizer=tokenizer,
+                        stop_fn=stop_fn,
+                        batch_chunk=job_batch_chunk,
+                    )
+                    if len(f_mc) != len(cands):
+                        d = {"reason": "mc_size_mismatch", "f_bar_mode": f_bar_mode, "f_real_mode": f_real_mode}
+                        if detail_full:
+                            d["cands"] = cands
+                            d["cand_probs"] = cand_probs
+                            d["f_mc"] = f_mc
+                        return (jidx, 0.0, False, d)
 
             if f_bar_mode == "prefix_minus_ht":
-                cached_bar = f_bar_pmht_by_job[jidx]
-                f_bar = float(cached_bar) if cached_bar is not None else 0.0
+                if global_pooling:
+                    cached_bar = f_bar_pmht_by_job[jidx]
+                    f_bar = float(cached_bar) if cached_bar is not None else 0.0
+                else:
+                    f_bar_list = await self._fepo_mc_mean_future_rate_minus_ht(
+                        [pb],
+                        m_samples=mc_m,
+                        gen_cap=max(1, gen_cap + 1),
+                        mc_temperature=mc_temperature,
+                        mc_top_p=mc_top_p,
+                        k_lp=k_lp,
+                        f_mode=f_mode,
+                        tokenizer=tokenizer,
+                        stop_fn=stop_fn,
+                        batch_chunk=job_batch_chunk,
+                        h_t_values=[float(job.get("h_t", 0.0))],
+                    )
+                    f_bar = float(f_bar_list[0]) if f_bar_list else 0.0
             else:
                 if not cands:
                     return (
