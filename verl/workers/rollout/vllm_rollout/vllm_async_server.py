@@ -894,9 +894,49 @@ class vLLMHttpServer:
             )
         )
 
+    async def _fepo_probe_candidates_batch(
+        self,
+        prefixes: list[list[int]],
+        *,
+        k_lp: int,
+        candidate_top_p: float,
+        candidate_max_k: int,
+        batch_chunk: int,
+    ) -> list[tuple[list[int], list[float]]]:
+        """Batch probe one-step next-token candidates for many FEPO prefixes."""
+        from verl.utils.fepo_branching import topp_capped_candidates_from_step_logprobs
+
+        if not prefixes:
+            return []
+
+        bc = max(1, int(batch_chunk))
+        out: list[tuple[list[int], list[float]]] = [([], []) for _ in range(len(prefixes))]
+
+        async def _probe_one(pref_ids: list[int]) -> tuple[list[int], list[float]]:
+            out0 = await self._fepo_raw_generate(
+                pref_ids,
+                max_tokens=1,
+                temperature=0.0,
+                top_p=1.0,
+                logprobs_k=k_lp,
+            )
+            o0 = out0.outputs[0]
+            step_lp: dict[int, float] = {}
+            if o0.logprobs and len(o0.logprobs) > 0:
+                for tid, info in o0.logprobs[0].items():
+                    step_lp[int(tid)] = float(info.logprob)
+            cands, cand_probs = topp_capped_candidates_from_step_logprobs(step_lp, candidate_top_p, candidate_max_k)
+            return cands, cand_probs
+
+        for start in range(0, len(prefixes), bc):
+            end = min(start + bc, len(prefixes))
+            batch_results = await asyncio.gather(*[_probe_one(prefixes[i]) for i in range(start, end)])
+            for local_i, item in enumerate(batch_results):
+                out[start + local_i] = item
+        return out
+
     async def fepo_compute(self, payload: dict[str, Any]) -> dict[str, Any]:
         """FEPO branching: ``f_bar = E_c[ F_MC(prefix+c) ]``, ``f_real = F_MC(prefix+chosen)`` (``compare_bias``)."""
-        from verl.utils.fepo_branching import topp_capped_candidates_from_step_logprobs
         from verl.utils.fepo_math import clamp_vllm_logprobs_topk
         from verl.utils.fepo_sentence_stop import completion_should_stop_after_first_sentence_simple
 
@@ -921,55 +961,84 @@ class vLLMHttpServer:
 
         stop_fn = completion_should_stop_after_first_sentence_simple if f_mode == "first_sentence" else None
 
-        deltas: list[float] = []
-        ok_flags: list[bool] = []
-        details: list[dict[str, Any]] = []
+        n_jobs = len(jobs)
+        deltas: list[float] = [0.0] * n_jobs
+        ok_flags: list[bool] = [False] * n_jobs
+        details: list[dict[str, Any]] = [{} for _ in range(n_jobs)]
 
-        for job in jobs:
+        need_cands = (f_bar_mode == "branching") or (f_real_mode == "chosen_branch_mc")
+        runnable_idx: list[int] = []
+        prefix_for_probe: list[list[int]] = []
+        probe_owner_idx: list[int] = []
+        cands_by_job: list[list[int]] = [[] for _ in range(n_jobs)]
+        cand_probs_by_job: list[list[float]] = [[] for _ in range(n_jobs)]
+
+        for jidx, job in enumerate(jobs):
+            suffix_after = list(job.get("suffix_after", []))
+            if not suffix_after:
+                details[jidx] = {"reason": "empty_suffix", "f_bar_mode": f_bar_mode, "f_real_mode": f_real_mode}
+                continue
+            runnable_idx.append(jidx)
+            if need_cands:
+                prefix_for_probe.append(list(job["prefix_before"]))
+                probe_owner_idx.append(jidx)
+
+        if need_cands and prefix_for_probe:
+            cand_results = await self._fepo_probe_candidates_batch(
+                prefix_for_probe,
+                k_lp=k_lp,
+                candidate_top_p=candidate_top_p,
+                candidate_max_k=candidate_max_k,
+                batch_chunk=batch_chunk,
+            )
+            for local_i, (cands, cand_probs) in enumerate(cand_results):
+                jidx = probe_owner_idx[local_i]
+                cands_by_job[jidx] = cands
+                cand_probs_by_job[jidx] = cand_probs
+
+        compute_idx: list[int] = []
+        for jidx in runnable_idx:
+            job = jobs[jidx]
+            cands = cands_by_job[jidx]
+            cand_probs = cand_probs_by_job[jidx]
+            chosen = int(job["chosen_token"])
+
+            if need_cands and len(cands) < min_candidates:
+                details[jidx] = {
+                    "reason": "insufficient_candidates",
+                    "f_bar_mode": f_bar_mode,
+                    "f_real_mode": f_real_mode,
+                    "cands": cands,
+                    "cand_probs": cand_probs,
+                }
+                continue
+            # Early reject before expensive MC when chosen branch is unavailable.
+            if f_real_mode == "chosen_branch_mc" and chosen not in cands:
+                details[jidx] = {
+                    "reason": "chosen_not_in_candidates",
+                    "f_bar_mode": f_bar_mode,
+                    "f_real_mode": f_real_mode,
+                    "cands": cands,
+                    "cand_probs": cand_probs,
+                }
+                continue
+            compute_idx.append(jidx)
+
+        job_concurrency = max(1, min(int(payload.get("fepo_job_concurrency", 8)), len(compute_idx) if compute_idx else 1))
+
+        async def _compute_one_job(jidx: int) -> tuple[int, float, bool, dict[str, Any]]:
+            job = jobs[jidx]
             pb = list(job["prefix_before"])
             chosen = int(job["chosen_token"])
             gen_cap = max(1, int(job["cont_max_new_tokens"]))
             suffix_after = list(job.get("suffix_after", []))
             job_batch_chunk = int(batch_chunk)
-            if not suffix_after:
-                deltas.append(0.0)
-                ok_flags.append(False)
-                details.append({"reason": "empty_suffix", "f_bar_mode": f_bar_mode, "f_real_mode": f_real_mode})
-                continue
 
-            cands: list[int] = []
-            cand_probs: list[float] = []
+            cands = cands_by_job[jidx]
+            cand_probs = cand_probs_by_job[jidx]
             f_mc: list[float] = []
-            need_cands = (f_bar_mode == "branching") or (f_real_mode == "chosen_branch_mc")
+
             if need_cands:
-                out0 = await self._fepo_raw_generate(
-                    pb,
-                    max_tokens=1,
-                    temperature=0.0,
-                    top_p=1.0,
-                    logprobs_k=k_lp,
-                )
-                o0 = out0.outputs[0]
-                step_lp: dict[int, float] = {}
-                if o0.logprobs and len(o0.logprobs) > 0:
-                    for tid, info in o0.logprobs[0].items():
-                        step_lp[int(tid)] = float(info.logprob)
-                cands, cand_probs = topp_capped_candidates_from_step_logprobs(
-                    step_lp, candidate_top_p, candidate_max_k
-                )
-                if len(cands) < min_candidates:
-                    deltas.append(0.0)
-                    ok_flags.append(False)
-                    details.append(
-                        {
-                            "reason": "insufficient_candidates",
-                            "f_bar_mode": f_bar_mode,
-                            "f_real_mode": f_real_mode,
-                            "cands": cands,
-                            "cand_probs": cand_probs,
-                        }
-                    )
-                    continue
                 prefixes = [pb + [int(c)] for c in cands]
                 f_mc = await self._fepo_mc_mean_f_per_prefix(
                     prefixes,
@@ -985,9 +1054,10 @@ class vLLMHttpServer:
                     batch_chunk=job_batch_chunk,
                 )
                 if len(f_mc) != len(cands):
-                    deltas.append(0.0)
-                    ok_flags.append(False)
-                    details.append(
+                    return (
+                        jidx,
+                        0.0,
+                        False,
                         {
                             "reason": "mc_size_mismatch",
                             "f_bar_mode": f_bar_mode,
@@ -995,9 +1065,8 @@ class vLLMHttpServer:
                             "cands": cands,
                             "cand_probs": cand_probs,
                             "f_mc": f_mc,
-                        }
+                        },
                     )
-                    continue
 
             if f_bar_mode == "prefix_minus_ht":
                 f_bar_list = await self._fepo_mc_mean_future_rate_minus_ht(
@@ -1016,10 +1085,12 @@ class vLLMHttpServer:
                 f_bar = float(f_bar_list[0]) if f_bar_list else 0.0
             else:
                 if not cands:
-                    deltas.append(0.0)
-                    ok_flags.append(False)
-                    details.append({"reason": "no_candidates", "f_bar_mode": f_bar_mode, "f_real_mode": f_real_mode})
-                    continue
+                    return (
+                        jidx,
+                        0.0,
+                        False,
+                        {"reason": "no_candidates", "f_bar_mode": f_bar_mode, "f_real_mode": f_real_mode},
+                    )
                 f_bar = float(sum(float(p) * float(f_mc[i]) for i, p in enumerate(cand_probs)))
 
             if f_real_mode == "teacher_forced_real_path":
@@ -1033,24 +1104,12 @@ class vLLMHttpServer:
                     stop_fn=stop_fn,
                 )
             else:
-                if chosen not in cands:
-                    deltas.append(0.0)
-                    ok_flags.append(False)
-                    details.append(
-                        {
-                            "reason": "chosen_not_in_candidates",
-                            "f_bar_mode": f_bar_mode,
-                            "f_real_mode": f_real_mode,
-                            "cands": cands,
-                            "cand_probs": cand_probs,
-                            "f_mc": f_mc,
-                        }
-                    )
-                    continue
                 f_real = float(f_mc[cands.index(chosen)])
-            deltas.append(float(f_bar - f_real))
-            ok_flags.append(True)
-            details.append(
+
+            return (
+                jidx,
+                float(f_bar - f_real),
+                True,
                 {
                     "f_bar_mode": f_bar_mode,
                     "f_real_mode": f_real_mode,
@@ -1061,8 +1120,16 @@ class vLLMHttpServer:
                     "cand_probs": [float(x) for x in cand_probs] if cand_probs else [],
                     "f_mc": [float(x) for x in f_mc] if f_mc else [],
                     "mc_batch_chunk_used": int(job_batch_chunk),
-                }
+                },
             )
+
+        for start in range(0, len(compute_idx), job_concurrency):
+            end = min(start + job_concurrency, len(compute_idx))
+            chunk_res = await asyncio.gather(*[_compute_one_job(jidx) for jidx in compute_idx[start:end]])
+            for jidx, delta_v, ok_v, detail_v in chunk_res:
+                deltas[jidx] = float(delta_v)
+                ok_flags[jidx] = bool(ok_v)
+                details[jidx] = detail_v
 
         return {"deltas": deltas, "ok": ok_flags, "details": details}
 

@@ -271,6 +271,19 @@ def run_fepo_advantage_phase(
     batch.batch["advantages"] = advantages + bonus * response_mask.float()
 
     n_ok = float(sum(1 for x in ok if x))
+    n_jobs_total = float(len(jobs))
+    fail_reasons: dict[str, int] = defaultdict(int)
+    for k_ok, det in zip(ok, details, strict=False):
+        if k_ok:
+            continue
+        if isinstance(det, dict):
+            r = det.get("reason")
+            if isinstance(r, str) and r:
+                fail_reasons[r] += 1
+            else:
+                fail_reasons["unknown"] += 1
+        else:
+            fail_reasons["unknown"] += 1
     min_f_vals = [
         float(d.get("branch_min_f_mc"))
         for d, k in zip(details, ok, strict=False)
@@ -278,12 +291,16 @@ def run_fepo_advantage_phase(
     ]
     metrics = {
         "fepo/n_selected": float(len(positions)),
+        "fepo/n_jobs": n_jobs_total,
         "fepo/n_jobs_ok": n_ok,
+        "fepo/n_jobs_failed": float(len(ok) - int(n_ok)),
         "fepo/mean_delta": float(np.nanmean([float(d) for d, k in zip(deltas, ok, strict=True) if k]))
         if any(ok)
         else 0.0,
         "fepo/branch_steps_min_f_mc": float(np.nanmean(min_f_vals)) if min_f_vals else 0.0,
     }
+    for rk, rv in fail_reasons.items():
+        metrics[f"fepo/fail_{rk}"] = float(rv)
     point_records: list[dict[str, Any]] = []
     for i, ((b, t), job) in enumerate(zip(coord, jobs, strict=False)):
         d = details[i] if i < len(details) and isinstance(details[i], dict) else {}
