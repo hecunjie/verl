@@ -24,6 +24,7 @@ from entropy_credit_experiment import (
     init_dist,
     load_data,
     purge_all_torchrun_like_env_for_vllm_standalone,
+    vllm_generate_quiet,
 )
 from infer_topk_f_mc_compare import (
     _append_boxed_instruction,
@@ -51,6 +52,39 @@ def _policy_from_mode(mode: str) -> str:
     if mode == "min_f_mc":
         return "min_f_mc"
     raise ValueError(f"unsupported mode: {mode}")
+
+
+def _generate_many_full_vllm(
+    *,
+    llm: Any,
+    prompt_ids: list[int],
+    n: int,
+    max_new_tokens: int,
+    temperature: float,
+    top_p: float,
+    batch_chunk: int,
+) -> list[list[int]]:
+    from vllm import SamplingParams
+    from vllm.inputs import TokensPrompt
+
+    if n < 1:
+        return []
+    sp = SamplingParams(
+        max_tokens=int(max_new_tokens),
+        temperature=float(temperature),
+        top_p=float(top_p),
+        logprobs=0,
+    )
+    out_ids: list[list[int]] = []
+    for start in range(0, int(n), int(batch_chunk)):
+        bs = min(int(batch_chunk), int(n) - start)
+        prompts = [TokensPrompt(prompt_token_ids=prompt_ids) for _ in range(bs)]
+        outputs = vllm_generate_quiet(llm, prompts, sp)
+        if len(outputs) != bs:
+            raise RuntimeError(f"vLLM batch size mismatch: expected {bs}, got {len(outputs)}")
+        for out_req in outputs:
+            out_ids.append([int(x) for x in list(out_req.outputs[0].token_ids)])
+    return out_ids
 
 
 def main() -> None:
@@ -220,45 +254,72 @@ def main() -> None:
 
         sample_correct: list[float] = []
         sample_lens: list[int] = []
-        for sample_idx in range(int(args.num_samples_per_prompt)):
-            response_ids, _trace = _decode_one_policy(
+        if policy in {"greedy_baseline", "sampling_baseline"}:
+            # Fast path: fully batched decode for pass@k workloads.
+            if policy == "greedy_baseline":
+                temp_use, top_p_use = 0.0, 1.0
+            else:
+                temp_use, top_p_use = float(args.sampling_temperature), float(args.sampling_top_p)
+            batched_ids = _generate_many_full_vllm(
                 llm=llm,
-                tokenizer=tokenizer,
                 prompt_ids=prompt_ids,
-                policy=policy,
-                entropy_threshold=float(args.entropy_threshold),
-                candidate_top_p=float(args.candidate_top_p),
-                candidate_max_k=int(args.candidate_max_k),
-                selection_f_mode=str(args.selection_f_mode),
+                n=int(args.num_samples_per_prompt),
                 max_new_tokens=int(args.max_new_tokens),
-                mc_m_samples=int(args.mc_m_samples),
-                mc_temperature=float(args.mc_temperature),
-                mc_top_p=float(args.mc_top_p),
-                sampling_temperature=float(args.sampling_temperature),
-                sampling_top_p=float(args.sampling_top_p),
-                minf_nonbranch_mode=str(args.minf_nonbranch_mode),
-                vllm_logprobs_topk=int(args.vllm_logprobs_topk),
-                vllm_request_batch_chunk=int(args.vllm_request_batch_chunk),
-                vllm_request_batch_chunk_mc=int(mc_batch_chunk),
-                f_continuation_mode=str(args.f_continuation_mode),
-                f_sentence_max_new_tokens=int(args.f_sentence_max_new_tokens),
-                f_sentence_stop=str(args.f_sentence_stop),
-                normalize_by_continuation_length=(args.bias_metrics_mode == "length_normalized"),
-                max_branch_steps=int(args.max_branch_steps),
-                rng=random.Random(args.seed + rank + global_idx * 100000 + sample_idx),
-                eos_token_id=tokenizer.eos_token_id,
-                show_nested_progress=False,
-                bucket_group_estimator=bucket_estimator,
+                temperature=temp_use,
+                top_p=top_p_use,
+                batch_chunk=int(args.vllm_request_batch_chunk),
             )
-            text = tokenizer.decode(response_ids, skip_special_tokens=True)
-            ok, _eval = evaluate_solution_acc(
-                data_source=data_source,
-                solution_str=text,
-                ground_truth=ground_truth,
-                math_eval_backend=str(args.math_eval_backend),
-            )
-            sample_correct.append(1.0 if ok else 0.0)
-            sample_lens.append(len(response_ids))
+            for response_ids in batched_ids:
+                text = tokenizer.decode(response_ids, skip_special_tokens=True)
+                ok, _eval = evaluate_solution_acc(
+                    data_source=data_source,
+                    solution_str=text,
+                    ground_truth=ground_truth,
+                    math_eval_backend=str(args.math_eval_backend),
+                )
+                sample_correct.append(1.0 if ok else 0.0)
+                sample_lens.append(len(response_ids))
+        else:
+            # min_f_mc currently keeps per-sample decoding logic.
+            for sample_idx in range(int(args.num_samples_per_prompt)):
+                response_ids, _trace = _decode_one_policy(
+                    llm=llm,
+                    tokenizer=tokenizer,
+                    prompt_ids=prompt_ids,
+                    policy=policy,
+                    entropy_threshold=float(args.entropy_threshold),
+                    candidate_top_p=float(args.candidate_top_p),
+                    candidate_max_k=int(args.candidate_max_k),
+                    selection_f_mode=str(args.selection_f_mode),
+                    max_new_tokens=int(args.max_new_tokens),
+                    mc_m_samples=int(args.mc_m_samples),
+                    mc_temperature=float(args.mc_temperature),
+                    mc_top_p=float(args.mc_top_p),
+                    sampling_temperature=float(args.sampling_temperature),
+                    sampling_top_p=float(args.sampling_top_p),
+                    minf_nonbranch_mode=str(args.minf_nonbranch_mode),
+                    vllm_logprobs_topk=int(args.vllm_logprobs_topk),
+                    vllm_request_batch_chunk=int(args.vllm_request_batch_chunk),
+                    vllm_request_batch_chunk_mc=int(mc_batch_chunk),
+                    f_continuation_mode=str(args.f_continuation_mode),
+                    f_sentence_max_new_tokens=int(args.f_sentence_max_new_tokens),
+                    f_sentence_stop=str(args.f_sentence_stop),
+                    normalize_by_continuation_length=(args.bias_metrics_mode == "length_normalized"),
+                    max_branch_steps=int(args.max_branch_steps),
+                    rng=random.Random(args.seed + rank + global_idx * 100000 + sample_idx),
+                    eos_token_id=tokenizer.eos_token_id,
+                    show_nested_progress=False,
+                    bucket_group_estimator=bucket_estimator,
+                )
+                text = tokenizer.decode(response_ids, skip_special_tokens=True)
+                ok, _eval = evaluate_solution_acc(
+                    data_source=data_source,
+                    solution_str=text,
+                    ground_truth=ground_truth,
+                    math_eval_backend=str(args.math_eval_backend),
+                )
+                sample_correct.append(1.0 if ok else 0.0)
+                sample_lens.append(len(response_ids))
 
         k_small = min(int(args.pass_k_small), len(sample_correct))
         k_large = min(int(args.pass_k_large), len(sample_correct))
