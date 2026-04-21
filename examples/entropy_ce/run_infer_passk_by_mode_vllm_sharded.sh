@@ -6,20 +6,26 @@ cd "${VERL_ROOT}"
 
 MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3-8B}"
 INPUT_DATA="${INPUT_DATA:-${HOME}/data/math_rl/dapo_math_17k_processed_train.parquet}"
-OUTPUT_DIR="${OUTPUT_DIR:-${HOME}/entropy_check/infer_topk_f_mc_compare}"
+OUTPUT_DIR="${OUTPUT_DIR:-${HOME}/entropy_check/infer_passk_by_mode}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 NNODES="${NNODES:-1}"
 NODE_RANK="${NODE_RANK:-0}"
 MAX_SAMPLES="${MAX_SAMPLES:-300}"
 SEED="${SEED:-42}"
+VLLM_SEED="${VLLM_SEED:-}"
+
+MODE="${MODE:-min_f_mc}"
+NUM_SAMPLES_PER_PROMPT="${NUM_SAMPLES_PER_PROMPT:-32}"
+PASS_K_SMALL="${PASS_K_SMALL:-4}"
+PASS_K_LARGE="${PASS_K_LARGE:-32}"
 
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-2048}"
 ENTROPY_THRESHOLD="${ENTROPY_THRESHOLD:-1.0}"
 CANDIDATE_TOP_P="${CANDIDATE_TOP_P:-0.95}"
 CANDIDATE_MAX_K="${CANDIDATE_MAX_K:-5}"
-SELECTION_F_MODE="${SELECTION_F_MODE:-greedy_path}"
-MAX_BRANCH_STEPS="${MAX_BRANCH_STEPS:-0}"
-MC_M_SAMPLES="${MC_M_SAMPLES:-1}"
+SELECTION_F_MODE="${SELECTION_F_MODE:-mc}"
+MAX_BRANCH_STEPS="${MAX_BRANCH_STEPS:-64}"
+MC_M_SAMPLES="${MC_M_SAMPLES:-10}"
 MC_TEMPERATURE="${MC_TEMPERATURE:-1.0}"
 MC_TOP_P="${MC_TOP_P:-0.95}"
 SAMPLING_TEMPERATURE="${SAMPLING_TEMPERATURE:-1.0}"
@@ -40,47 +46,29 @@ BUCKET_NUM_BINS="${BUCKET_NUM_BINS:-100}"
 BUCKET_MIN_POINTS_PER_BIN="${BUCKET_MIN_POINTS_PER_BIN:-4}"
 VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.9}"
 VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-32768}"
-SAVE_TRACES="${SAVE_TRACES:-1}"
 NO_PROGRESS="${NO_PROGRESS:-0}"
 PROGRESS_ALL_RANKS="${PROGRESS_ALL_RANKS:-0}"
-PROGRESS_NESTED="${PROGRESS_NESTED:-1}"
 PROGRESS_ECHO="${PROGRESS_ECHO:-0}"
 
 mkdir -p "${OUTPUT_DIR}"
 export VLLM_HOST_IP="${VLLM_HOST_IP:-127.0.0.1}"
 unset HOST_IP 2>/dev/null || true
 
-if ! [[ "${NNODES}" =~ ^[0-9]+$ ]] || [ "${NNODES}" -lt 1 ]; then
-  echo "Invalid NNODES=${NNODES} (must be >=1)" >&2
-  exit 1
-fi
-if ! [[ "${NODE_RANK}" =~ ^[0-9]+$ ]] || [ "${NODE_RANK}" -lt 0 ] || [ "${NODE_RANK}" -ge "${NNODES}" ]; then
-  echo "Invalid NODE_RANK=${NODE_RANK} (must satisfy 0 <= NODE_RANK < NNODES)" >&2
-  exit 1
-fi
-if ! [[ "${NPROC_PER_NODE}" =~ ^[0-9]+$ ]] || [ "${NPROC_PER_NODE}" -lt 1 ]; then
-  echo "Invalid NPROC_PER_NODE=${NPROC_PER_NODE} (must be >=1)" >&2
-  exit 1
-fi
-
 WORLD_SIZE=$((NNODES * NPROC_PER_NODE))
-echo "[infer_topk_f_mc_compare] NODE_RANK=${NODE_RANK}/${NNODES} NPROC_PER_NODE=${NPROC_PER_NODE} WORLD_SIZE=${WORLD_SIZE}" >&2
+echo "[infer_passk_by_mode] MODE=${MODE} NODE_RANK=${NODE_RANK}/${NNODES} NPROC_PER_NODE=${NPROC_PER_NODE} WORLD_SIZE=${WORLD_SIZE}" >&2
 
 PIDS=()
 for ((r = 0; r < NPROC_PER_NODE; r++)); do
   GLOBAL_RANK=$((NODE_RANK * NPROC_PER_NODE + r))
   EXTRA_ARGS=()
-  if [ "${SAVE_TRACES}" != "1" ]; then
-    EXTRA_ARGS+=(--no-save_traces)
+  if [ -n "${VLLM_SEED}" ]; then
+    EXTRA_ARGS+=(--vllm_seed "${VLLM_SEED}")
   fi
   if [ "${NO_PROGRESS}" = "1" ]; then
     EXTRA_ARGS+=(--no_progress)
   fi
   if [ "${PROGRESS_ALL_RANKS}" = "1" ]; then
     EXTRA_ARGS+=(--progress_all_ranks)
-  fi
-  if [ "${PROGRESS_NESTED}" != "1" ]; then
-    EXTRA_ARGS+=(--no-progress_nested)
   fi
   if [ "${PROGRESS_ECHO}" = "1" ]; then
     EXTRA_ARGS+=(--progress_echo)
@@ -89,10 +77,14 @@ for ((r = 0; r < NPROC_PER_NODE; r++)); do
     EXTRA_ARGS+=(--force_boxed_answer_instruction)
   fi
 
-  CUDA_VISIBLE_DEVICES="${r}" python3 examples/entropy_ce/infer_topk_f_mc_compare.py \
+  CUDA_VISIBLE_DEVICES="${r}" python3 examples/entropy_ce/infer_passk_by_mode.py \
     --input_data "${INPUT_DATA}" \
     --model_path "${MODEL_PATH}" \
     --output_dir "${OUTPUT_DIR}" \
+    --mode "${MODE}" \
+    --num_samples_per_prompt "${NUM_SAMPLES_PER_PROMPT}" \
+    --pass_k_small "${PASS_K_SMALL}" \
+    --pass_k_large "${PASS_K_LARGE}" \
     --max_samples "${MAX_SAMPLES}" \
     --seed "${SEED}" \
     --max_new_tokens "${MAX_NEW_TOKENS}" \
@@ -134,3 +126,4 @@ for pid in "${PIDS[@]}"; do
   fi
 done
 exit "${EXIT}"
+

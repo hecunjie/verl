@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import os
 import random
@@ -407,8 +408,10 @@ def _decode_one_policy(
     mc_top_p: float,
     sampling_temperature: float,
     sampling_top_p: float,
+    minf_nonbranch_mode: str,
     vllm_logprobs_topk: int,
     vllm_request_batch_chunk: int,
+    vllm_request_batch_chunk_mc: int,
     f_continuation_mode: str,
     f_sentence_max_new_tokens: int,
     f_sentence_stop: str,
@@ -545,7 +548,7 @@ def _decode_one_policy(
 
                     if selection_f_mode in ("greedy_path", "mc"):
                         n_req = len(prefixes) * int(m_samples_use)
-                        bs = int(vllm_request_batch_chunk)
+                        bs = int(vllm_request_batch_chunk_mc)
                         chunk_starts = range(0, n_req, bs)
                         if show_nested_progress and tqdm is not None:
                             n_chunks = (n_req + bs - 1) // bs
@@ -565,7 +568,7 @@ def _decode_one_policy(
                             temperature=temp_use,
                             top_p=top_p_use,
                             logprobs_k=vllm_logprobs_topk,
-                            batch_chunk=vllm_request_batch_chunk,
+                            batch_chunk=vllm_request_batch_chunk_mc,
                             f_continuation_mode=f_continuation_mode,
                             tokenizer=tokenizer if f_continuation_mode == "first_sentence" else None,
                             f_sentence_max_new_tokens=f_sentence_max_new_tokens,
@@ -580,7 +583,6 @@ def _decode_one_policy(
                             chosen_token = int(cands[best_i])
             else:
                 raise ValueError(f"unsupported policy: {policy}")
-
             branch_count += 1
             branch_records.append(
                 {
@@ -595,6 +597,16 @@ def _decode_one_policy(
                     "chosen_text": tokenizer.decode([int(chosen_token)], skip_special_tokens=True),
                 }
             )
+        elif policy == "min_f_mc" and minf_nonbranch_mode == "sampling":
+            sampled_token = _sample_one_token_vllm(
+                llm=llm,
+                prefix_ids=prefix,
+                temperature=sampling_temperature,
+                top_p=sampling_top_p,
+            )
+            if sampled_token is None:
+                break
+            chosen_token = int(sampled_token)
 
         response_ids.append(int(chosen_token))
         entropy_hist.append(float(entropy_t))
@@ -617,6 +629,12 @@ def main() -> None:
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--max_samples", type=int, default=300)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--vllm_seed",
+        type=int,
+        default=None,
+        help="Explicit RNG seed for vLLM sampling. Default: seed + rank.",
+    )
 
     parser.add_argument("--max_new_tokens", type=int, default=2048)
     parser.add_argument("--entropy_threshold", type=float, default=1.0)
@@ -635,6 +653,12 @@ def main() -> None:
     parser.add_argument("--mc_top_p", type=float, default=0.95)
     parser.add_argument("--sampling_temperature", type=float, default=1.0)
     parser.add_argument("--sampling_top_p", type=float, default=0.95)
+    parser.add_argument(
+        "--minf_nonbranch_mode",
+        choices=["greedy", "sampling"],
+        default="greedy",
+        help="Token choice for min_f_mc at non-branch steps: greedy (default) or sampling.",
+    )
     parser.add_argument("--bias_metrics_mode", choices=["raw", "length_normalized"], default="length_normalized")
     parser.add_argument("--f_continuation_mode", choices=["full", "first_sentence"], default="first_sentence")
     parser.add_argument("--f_sentence_max_new_tokens", type=int, default=256)
@@ -642,6 +666,12 @@ def main() -> None:
 
     parser.add_argument("--vllm_logprobs_topk", type=int, default=20)
     parser.add_argument("--vllm_request_batch_chunk", type=int, default=64)
+    parser.add_argument(
+        "--vllm_request_batch_chunk_mc",
+        type=int,
+        default=0,
+        help="Batch chunk used only by min-F MC estimation; <=0 means reuse vllm_request_batch_chunk.",
+    )
     parser.add_argument("--bucket_group_rollouts", type=int, default=16)
     parser.add_argument("--bucket_num_bins", type=int, default=100)
     parser.add_argument("--bucket_min_points_per_bin", type=int, default=4)
@@ -696,6 +726,8 @@ def main() -> None:
         raise SystemExit("--max_new_tokens must be >=1.")
     if args.vllm_request_batch_chunk < 1:
         raise SystemExit("--vllm_request_batch_chunk must be >=1.")
+    if int(args.vllm_request_batch_chunk_mc) != 0 and int(args.vllm_request_batch_chunk_mc) < 1:
+        raise SystemExit("--vllm_request_batch_chunk_mc must be 0 or >=1.")
     if args.bucket_group_rollouts < 1:
         raise SystemExit("--bucket_group_rollouts must be >=1.")
     if args.bucket_num_bins < 2:
@@ -709,6 +741,12 @@ def main() -> None:
     if vllm_standalone:
         purge_all_torchrun_like_env_for_vllm_standalone()
 
+    mc_batch_chunk = (
+        int(args.vllm_request_batch_chunk_mc)
+        if int(args.vllm_request_batch_chunk_mc) > 0
+        else int(args.vllm_request_batch_chunk)
+    )
+
     _configure_vllm_multiprocessing_spawn()
     _configure_vllm_ipc_for_single_node()
 
@@ -716,27 +754,37 @@ def main() -> None:
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    dist_snap = _snapshot_and_clear_torchrun_dist_env()
-    try:
-        from vllm import LLM
-
-        llm = LLM(
-            model=args.model_path,
-            trust_remote_code=True,
-            dtype="bfloat16",
-            tensor_parallel_size=1,
-            gpu_memory_utilization=float(args.vllm_gpu_memory_utilization),
-            max_model_len=int(args.vllm_max_model_len),
-            enforce_eager=True,
-        )
-    finally:
-        _restore_torchrun_dist_env(dist_snap)
-
     _, rank, world_size = init_dist(
         backend="vllm",
         rank_override=args.vllm_shard_rank if vllm_standalone else None,
         world_size_override=args.vllm_shard_world_size if vllm_standalone else None,
     )
+
+    # Keep all local random sources deterministic per shard.
+    random.seed(args.seed + rank)
+    np.random.seed(args.seed + rank)
+
+    vllm_seed_use = int(args.vllm_seed) if args.vllm_seed is not None else int(args.seed + rank)
+
+    dist_snap = _snapshot_and_clear_torchrun_dist_env()
+    try:
+        from vllm import LLM
+
+        llm_kwargs: dict[str, Any] = {
+            "model": args.model_path,
+            "trust_remote_code": True,
+            "dtype": "bfloat16",
+            "tensor_parallel_size": 1,
+            "gpu_memory_utilization": float(args.vllm_gpu_memory_utilization),
+            "max_model_len": int(args.vllm_max_model_len),
+            "enforce_eager": True,
+        }
+        # vLLM API differs by version; pass seed when supported to stabilize MC decoding.
+        if "seed" in inspect.signature(LLM).parameters:
+            llm_kwargs["seed"] = vllm_seed_use
+        llm = LLM(**llm_kwargs)
+    finally:
+        _restore_torchrun_dist_env(dist_snap)
 
     out_dir = Path(args.output_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -754,7 +802,6 @@ def main() -> None:
     local_rows = [row for idx, row in enumerate(rows) if idx % world_size == rank]
 
     rng = random.Random(args.seed + rank)
-    np.random.seed(args.seed + rank)
 
     env_no_tqdm = os.environ.get("TQDM_DISABLE", "").strip().lower() in ("1", "true", "yes")
     use_tqdm = tqdm is not None and not args.no_progress and not env_no_tqdm and (
@@ -835,8 +882,10 @@ def main() -> None:
             mc_top_p=float(args.mc_top_p),
             sampling_temperature=float(args.sampling_temperature),
             sampling_top_p=float(args.sampling_top_p),
+            minf_nonbranch_mode=str(args.minf_nonbranch_mode),
             vllm_logprobs_topk=int(args.vllm_logprobs_topk),
             vllm_request_batch_chunk=int(args.vllm_request_batch_chunk),
+            vllm_request_batch_chunk_mc=int(mc_batch_chunk),
             f_continuation_mode=str(args.f_continuation_mode),
             f_sentence_max_new_tokens=int(args.f_sentence_max_new_tokens),
             f_sentence_stop=str(args.f_sentence_stop),
@@ -866,8 +915,10 @@ def main() -> None:
             mc_top_p=float(args.mc_top_p),
             sampling_temperature=float(args.sampling_temperature),
             sampling_top_p=float(args.sampling_top_p),
+            minf_nonbranch_mode=str(args.minf_nonbranch_mode),
             vllm_logprobs_topk=int(args.vllm_logprobs_topk),
             vllm_request_batch_chunk=int(args.vllm_request_batch_chunk),
+            vllm_request_batch_chunk_mc=int(mc_batch_chunk),
             f_continuation_mode=str(args.f_continuation_mode),
             f_sentence_max_new_tokens=int(args.f_sentence_max_new_tokens),
             f_sentence_stop=str(args.f_sentence_stop),
@@ -897,8 +948,10 @@ def main() -> None:
             mc_top_p=float(args.mc_top_p),
             sampling_temperature=float(args.sampling_temperature),
             sampling_top_p=float(args.sampling_top_p),
+            minf_nonbranch_mode=str(args.minf_nonbranch_mode),
             vllm_logprobs_topk=int(args.vllm_logprobs_topk),
             vllm_request_batch_chunk=int(args.vllm_request_batch_chunk),
+            vllm_request_batch_chunk_mc=int(mc_batch_chunk),
             f_continuation_mode=str(args.f_continuation_mode),
             f_sentence_max_new_tokens=int(args.f_sentence_max_new_tokens),
             f_sentence_stop=str(args.f_sentence_stop),
@@ -979,7 +1032,10 @@ def main() -> None:
             "mc_m_samples": int(args.mc_m_samples),
             "sampling_temperature": float(args.sampling_temperature),
             "sampling_top_p": float(args.sampling_top_p),
+            "minf_nonbranch_mode": str(args.minf_nonbranch_mode),
             "selection_f_mode": str(args.selection_f_mode),
+            "seed": int(args.seed),
+            "vllm_seed": int(vllm_seed_use),
             "math_eval_backend": str(args.math_eval_backend),
             "force_boxed_answer_instruction": bool(args.force_boxed_answer_instruction),
             "bucket_group_rollouts": int(args.bucket_group_rollouts),
@@ -989,6 +1045,7 @@ def main() -> None:
             "f_sentence_max_new_tokens": int(args.f_sentence_max_new_tokens),
             "f_sentence_stop": str(args.f_sentence_stop),
             "bias_metrics_mode": str(args.bias_metrics_mode),
+            "vllm_request_batch_chunk_mc": int(mc_batch_chunk),
             "result_min_f_mc": {
                 "is_correct": bool(ok_minf),
                 "eval": eval_minf,
@@ -1166,6 +1223,8 @@ def main() -> None:
                 "max_branch_steps": int(args.max_branch_steps),
                 "mc_m_samples": int(args.mc_m_samples),
                 "selection_f_mode": str(args.selection_f_mode),
+                "seed": int(args.seed),
+                "vllm_seed": int(vllm_seed_use),
                 "math_eval_backend": str(args.math_eval_backend),
                 "bucket_group_rollouts": int(args.bucket_group_rollouts),
                 "bucket_num_bins": int(args.bucket_num_bins),
@@ -1174,10 +1233,12 @@ def main() -> None:
                 "mc_top_p": float(args.mc_top_p),
                 "sampling_temperature": float(args.sampling_temperature),
                 "sampling_top_p": float(args.sampling_top_p),
+                "minf_nonbranch_mode": str(args.minf_nonbranch_mode),
                 "f_continuation_mode": str(args.f_continuation_mode),
                 "f_sentence_max_new_tokens": int(args.f_sentence_max_new_tokens),
                 "f_sentence_stop": str(args.f_sentence_stop),
                 "bias_metrics_mode": str(args.bias_metrics_mode),
+                "vllm_request_batch_chunk_mc": int(mc_batch_chunk),
             },
         }
         with open(out_dir / "infer_compare_summary.json", "w", encoding="utf-8") as f:

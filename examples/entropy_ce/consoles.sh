@@ -196,13 +196,12 @@ python3 examples/entropy_ce/analyze_suffix_entropy_curve_bins.py \
   --output_dir /mnt/tidal-alsh01/dataset/zeus/hecunjie/entropy_check/ds_distill_1.5B_bias_correct_wrong_qwen3-4b-base_256/entropy_curve/suffix_curve_plots \
   --num_bins 100
 
-
 SELECTION_F_MODE=mc \
-MC_M_SAMPLES=10 \
+MC_M_SAMPLES=64 \
 MATH_EVAL_BACKEND=math_verify \
-MODEL_PATH=/mnt/tidal-alsh01/dataset/zeus/hecunjie/models/Qwen/Qwen3-4B-base \
-INPUT_DATA=/mnt/ali-sh-1/dataset/zeus/hecunjie/rl_data/grpo/math500_test.parquet \
-OUTPUT_DIR=/mnt/tidal-alsh01/dataset/zeus/hecunjie/entropy_check/infer_topk_f_mc_compare_qwen3_4b_base_mc10_mathverify_boxed \
+MODEL_PATH=/mnt/tidal-alsh01/dataset/zeus/hecunjie/models/Qwen/DeepSeek-R1-Distill-Qwen-1.5B \
+INPUT_DATA=/mnt/ali-sh-1/dataset/zeus/hecunjie/rl_data/grpo/aime2024_test.parquet \
+OUTPUT_DIR=/mnt/tidal-alsh01/dataset/zeus/hecunjie/entropy_check/infer_topk_f_mc_compare_deepseek_r1_distill_qwen_1.5b_mc64_aime24_test1 \
 NPROC_PER_NODE=8 \
 MAX_SAMPLES=500 \
 MAX_NEW_TOKENS=8192 \
@@ -218,14 +217,15 @@ BIAS_METRICS_MODE=length_normalized \
 PROGRESS_ECHO=1 \
 bash /mnt/ali-sh-1/dataset/zeus/hecunjie/gitlab-source/verl/examples/entropy_ce/run_infer_topk_f_mc_compare_vllm_sharded.sh
 
+SEED=123 \
 SAMPLING_TEMPERATURE=1.0 \
 SAMPLING_TOP_P=0.95 \
 SELECTION_F_MODE=mc \
 MC_M_SAMPLES=10 \
 MATH_EVAL_BACKEND=math_verify \
-MODEL_PATH=/mnt/tidal-alsh01/dataset/zeus/hecunjie/models/Qwen/Qwen3-8B \
+MODEL_PATH=/mnt/tidal-alsh01/dataset/zeus/hecunjie/models/Qwen/Qwen3-4B-base \
 INPUT_DATA=/mnt/ali-sh-1/dataset/zeus/hecunjie/rl_data/grpo/aime2024_test.parquet \
-OUTPUT_DIR=/mnt/tidal-alsh01/dataset/zeus/hecunjie/entropy_check/infer_topk_f_mc_compare_qwen3_8b_instruct_mc10_aime24 \
+OUTPUT_DIR=/mnt/tidal-alsh01/dataset/zeus/hecunjie/entropy_check/infer_topk_f_mc_compare_qwen3_4b_base_mc10_aime24_test1 \
 NPROC_PER_NODE=8 \
 MAX_SAMPLES=500 \
 MAX_NEW_TOKENS=8192 \
@@ -241,7 +241,7 @@ BIAS_METRICS_MODE=length_normalized \
 PROGRESS_ECHO=1 \
 bash /mnt/ali-sh-1/dataset/zeus/hecunjie/gitlab-source/verl/examples/entropy_ce/run_infer_topk_f_mc_compare_vllm_sharded.sh
 
-SEED=12345 \
+SEED=42 \
 SAMPLING_TEMPERATURE=1.0 \
 SAMPLING_TOP_P=0.95 \
 SELECTION_F_MODE=mc \
@@ -249,9 +249,9 @@ MC_M_SAMPLES=10 \
 MATH_EVAL_BACKEND=math_verify \
 MODEL_PATH=/mnt/tidal-alsh01/dataset/zeus/hecunjie/models/Qwen/Qwen3-4B \
 INPUT_DATA=/mnt/ali-sh-1/dataset/zeus/hecunjie/rl_data/grpo/aime2024_test.parquet \
-OUTPUT_DIR=/mnt/tidal-alsh01/dataset/zeus/hecunjie/entropy_check/infer_topk_f_mc_compare_qwen3_4b_instruct_mc10_aime24_test9 \
+OUTPUT_DIR=/mnt/tidal-alsh01/dataset/zeus/hecunjie/entropy_check/infer_topk_f_mc_compare_qwen3_4b_instruct_mc10_aime24_test11 \
 NPROC_PER_NODE=8 \
-MAX_SAMPLES=2000 \
+MAX_SAMPLES=500 \
 MAX_NEW_TOKENS=8192 \
 ENTROPY_THRESHOLD=1.0 \
 CANDIDATE_TOP_P=0.95 \
@@ -459,6 +459,33 @@ F_SENTENCE_MAX_NEW_TOKENS=128 \
 F_SENTENCE_STOP=simple \
 BUCKET_GROUP_ROLLOUTS=1 \
 FBAR_MODE=lookahead_2step \
+LOCAL_WINDOW_LEFT_TOKENS=20 \
+LOCAL_WINDOW_RIGHT_TOKENS=20 \
+MATH_EVAL_BACKEND=math_verify \
+PROGRESS_ECHO=1 \
+bash verl/examples/entropy_ce/run_compare_bias_sign_bucket_vs_mc_sharded.sh
+
+# 首句 f_real + 下一句熵率 f_bar：采样点之后到首句末为 f_real，紧随其后的下一句为 f_bar（需 first_sentence + real_path）
+MAX_SAMPLES=300 \
+MODEL_PATH=/mnt/tidal-alsh01/dataset/zeus/hecunjie/models/Qwen/Qwen3-4B \
+INPUT_DATA=/mnt/ali-sh-1/dataset/zeus/hecunjie/rl_data/grpo/dapo_math_17k_processed_train.parquet \
+OUTPUT_DIR=/mnt/tidal-alsh01/dataset/zeus/hecunjie/entropy_check/compare_bias_sign_first_next_sentence_mc_qwen3_4b \
+NPROC_PER_NODE=8 \
+MAX_NEW_TOKENS=8192 \
+ENTROPY_THRESHOLD=1.0 \
+CANDIDATE_TOP_P=0.95 \
+CANDIDATE_MAX_K=5 \
+MAX_BRANCH_STEPS=64 \
+MC_M_SAMPLES_REF=64 \
+MC_TEMPERATURE=1.0 \
+MC_TOP_P=0.95 \
+BIAS_METRICS_MODE=length_normalized \
+F_CONTINUATION_MODE=first_sentence \
+F_SENTENCE_MAX_NEW_TOKENS=128 \
+F_SENTENCE_STOP=simple \
+BUCKET_GROUP_ROLLOUTS=1 \
+FBAR_MODE=first_next_sentence \
+BRANCH_TOKEN_SELECTOR=real_path \
 LOCAL_WINDOW_LEFT_TOKENS=20 \
 LOCAL_WINDOW_RIGHT_TOKENS=20 \
 MATH_EVAL_BACKEND=math_verify \

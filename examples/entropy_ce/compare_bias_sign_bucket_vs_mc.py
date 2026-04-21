@@ -208,6 +208,52 @@ def _candidate_lookahead_2step_entropy(
     return float(exp_h_nextnext)
 
 
+def _f_real_fbar_first_next_sentence(
+    gen_ids: list[int],
+    step_lps_float: list[dict[int, float]],
+    *,
+    tokenizer: Any,
+    stop_fn: Any,
+    normalize_by_continuation_length: bool,
+) -> tuple[float, float]:
+    """从分支点之后的续写后缀上：首句熵（或熵率）作 f_real，紧随其后的「下一句」作 f_bar。
+
+    与 ``continuation_F_from_gen_ids_and_step_logprobs(..., first_sentence)`` 一致：首句边界由
+    ``truncate_gen_ids_to_first_sentence`` + ``stop_fn`` 决定；下一句再对剩余后缀做一次首句截断。
+    """
+    from sentence_stop_utils import truncate_gen_ids_to_first_sentence
+
+    n = len(gen_ids)
+    padded = list(step_lps_float)
+    while len(padded) < n:
+        padded.append({})
+    if n <= 0:
+        return float("nan"), float("nan")
+
+    k1 = int(truncate_gen_ids_to_first_sentence(gen_ids, tokenizer, stop_fn))
+    k1 = min(max(k1, 0), n)
+    ent_first = [float(entropy_from_logprobs_topk(padded[i])) for i in range(k1)]
+    if not ent_first:
+        f_real = float("nan")
+    else:
+        s0 = float(sum(ent_first))
+        f_real = s0 / float(len(ent_first)) if normalize_by_continuation_length else s0
+
+    rest_ids = gen_ids[k1:]
+    if not rest_ids:
+        return f_real, float("nan")
+
+    k2 = int(truncate_gen_ids_to_first_sentence(rest_ids, tokenizer, stop_fn))
+    k2 = min(max(k2, 0), len(rest_ids))
+    ent_second = [float(entropy_from_logprobs_topk(padded[k1 + i])) for i in range(k2)]
+    if not ent_second:
+        f_bar = float("nan")
+    else:
+        s1 = float(sum(ent_second))
+        f_bar = s1 / float(len(ent_second)) if normalize_by_continuation_length else s1
+    return f_real, f_bar
+
+
 def _sample_group_rollouts_detailed(
     *,
     llm: Any,
@@ -469,7 +515,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--fbar_mode",
-        choices=["single_local", "group_local", "lookahead_1step", "lookahead_2step"],
+        choices=["single_local", "group_local", "lookahead_1step", "lookahead_2step", "first_next_sentence"],
         default="single_local",
         help=(
             "How to compute f_bar vs f_real proxy at each sampled step: "
@@ -477,7 +523,9 @@ def main() -> None:
             "lookahead_1step uses weighted next-step entropy H(next|prefix+c) over top-p candidates "
             "vs the chosen branch's next-step entropy; "
             "lookahead_2step uses weighted expected two-step-ahead entropy "
-            "E[H(next-next)|prefix+c] under top-p capped next-token branching."
+            "E[H(next-next)|prefix+c] under top-p capped next-token branching; "
+            "first_next_sentence uses first-sentence entropy (rate) after the branch vs next-sentence "
+            "entropy rate on the real-path suffix (requires first_sentence continuation + real_path)."
         ),
     )
 
@@ -594,6 +642,11 @@ def main() -> None:
         raise SystemExit("--bucket_min_points_per_bin must be >=1.")
     if int(args.local_window_left_tokens) < 0 or int(args.local_window_right_tokens) < 0:
         raise SystemExit("--local_window_left_tokens and --local_window_right_tokens must be >=0.")
+    if str(args.fbar_mode) == "first_next_sentence":
+        if str(args.f_continuation_mode) != "first_sentence":
+            raise SystemExit("--fbar_mode first_next_sentence requires --f_continuation_mode first_sentence.")
+        if str(args.branch_token_selector) != "real_path":
+            raise SystemExit("--fbar_mode first_next_sentence requires --branch_token_selector real_path.")
     if (
         str(args.rm_score_backend) == "open_source_rm"
         and (str(args.branch_token_selector) == "reward_model" or bool(args.rm_mc_compare))
@@ -920,22 +973,35 @@ def main() -> None:
                     summary_cnt["n_eval_steps_mc_compare"] += 1
                     summary_cnt["n_match_sign_mc_compare_vs_ref"] += int(sign_match_mc_compare_vs_ref)
 
+            f_real_first_next_trace: float | None = None
+            f_bar_first_next_trace: float | None = None
             if str(args.branch_token_selector) == "reward_model":
                 # For RM-selected branch, use MC-estimated f_real as real-path proxy for local metrics.
                 f_selected_real_proxy = float(f_real_mc)
             else:
                 suffix_gen_ids = [int(t) for t in response_ids[step_idx + 1 :]]
                 suffix_step_lps = [dict(d) for d in step_lps_seq[step_idx + 1 :]]
-                f_selected_real_proxy = float(
-                    continuation_F_from_gen_ids_and_step_logprobs(
+                if str(args.fbar_mode) == "first_next_sentence":
+                    assert sentence_stop_check is not None
+                    f_real_first_next_trace, f_bar_first_next_trace = _f_real_fbar_first_next_sentence(
                         gen_ids=suffix_gen_ids,
                         step_lps_float=suffix_step_lps,
-                        f_continuation_mode=str(args.f_continuation_mode),
-                        tokenizer=tokenizer if str(args.f_continuation_mode) == "first_sentence" else None,
-                        stop_fn=sentence_stop_check if str(args.f_continuation_mode) == "first_sentence" else None,
-                        normalize_by_continuation_length=True,
+                        tokenizer=tokenizer,
+                        stop_fn=sentence_stop_check,
+                        normalize_by_continuation_length=(str(args.bias_metrics_mode) == "length_normalized"),
                     )
-                )
+                    f_selected_real_proxy = float(f_real_first_next_trace)
+                else:
+                    f_selected_real_proxy = float(
+                        continuation_F_from_gen_ids_and_step_logprobs(
+                            gen_ids=suffix_gen_ids,
+                            step_lps_float=suffix_step_lps,
+                            f_continuation_mode=str(args.f_continuation_mode),
+                            tokenizer=tokenizer if str(args.f_continuation_mode) == "first_sentence" else None,
+                            stop_fn=sentence_stop_check if str(args.f_continuation_mode) == "first_sentence" else None,
+                            normalize_by_continuation_length=True,
+                        )
+                    )
             fbar_lookahead_1step: float | None = None
             f_real_lookahead_1step: float | None = None
             fbar_lookahead_2step: float | None = None
@@ -983,6 +1049,13 @@ def main() -> None:
                 fbar_local_same_label = fbar_la2
                 fbar_local_all = fbar_la2
                 sign_trend_same_label = _sign(fbar_la2 - f_real_la2)
+                sign_trend_all = sign_trend_same_label
+            elif str(args.fbar_mode) == "first_next_sentence":
+                if f_real_first_next_trace is None or f_bar_first_next_trace is None:
+                    raise RuntimeError("internal: first_next_sentence f_real/f_bar not computed")
+                fbar_local_same_label = float(f_bar_first_next_trace)
+                fbar_local_all = float(f_bar_first_next_trace)
+                sign_trend_same_label = _sign(float(f_bar_first_next_trace) - float(f_real_first_next_trace))
                 sign_trend_all = sign_trend_same_label
             elif str(args.fbar_mode) == "single_local":
                 local_real = _local_entropy_rate_around_step(
@@ -1061,6 +1134,8 @@ def main() -> None:
                         "f_real_lookahead_1step": f_real_lookahead_1step,
                         "f_bar_lookahead_2step": fbar_lookahead_2step,
                         "f_real_lookahead_2step": f_real_lookahead_2step,
+                        "f_real_first_next_sentence": f_real_first_next_trace,
+                        "f_bar_first_next_sentence": f_bar_first_next_trace,
                         "f_bar_trend_same_label": float(fbar_local_same_label),
                         "f_bar_trend_all": float(fbar_local_all),
                         "f_bar_trend_same_label_full_traj": float(fbar_trend_same_label),

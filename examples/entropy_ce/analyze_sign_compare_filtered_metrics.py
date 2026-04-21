@@ -2,11 +2,13 @@
 """从 sign_compare_merged.jsonl 统计「符号一致」在多种过滤下的指标。
 
 约定（与 compare_bias_sign_bucket_vs_mc.py 的 trace 字段一致）：
-- 「准确率」侧（两种 lookahead 并行统计）：
+- 「准确率」侧（多种 f_bar 模式并行统计）：
   - lookahead_1step：f_bar_lookahead_1step >= threshold，且去掉
     |f_bar_lookahead_1step - f_real_lookahead_1step| < margin_threshold；
   - lookahead_2step：f_bar_lookahead_2step >= threshold，且去掉
-    |f_bar_lookahead_2step - f_real_lookahead_2step| < margin_threshold。
+    |f_bar_lookahead_2step - f_real_lookahead_2step| < margin_threshold；
+  - first_next_sentence：f_bar_first_next_sentence >= threshold，且去掉
+    |f_bar_first_next_sentence - f_real_first_next_sentence| < margin_threshold。
 - 「召回」侧（MC 参考，即 mc_m_samples_ref，字段名可能仍为 f_bar_mc_128）：
   保留 f_bar_mc_ref >= threshold 且 |f_bar_mc_ref - f_real_mc_ref| >= margin 的 step，
   match 用 trend 与 **MC ref** 的符号是否一致（sign_match_real_trend_same_label）。
@@ -89,6 +91,25 @@ def _acc_step_ok_2step(st: dict[str, Any], thr: float, margin_thr: float) -> boo
     try:
         fbf, frf = float(fb), float(fr)
     except (TypeError, ValueError):
+        return False
+    if fbf < thr:
+        return False
+    if abs(fbf - frf) < margin_thr:
+        return False
+    return True
+
+
+def _acc_step_ok_first_next(st: dict[str, Any], thr: float, margin_thr: float) -> bool:
+    """准确率子集（首句 f_real + 下一句 f_bar）：与 first_next_sentence 的 trend 字段一致。"""
+    fb = st.get("f_bar_first_next_sentence")
+    fr = st.get("f_real_first_next_sentence")
+    if fb is None or fr is None:
+        return False
+    try:
+        fbf, frf = float(fb), float(fr)
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(fbf) or not math.isfinite(frf):
         return False
     if fbf < thr:
         return False
@@ -448,6 +469,12 @@ def main() -> None:
     n_acc_match = sum(1 for st in acc_kept if _get_match(st, use_all))
     acc_rate = float(n_acc_match) / float(n_acc) if n_acc > 0 else float("nan")
 
+    # 准确率（first_next_sentence：首句 vs 下一句）
+    acc_fn_kept = [st for st in steps if _acc_step_ok_first_next(st, thr, margin_thr)]
+    n_acc_fn = len(acc_fn_kept)
+    n_acc_fn_match = sum(1 for st in acc_fn_kept if _get_match(st, use_all))
+    acc_fn_rate = float(n_acc_fn_match) / float(n_acc_fn) if n_acc_fn > 0 else float("nan")
+
     # 召回（MC ref）
     rec_ref_kept = [st for st in steps if _rec_step_ok_ref(st, thr, margin_thr)]
     n_rec_ref = len(rec_ref_kept)
@@ -507,6 +534,27 @@ def main() -> None:
     n_both2_cmp_match_vs_ref = sum(1 for st in both2_cmp if _get_match(st, use_all))
     both2_cmp_rate_vs_ref = (
         float(n_both2_cmp_match_vs_ref) / float(n_both2_cmp) if n_both2_cmp > 0 else float("nan")
+    )
+
+    # 交集：first_next_sentence 准确率 ∧ MC ref / MC compare
+    both_fn = [
+        st for st in steps if _acc_step_ok_first_next(st, thr, margin_thr) and _rec_step_ok_ref(st, thr, margin_thr)
+    ]
+    n_both_fn = len(both_fn)
+    n_both_fn_match = sum(1 for st in both_fn if _get_match(st, use_all))
+    both_fn_rate = float(n_both_fn_match) / float(n_both_fn) if n_both_fn > 0 else float("nan")
+
+    both_fn_cmp = [
+        st
+        for st in steps
+        if _acc_step_ok_first_next(st, thr, margin_thr) and _rec_step_ok_compare(st, thr, margin_thr)
+    ]
+    n_both_fn_cmp = len(both_fn_cmp)
+    n_both_fn_cmp_match = sum(1 for st in both_fn_cmp if _get_match_vs_mc_compare(st, use_all))
+    both_fn_cmp_rate = float(n_both_fn_cmp_match) / float(n_both_fn_cmp) if n_both_fn_cmp > 0 else float("nan")
+    n_both_fn_cmp_match_vs_ref = sum(1 for st in both_fn_cmp if _get_match(st, use_all))
+    both_fn_cmp_rate_vs_ref = (
+        float(n_both_fn_cmp_match_vs_ref) / float(n_both_fn_cmp) if n_both_fn_cmp > 0 else float("nan")
     )
 
     # --- Precision / Recall for sign_match_mc_compare_vs_ref (predict=compare, gt=ref) ---
@@ -593,6 +641,15 @@ def main() -> None:
             "n_match": n_acc_match,
             "rate": acc_rate,
         },
+        "accuracy_side_first_next_sentence": {
+            "description": (
+                "keep steps with f_bar_first_next_sentence >= threshold AND "
+                "|f_bar_first_next_sentence - f_real_first_next_sentence| >= margin_threshold; then match rate"
+            ),
+            "n_kept": n_acc_fn,
+            "n_match": n_acc_fn_match,
+            "rate": acc_fn_rate,
+        },
         "accuracy_side": {
             "description": (
                 "alias of accuracy_side_lookahead_2step for backward compatibility "
@@ -660,6 +717,20 @@ def main() -> None:
             "rate_trend_vs_mc_compare": both2_cmp_rate,
             "n_match_trend_vs_mc_ref": n_both2_cmp_match_vs_ref,
             "rate_trend_vs_mc_ref": both2_cmp_rate_vs_ref,
+        },
+        "intersection_both_filters_first_next_sentence": {
+            "description": "first_next_sentence accuracy filters AND recall_side_mc_ref",
+            "n_kept": n_both_fn,
+            "n_match": n_both_fn_match,
+            "rate": both_fn_rate,
+        },
+        "intersection_both_filters_first_next_sentence_mc_compare": {
+            "description": "first_next_sentence accuracy filters AND recall_side_mc_compare",
+            "n_kept": n_both_fn_cmp,
+            "n_match_trend_vs_mc_compare": n_both_fn_cmp_match,
+            "rate_trend_vs_mc_compare": both_fn_cmp_rate,
+            "n_match_trend_vs_mc_ref": n_both_fn_cmp_match_vs_ref,
+            "rate_trend_vs_mc_ref": both_fn_cmp_rate_vs_ref,
         },
         "intersection_both_filters": {
             "description": (
