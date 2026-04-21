@@ -59,6 +59,40 @@ def _append_jsonl(path: Path, rec: dict[str, Any]) -> None:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
+def _find_subseq(haystack: list[int], needle: list[int], start: int = 0) -> int:
+    """Return first index i s.t. haystack[i:i+len(needle)] == needle; -1 if not found."""
+    if not needle:
+        return -1
+    n = len(haystack)
+    m = len(needle)
+    if m > n:
+        return -1
+    s = max(int(start), 0)
+    for i in range(s, n - m + 1):
+        if haystack[i : i + m] == needle:
+            return i
+    return -1
+
+
+def _think_content_token_span(response_ids: list[int], tokenizer: Any) -> tuple[int, int] | None:
+    """Token span (inclusive) inside first <think> ... </think>; None if missing/empty."""
+    open_ids = [int(x) for x in tokenizer.encode("<think>", add_special_tokens=False)]
+    close_ids = [int(x) for x in tokenizer.encode("</think>", add_special_tokens=False)]
+    if not open_ids or not close_ids:
+        return None
+    open_start = _find_subseq(response_ids, open_ids, start=0)
+    if open_start < 0:
+        return None
+    close_start = _find_subseq(response_ids, close_ids, start=open_start + len(open_ids))
+    if close_start < 0:
+        return None
+    lo = int(open_start + len(open_ids))
+    hi = int(close_start - 1)
+    if lo > hi:
+        return None
+    return lo, hi
+
+
 def _build_rollout_prefix_suffix_refs(hs_rollouts: list[list[float]]) -> list[dict[str, Any]]:
     """Per-rollout references keyed by monotonic prefix entropy sum.
 
@@ -726,6 +760,7 @@ def main() -> None:
         "n_eval_steps_mc_compare": 0,
         "n_eval_steps_rm_mc_compare": 0,
         "n_match_rm_vs_mc_token": 0,
+        "n_skipped_no_next_sentence_for_first_next": 0,
     }
 
     sentence_stop_check = None
@@ -807,6 +842,7 @@ def main() -> None:
         step_lps_seq: list[dict[int, float]] = list(real_rollout.get("step_lps", []))
         real_is_correct = bool(real_rollout.get("is_correct", False))
         real_entropy_rate_full = float(real_rollout.get("entropy_rate_full", 0.0))
+        think_span = _think_content_token_span(response_ids, tokenizer)
 
         same_label_rollouts = [r for r in rollouts if bool(r.get("is_correct", False)) == real_is_correct] or [real_rollout]
 
@@ -822,6 +858,10 @@ def main() -> None:
         eval_positions: list[int] = []
         branch_count = 0
         for step_idx in range(n_steps):
+            if think_span is None:
+                continue
+            if not (int(think_span[0]) <= int(step_idx) <= int(think_span[1])):
+                continue
             step_lp = step_lps_seq[step_idx]
             cands, _cand_probs = _topp_capped_from_step_logprobs(
                 step_lp,
@@ -990,6 +1030,10 @@ def main() -> None:
                         stop_fn=sentence_stop_check,
                         normalize_by_continuation_length=(str(args.bias_metrics_mode) == "length_normalized"),
                     )
+                    # If sampled point is in the final sentence, there is no "next sentence" for f_bar.
+                    if not np.isfinite(float(f_real_first_next_trace)) or not np.isfinite(float(f_bar_first_next_trace)):
+                        summary_cnt["n_skipped_no_next_sentence_for_first_next"] += 1
+                        continue
                     f_selected_real_proxy = float(f_real_first_next_trace)
                 else:
                     f_selected_real_proxy = float(

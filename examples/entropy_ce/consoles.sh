@@ -199,9 +199,9 @@ python3 examples/entropy_ce/analyze_suffix_entropy_curve_bins.py \
 SELECTION_F_MODE=mc \
 MC_M_SAMPLES=64 \
 MATH_EVAL_BACKEND=math_verify \
-MODEL_PATH=/mnt/tidal-alsh01/dataset/zeus/hecunjie/models/Qwen/DeepSeek-R1-Distill-Qwen-1.5B \
+MODEL_PATH=/mnt/tidal-alsh01/dataset/zeus/hecunjie/models/Qwen/DeepSeek-R1-Distill-Qwen-7B \
 INPUT_DATA=/mnt/ali-sh-1/dataset/zeus/hecunjie/rl_data/grpo/aime2024_test.parquet \
-OUTPUT_DIR=/mnt/tidal-alsh01/dataset/zeus/hecunjie/entropy_check/infer_topk_f_mc_compare_deepseek_r1_distill_qwen_1.5b_mc64_aime24_test1 \
+OUTPUT_DIR=/mnt/tidal-alsh01/dataset/zeus/hecunjie/entropy_check/infer_topk_f_mc_compare_deepseek_r1_distill_qwen_7b_mc64_aime24_test1 \
 NPROC_PER_NODE=8 \
 MAX_SAMPLES=500 \
 MAX_NEW_TOKENS=8192 \
@@ -526,3 +526,51 @@ python3 examples/entropy_ce/analyze_sign_compare_filtered_metrics.py \
 
     --pr_precision_relative_gap_frac 0.3 \
   --pr_recall_relative_gap_frac 0.3 \
+
+
+# MODE=greedy \
+
+MODE=sampling \
+NUM_SAMPLES_PER_PROMPT=32 \
+PASS_K_SMALL=4 \
+PASS_K_LARGE=32 \
+VLLM_REQUEST_BATCH_CHUNK_MC=256 \
+SAMPLING_TEMPERATURE=1.0 \
+SAMPLING_TOP_P=0.95 \
+MODEL_PATH=/mnt/tidal-alsh01/dataset/zeus/hecunjie/models/Qwen/Qwen3-4B \
+INPUT_DATA=/mnt/ali-sh-1/dataset/zeus/hecunjie/rl_data/grpo/aime2024_test.parquet \
+OUTPUT_DIR=/mnt/tidal-alsh01/dataset/zeus/hecunjie/entropy_check/qwen3-4b_passk_32/sampling_aime24 \
+NPROC_PER_NODE=8 \
+MAX_SAMPLES=500 \
+MAX_NEW_TOKENS=8192 \
+MATH_EVAL_BACKEND=math_verify \
+bash /mnt/ali-sh-1/dataset/zeus/hecunjie/gitlab-source/verl/examples/entropy_ce/run_infer_passk_by_mode_vllm_sharded.sh
+
+MODE=min_f_mc \
+MINF_NONBRANCH_MODE=greedy \
+NUM_SAMPLES_PER_PROMPT=32 \
+PASS_K_SMALL=4 \
+PASS_K_LARGE=32 \
+SAMPLING_TEMPERATURE=1.0 \
+SAMPLING_TOP_P=0.95 \
+SELECTION_F_MODE=mc \
+MC_M_SAMPLES=10 \
+MC_TEMPERATURE=1.0 \
+MC_TOP_P=0.95 \
+VLLM_REQUEST_BATCH_CHUNK_MC=256 \
+MODEL_PATH=/mnt/tidal-alsh01/dataset/zeus/hecunjie/models/Qwen/Qwen3-4B \
+INPUT_DATA=/mnt/ali-sh-1/dataset/zeus/hecunjie/rl_data/grpo/aime2024_test.parquet \
+OUTPUT_DIR=/mnt/tidal-alsh01/dataset/zeus/hecunjie/entropy_check/qwen3-4b_passk_32/minfmc_nonbranch_greedy_aime24_batch \
+NPROC_PER_NODE=8 \
+MAX_SAMPLES=500 \
+MAX_NEW_TOKENS=8192 \
+ENTROPY_THRESHOLD=1.0 \
+CANDIDATE_TOP_P=0.95 \
+CANDIDATE_MAX_K=5 \
+MAX_BRANCH_STEPS=64 \
+F_CONTINUATION_MODE=first_sentence \
+F_SENTENCE_MAX_NEW_TOKENS=256 \
+BIAS_METRICS_MODE=length_normalized \
+MATH_EVAL_BACKEND=math_verify \
+bash /mnt/ali-sh-1/dataset/zeus/hecunjie/gitlab-source/verl/examples/entropy_ce/run_infer_passk_by_mode_vllm_sharded.sh \
+  --minf_sample_parallel_batch 32
