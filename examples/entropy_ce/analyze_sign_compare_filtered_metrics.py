@@ -249,9 +249,16 @@ def _include_precision_pr_subset_first_next(
         return False
     if min_fbar is None and min_abs_gap is None and relative_gap_frac is None:
         return True
+    fb = st.get("f_bar_first_next_sentence")
+    fr = st.get("f_real_first_next_sentence")
+    # Backward compatibility: old trend-only traces don't have first_next fields.
+    # In that case, use trend proxy fields directly.
+    if fb is None or fr is None:
+        fb = st.get("f_bar_trend_all") if use_trend_all else st.get("f_bar_trend_same_label")
+        fr = st.get("f_selected_real_proxy_rate")
     return _passes_optional_fb_fr_filters(
-        st.get("f_bar_first_next_sentence"),
-        st.get("f_real_first_next_sentence"),
+        fb,
+        fr,
         min_fbar,
         min_abs_gap,
         relative_gap_frac,
@@ -787,7 +794,9 @@ def main() -> None:
             "description": (
                 "predict = sign(real_trend from first_next_sentence), gt = sign(mc_ref), "
                 "Y = sign_match_real_trend_same_label (or sign_match_real_trend_all with --use_trend_all). "
-                "Precision denominator uses first_next filters; recall denominator uses mc_ref filters."
+                "Precision denominator uses first_next filters; recall denominator uses mc_ref filters. "
+                "For backward compatibility, if first_next fields are missing, precision-side filters "
+                "fallback to trend proxy fields: f_bar_trend_same_label/all vs f_selected_real_proxy_rate."
             ),
             "precision": {
                 "denominator_steps": n_fn_prec,
