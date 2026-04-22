@@ -12,7 +12,8 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from transformers import AutoTokenizer
+import torch
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 from entropy_credit_experiment import (
     _configure_vllm_ipc_for_single_node,
@@ -168,6 +169,121 @@ def _sample_one_token_vllm(
     if not o.token_ids:
         return None
     return int(o.token_ids[0])
+
+
+def _build_open_source_rm_scorer(
+    *,
+    model_path: str,
+    tokenizer_path: str | None,
+    device: str,
+    max_length: int,
+):
+    tok = AutoTokenizer.from_pretrained(tokenizer_path or model_path, trust_remote_code=True)
+    target_device = "cuda" if (device == "auto" and torch.cuda.is_available()) else ("cpu" if device == "auto" else device)
+    dtype = torch.bfloat16 if target_device.startswith("cuda") else torch.float32
+    model = AutoModelForSequenceClassification.from_pretrained(
+        model_path,
+        trust_remote_code=True,
+        torch_dtype=dtype,
+    )
+    model.to(target_device)
+    model.eval()
+
+    def _score(prompt_text: str, response_text: str) -> float:
+        packed = f"User:\n{prompt_text}\n\nAssistant:\n{response_text}"
+        enc = tok(
+            packed,
+            return_tensors="pt",
+            truncation=True,
+            max_length=int(max_length),
+        )
+        enc = {k: v.to(target_device) for k, v in enc.items()}
+        with torch.no_grad():
+            out = model(**enc)
+            logits = out.logits
+            if logits.ndim == 1:
+                return float(logits[0].item())
+            if logits.shape[-1] == 1:
+                return float(logits[0, 0].item())
+            if logits.shape[-1] == 2:
+                return float((logits[0, 1] - logits[0, 0]).item())
+            return float(logits[0, -1].item())
+
+    return _score
+
+
+def _estimate_reward_mc_many_prefixes_vllm(
+    *,
+    llm: Any,
+    tokenizer: Any,
+    rm_scorer: Any,
+    prompt_text: str,
+    prefixes: list[list[int]],
+    response_prefixes: list[list[int]],
+    m_samples: int,
+    max_new_tokens: int,
+    temperature: float,
+    top_p: float,
+    batch_chunk: int,
+    f_continuation_mode: str,
+    f_sentence_max_new_tokens: int,
+    sentence_stop_check: Any | None,
+) -> list[float]:
+    from vllm import SamplingParams
+    from vllm.inputs import TokensPrompt
+
+    if m_samples < 1 or not prefixes:
+        return [float("nan") for _ in prefixes]
+    if len(prefixes) != len(response_prefixes):
+        raise ValueError("prefixes and response_prefixes must have same length.")
+
+    gen_cap = int(max_new_tokens)
+    if str(f_continuation_mode) == "first_sentence":
+        gen_cap = max(1, min(int(f_sentence_max_new_tokens), int(max_new_tokens)))
+        if sentence_stop_check is None:
+            from sentence_stop_utils import completion_should_stop_after_first_sentence_simple
+
+            sentence_stop_check = completion_should_stop_after_first_sentence_simple
+    sp = SamplingParams(
+        max_tokens=max(1, gen_cap),
+        temperature=float(temperature),
+        top_p=float(top_p),
+        logprobs=0,
+    )
+
+    flat_prompts: list[TokensPrompt] = []
+    flat_pref_idx: list[int] = []
+    for pi, pref in enumerate(prefixes):
+        for _ in range(int(m_samples)):
+            flat_prompts.append(TokensPrompt(prompt_token_ids=pref))
+            flat_pref_idx.append(pi)
+
+    per_pref_scores: list[list[float]] = [[] for _ in range(len(prefixes))]
+    for start in range(0, len(flat_prompts), int(batch_chunk)):
+        prompts = flat_prompts[start : start + int(batch_chunk)]
+        outputs = vllm_generate_quiet(llm, prompts, sp)
+        if len(outputs) != len(prompts):
+            raise RuntimeError(f"vLLM batch size mismatch: expected {len(prompts)}, got {len(outputs)}")
+        for out_i, out_req in enumerate(outputs):
+            pref_idx = int(flat_pref_idx[start + out_i])
+            gen_ids = [int(t) for t in (out_req.outputs[0].token_ids or [])]
+            if str(f_continuation_mode) == "first_sentence":
+                from sentence_stop_utils import truncate_gen_ids_to_first_sentence
+
+                keep_k = int(truncate_gen_ids_to_first_sentence(gen_ids, tokenizer, sentence_stop_check))
+                gen_ids = gen_ids[: max(0, keep_k)]
+            resp_ids = list(response_prefixes[pref_idx]) + gen_ids
+            resp_text = tokenizer.decode(resp_ids, skip_special_tokens=True)
+            sc = float(rm_scorer(prompt_text, resp_text))
+            per_pref_scores[pref_idx].append(sc)
+
+    out_vals: list[float] = []
+    for ss in per_pref_scores:
+        if not ss:
+            out_vals.append(float("nan"))
+        else:
+            out_vals.append(float(np.mean(np.array(ss, dtype=np.float64))))
+    return out_vals
 
 
 def _candidate_lookahead_1step_entropy(
@@ -425,6 +541,8 @@ def _decode_one_policy(
     progress_mc_position: int = 2,
     progress_mc_desc: str = "mc",
     bucket_group_estimator: dict[str, Any] | None = None,
+    prompt_text: str | None = None,
+    rm_scorer: Any | None = None,
 ) -> tuple[list[int], list[dict[str, Any]]]:
     if policy not in {"min_f_mc", "sampling_baseline", "greedy_baseline"}:
         raise ValueError(f"unsupported policy: {policy}")
@@ -510,6 +628,39 @@ def _decode_one_policy(
                         m_samples_use = int(mc_m_samples)
                         temp_use = float(mc_temperature)
                         top_p_use = float(mc_top_p)
+                    elif selection_f_mode == "rm_score_mc":
+                        if rm_scorer is None or prompt_text is None:
+                            raise ValueError("rm_scorer and prompt_text are required for selection_f_mode=rm_score_mc.")
+                        reward_values = _estimate_reward_mc_many_prefixes_vllm(
+                            llm=llm,
+                            tokenizer=tokenizer,
+                            rm_scorer=rm_scorer,
+                            prompt_text=prompt_text,
+                            prefixes=prefixes,
+                            response_prefixes=[response_ids + [int(t)] for t in cands],
+                            m_samples=int(mc_m_samples),
+                            max_new_tokens=remaining,
+                            temperature=float(mc_temperature),
+                            top_p=float(mc_top_p),
+                            batch_chunk=int(vllm_request_batch_chunk_mc),
+                            f_continuation_mode=str(f_continuation_mode),
+                            f_sentence_max_new_tokens=int(f_sentence_max_new_tokens),
+                            sentence_stop_check=sentence_stop_check,
+                        )
+                        if not reward_values:
+                            chosen_token = int(cands[0])
+                        else:
+                            arr_reward = np.array(reward_values, dtype=np.float64)
+                            if not np.any(np.isfinite(arr_reward)):
+                                chosen_token = int(cands[0])
+                            else:
+                                arr_reward[~np.isfinite(arr_reward)] = -1e30
+                                best_i = int(np.argmax(arr_reward))
+                                chosen_token = int(cands[best_i])
+                            f_values = [float(x) for x in reward_values]
+                        m_samples_use = 0
+                        temp_use = 0.0
+                        top_p_use = 1.0
                     elif selection_f_mode == "lookahead_1step":
                         f_values = [
                             _candidate_lookahead_1step_entropy(
@@ -592,6 +743,7 @@ def _decode_one_policy(
                     "candidate_probs_renorm_topp": [float(x) for x in cand_probs],
                     "candidate_texts": [tokenizer.decode([int(x)], skip_special_tokens=True) for x in cands],
                     "f_values_mc": [float(x) for x in f_values] if f_values else None,
+                    "reward_values_rm": [float(x) for x in f_values] if (f_values and selection_f_mode == "rm_score_mc") else None,
                     "selection_f_mode": selection_f_mode if policy == "min_f_mc" else None,
                     "chosen_token": int(chosen_token),
                     "chosen_text": tokenizer.decode([int(chosen_token)], skip_special_tokens=True),
@@ -642,9 +794,13 @@ def main() -> None:
     parser.add_argument("--candidate_max_k", type=int, default=5)
     parser.add_argument(
         "--selection_f_mode",
-        choices=["mc", "greedy_path", "lookahead_1step", "bucket_group_estimate"],
+        choices=["mc", "greedy_path", "lookahead_1step", "bucket_group_estimate", "rm_score_mc"],
         default="greedy_path",
-        help="How to estimate candidate F when selecting min-F: mc (multi-sample), greedy_path (single deterministic continuation), lookahead_1step (H_{t+1} proxy), or bucket_group_estimate (group bucket-aligned estimate).",
+        help=(
+            "How to select branch token in min-F policy: mc (min expected F by multi-sample), "
+            "greedy_path, lookahead_1step, bucket_group_estimate, or rm_score_mc "
+            "(max expected reward over MC-sampled continuations)."
+        ),
     )
     parser.add_argument("--max_branch_steps", type=int, default=0, help="<=0 means no cap.")
 
@@ -663,6 +819,15 @@ def main() -> None:
     parser.add_argument("--f_continuation_mode", choices=["full", "first_sentence"], default="first_sentence")
     parser.add_argument("--f_sentence_max_new_tokens", type=int, default=256)
     parser.add_argument("--f_sentence_stop", choices=["simple", "pysbd"], default="simple")
+    parser.add_argument(
+        "--rm_model_path",
+        type=str,
+        default="",
+        help="HF/local path of reward model; required when --selection_f_mode=rm_score_mc.",
+    )
+    parser.add_argument("--rm_model_tokenizer_path", type=str, default="", help="Optional RM tokenizer path.")
+    parser.add_argument("--rm_model_device", type=str, default="cpu", help="RM device: auto/cpu/cuda/cuda:1.")
+    parser.add_argument("--rm_model_max_length", type=int, default=4096)
 
     parser.add_argument("--vllm_logprobs_topk", type=int, default=20)
     parser.add_argument("--vllm_request_batch_chunk", type=int, default=64)
@@ -734,6 +899,11 @@ def main() -> None:
         raise SystemExit("--bucket_num_bins must be >=2.")
     if args.bucket_min_points_per_bin < 1:
         raise SystemExit("--bucket_min_points_per_bin must be >=1.")
+    if str(args.selection_f_mode) == "rm_score_mc":
+        if not str(args.rm_model_path).strip():
+            raise SystemExit("--rm_model_path is required when --selection_f_mode=rm_score_mc.")
+        if str(args.f_continuation_mode) != "first_sentence":
+            raise SystemExit("--selection_f_mode rm_score_mc currently requires --f_continuation_mode first_sentence.")
 
     vllm_standalone = args.vllm_shard_rank is not None and args.vllm_shard_world_size is not None
     if (args.vllm_shard_rank is None) ^ (args.vllm_shard_world_size is None):
@@ -753,6 +923,14 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
+    rm_scorer = None
+    if str(args.selection_f_mode) == "rm_score_mc":
+        rm_scorer = _build_open_source_rm_scorer(
+            model_path=str(args.rm_model_path),
+            tokenizer_path=str(args.rm_model_tokenizer_path) or None,
+            device=str(args.rm_model_device),
+            max_length=int(args.rm_model_max_length),
+        )
 
     _, rank, world_size = init_dist(
         backend="vllm",
@@ -899,6 +1077,8 @@ def main() -> None:
             progress_mc_position=bar_base + 2,
             progress_mc_desc=f"shard{rank} minF MC",
             bucket_group_estimator=bucket_estimator,
+            prompt_text=prompt_text,
+            rm_scorer=rm_scorer,
         )
         response_rand, trace_rand = _decode_one_policy(
             llm=llm,
@@ -932,6 +1112,8 @@ def main() -> None:
             progress_mc_position=bar_base + 2,
             progress_mc_desc=f"shard{rank} sampling MC",
             bucket_group_estimator=None,
+            prompt_text=prompt_text,
+            rm_scorer=None,
         )
         response_greedy, trace_greedy = _decode_one_policy(
             llm=llm,
@@ -965,6 +1147,8 @@ def main() -> None:
             progress_mc_position=bar_base + 2,
             progress_mc_desc=f"shard{rank} greedy MC",
             bucket_group_estimator=None,
+            prompt_text=prompt_text,
+            rm_scorer=None,
         )
 
         text_minf = tokenizer.decode(response_minf, skip_special_tokens=True)

@@ -12,6 +12,8 @@ NNODES="${NNODES:-1}"
 NODE_RANK="${NODE_RANK:-0}"
 MAX_SAMPLES="${MAX_SAMPLES:-300}"
 SEED="${SEED:-42}"
+GPUS_PER_PROCESS="${GPUS_PER_PROCESS:-1}"                  # 1 / 2
+RM_GPU_LOCAL_INDEX="${RM_GPU_LOCAL_INDEX:-1}"             # when GPUS_PER_PROCESS=2 and RM on cuda/auto
 
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-2048}"
 ENTROPY_THRESHOLD="${ENTROPY_THRESHOLD:-1.0}"
@@ -31,6 +33,10 @@ FORCE_BOXED_ANSWER_INSTRUCTION="${FORCE_BOXED_ANSWER_INSTRUCTION:-0}"
 F_CONTINUATION_MODE="${F_CONTINUATION_MODE:-first_sentence}"
 F_SENTENCE_MAX_NEW_TOKENS="${F_SENTENCE_MAX_NEW_TOKENS:-256}"
 F_SENTENCE_STOP="${F_SENTENCE_STOP:-simple}"
+RM_MODEL_PATH="${RM_MODEL_PATH:-}"
+RM_MODEL_TOKENIZER_PATH="${RM_MODEL_TOKENIZER_PATH:-}"
+RM_MODEL_DEVICE="${RM_MODEL_DEVICE:-cpu}"
+RM_MODEL_MAX_LENGTH="${RM_MODEL_MAX_LENGTH:-4096}"
 
 VLLM_LOGPROBS_TOPK="${VLLM_LOGPROBS_TOPK:-20}"
 VLLM_REQUEST_BATCH_CHUNK="${VLLM_REQUEST_BATCH_CHUNK:-64}"
@@ -62,6 +68,14 @@ if ! [[ "${NPROC_PER_NODE}" =~ ^[0-9]+$ ]] || [ "${NPROC_PER_NODE}" -lt 1 ]; the
   echo "Invalid NPROC_PER_NODE=${NPROC_PER_NODE} (must be >=1)" >&2
   exit 1
 fi
+if ! [[ "${GPUS_PER_PROCESS}" =~ ^[0-9]+$ ]] || { [ "${GPUS_PER_PROCESS}" -ne 1 ] && [ "${GPUS_PER_PROCESS}" -ne 2 ]; }; then
+  echo "Invalid GPUS_PER_PROCESS=${GPUS_PER_PROCESS} (must be 1 or 2)" >&2
+  exit 1
+fi
+if ! [[ "${RM_GPU_LOCAL_INDEX}" =~ ^[0-9]+$ ]] || [ "${RM_GPU_LOCAL_INDEX}" -lt 0 ]; then
+  echo "Invalid RM_GPU_LOCAL_INDEX=${RM_GPU_LOCAL_INDEX} (must be >=0)" >&2
+  exit 1
+fi
 
 WORLD_SIZE=$((NNODES * NPROC_PER_NODE))
 echo "[infer_topk_f_mc_compare] NODE_RANK=${NODE_RANK}/${NNODES} NPROC_PER_NODE=${NPROC_PER_NODE} WORLD_SIZE=${WORLD_SIZE}" >&2
@@ -69,6 +83,17 @@ echo "[infer_topk_f_mc_compare] NODE_RANK=${NODE_RANK}/${NNODES} NPROC_PER_NODE=
 PIDS=()
 for ((r = 0; r < NPROC_PER_NODE; r++)); do
   GLOBAL_RANK=$((NODE_RANK * NPROC_PER_NODE + r))
+  MAIN_GPU="${r}"
+  RM_DEVICE_ARG="${RM_MODEL_DEVICE}"
+  CUDA_VISIBLE_DEVICES_ARG="${MAIN_GPU}"
+  if [ "${GPUS_PER_PROCESS}" = "2" ]; then
+    MAIN_GPU=$((2 * r))
+    RM_GPU=$((2 * r + 1))
+    CUDA_VISIBLE_DEVICES_ARG="${MAIN_GPU},${RM_GPU}"
+    if [ "${RM_MODEL_DEVICE}" = "cuda" ] || [ "${RM_MODEL_DEVICE}" = "auto" ]; then
+      RM_DEVICE_ARG="cuda:${RM_GPU_LOCAL_INDEX}"
+    fi
+  fi
   EXTRA_ARGS=()
   if [ "${SAVE_TRACES}" != "1" ]; then
     EXTRA_ARGS+=(--no-save_traces)
@@ -89,7 +114,7 @@ for ((r = 0; r < NPROC_PER_NODE; r++)); do
     EXTRA_ARGS+=(--force_boxed_answer_instruction)
   fi
 
-  CUDA_VISIBLE_DEVICES="${r}" python3 examples/entropy_ce/infer_topk_f_mc_compare.py \
+  CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES_ARG}" python3 examples/entropy_ce/infer_topk_f_mc_compare.py \
     --input_data "${INPUT_DATA}" \
     --model_path "${MODEL_PATH}" \
     --output_dir "${OUTPUT_DIR}" \
@@ -112,6 +137,10 @@ for ((r = 0; r < NPROC_PER_NODE; r++)); do
     --f_continuation_mode "${F_CONTINUATION_MODE}" \
     --f_sentence_max_new_tokens "${F_SENTENCE_MAX_NEW_TOKENS}" \
     --f_sentence_stop "${F_SENTENCE_STOP}" \
+    --rm_model_path "${RM_MODEL_PATH}" \
+    --rm_model_tokenizer_path "${RM_MODEL_TOKENIZER_PATH}" \
+    --rm_model_device "${RM_DEVICE_ARG}" \
+    --rm_model_max_length "${RM_MODEL_MAX_LENGTH}" \
     --vllm_logprobs_topk "${VLLM_LOGPROBS_TOPK}" \
     --vllm_request_batch_chunk "${VLLM_REQUEST_BATCH_CHUNK}" \
     --vllm_request_batch_chunk_mc "${VLLM_REQUEST_BATCH_CHUNK_MC}" \

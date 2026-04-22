@@ -266,6 +266,37 @@ BIAS_METRICS_MODE=length_normalized \
 PROGRESS_ECHO=1 \
 bash /mnt/ali-sh-1/dataset/zeus/hecunjie/gitlab-source/verl/examples/entropy_ce/run_infer_topk_f_mc_compare_vllm_sharded.sh
 
+# 用 Reward Model 对 MC(first_sentence) 续写打分：每个候选 token 采样 MC_M_SAMPLES 条续写，按 RM 均分选最好 token
+SEED=42 \
+SAMPLING_TEMPERATURE=1.0 \
+SAMPLING_TOP_P=0.95 \
+SELECTION_F_MODE=rm_score_mc \
+MC_M_SAMPLES=10 \
+MC_TEMPERATURE=1.0 \
+MC_TOP_P=0.95 \
+F_SENTENCE_STOP=simple \
+F_CONTINUATION_MODE=first_sentence \
+F_SENTENCE_MAX_NEW_TOKENS=256 \
+RM_MODEL_PATH=/mnt/tidal-alsh01/dataset/zeus/hecunjie/models/reward_models/Skywork-Reward-Llama-3.1-8B \
+RM_MODEL_DEVICE=cuda \
+RM_MODEL_MAX_LENGTH=4096 \
+MATH_EVAL_BACKEND=math_verify \
+MODEL_PATH=/mnt/tidal-alsh01/dataset/zeus/hecunjie/models/Qwen/Qwen3-4B \
+INPUT_DATA=/mnt/ali-sh-1/dataset/zeus/hecunjie/rl_data/grpo/aime2024_test.parquet \
+OUTPUT_DIR=/mnt/tidal-alsh01/dataset/zeus/hecunjie/entropy_check/infer_topk_rm_score_mc_compare_qwen3_4b_instruct_mc10_aime24 \
+NPROC_PER_NODE=4 \
+GPUS_PER_PROCESS=2 \
+RM_GPU_LOCAL_INDEX=1 \
+MAX_SAMPLES=500 \
+MAX_NEW_TOKENS=8192 \
+ENTROPY_THRESHOLD=1.0 \
+CANDIDATE_TOP_P=0.95 \
+CANDIDATE_MAX_K=5 \
+MAX_BRANCH_STEPS=64 \
+BIAS_METRICS_MODE=length_normalized \
+PROGRESS_ECHO=1 \
+bash /mnt/ali-sh-1/dataset/zeus/hecunjie/gitlab-source/verl/examples/entropy_ce/run_infer_topk_f_mc_compare_vllm_sharded.sh
+
 
 MAX_SAMPLES=300 \
 MODEL_PATH=/mnt/tidal-alsh01/dataset/zeus/hecunjie/models/Qwen/Qwen3-4B \
@@ -341,7 +372,7 @@ bash verl/examples/entropy_ce/run_compare_bias_sign_bucket_vs_mc_sharded.sh
 MAX_SAMPLES=300 \
 MODEL_PATH=/mnt/tidal-alsh01/dataset/zeus/hecunjie/models/Qwen/Qwen3-4B \
 INPUT_DATA=/mnt/ali-sh-1/dataset/zeus/hecunjie/rl_data/grpo/dapo_math_17k_processed_train.parquet \
-OUTPUT_DIR=/mnt/tidal-alsh01/dataset/zeus/hecunjie/entropy_check/compare_bias_sign_reward_select_qwen3_4b \
+OUTPUT_DIR=/mnt/tidal-alsh01/dataset/zeus/hecunjie/entropy_check/compare_bias_sign_reward_skywork_select_qwen3_4b \
 NPROC_PER_NODE=4 \
 GPUS_PER_PROCESS=2 \
 MAX_NEW_TOKENS=8192 \
@@ -359,7 +390,7 @@ BUCKET_GROUP_ROLLOUTS=1 \
 FBAR_MODE=lookahead_1step \
 BRANCH_TOKEN_SELECTOR=reward_model \
 RM_SCORE_BACKEND=open_source_rm \
-RM_MODEL_PATH=Skywork/Skywork-Reward-Llama-3.1-8B \
+RM_MODEL_PATH=/mnt/tidal-alsh01/dataset/zeus/hecunjie/models/reward_models/Skywork-Reward-Llama-3.1-8B \
 RM_MODEL_DEVICE=cuda \
 RM_MODEL_MAX_LENGTH=4096 \
 RM_SELECT_DECODE_MODE=greedy \
@@ -538,8 +569,8 @@ VLLM_REQUEST_BATCH_CHUNK_MC=256 \
 SAMPLING_TEMPERATURE=1.0 \
 SAMPLING_TOP_P=0.95 \
 MODEL_PATH=/mnt/tidal-alsh01/dataset/zeus/hecunjie/models/Qwen/Qwen3-4B \
-INPUT_DATA=/mnt/ali-sh-1/dataset/zeus/hecunjie/rl_data/grpo/aime2024_test.parquet \
-OUTPUT_DIR=/mnt/tidal-alsh01/dataset/zeus/hecunjie/entropy_check/qwen3-4b_passk_32/sampling_aime24 \
+INPUT_DATA=/mnt/ali-sh-1/dataset/zeus/hecunjie/rl_data/grpo/aime2025_test.parquet \
+OUTPUT_DIR=/mnt/tidal-alsh01/dataset/zeus/hecunjie/entropy_check/qwen3-4b_passk_32/sampling_aime25 \
 NPROC_PER_NODE=8 \
 MAX_SAMPLES=500 \
 MAX_NEW_TOKENS=8192 \
@@ -547,7 +578,7 @@ MATH_EVAL_BACKEND=math_verify \
 bash /mnt/ali-sh-1/dataset/zeus/hecunjie/gitlab-source/verl/examples/entropy_ce/run_infer_passk_by_mode_vllm_sharded.sh
 
 MODE=min_f_mc \
-MINF_NONBRANCH_MODE=greedy \
+MINF_NONBRANCH_MODE=sampling \
 NUM_SAMPLES_PER_PROMPT=32 \
 PASS_K_SMALL=4 \
 PASS_K_LARGE=32 \
@@ -559,8 +590,8 @@ MC_TEMPERATURE=1.0 \
 MC_TOP_P=0.95 \
 VLLM_REQUEST_BATCH_CHUNK_MC=256 \
 MODEL_PATH=/mnt/tidal-alsh01/dataset/zeus/hecunjie/models/Qwen/Qwen3-4B \
-INPUT_DATA=/mnt/ali-sh-1/dataset/zeus/hecunjie/rl_data/grpo/aime2024_test.parquet \
-OUTPUT_DIR=/mnt/tidal-alsh01/dataset/zeus/hecunjie/entropy_check/qwen3-4b_passk_32/minfmc_nonbranch_greedy_aime24_batch \
+INPUT_DATA=/mnt/ali-sh-1/dataset/zeus/hecunjie/rl_data/grpo/aime2025_test.parquet \
+OUTPUT_DIR=/mnt/tidal-alsh01/dataset/zeus/hecunjie/entropy_check/qwen3-4b_passk_32/minfmc_nonbranch_sampling_aime25_batch \
 NPROC_PER_NODE=8 \
 MAX_SAMPLES=500 \
 MAX_NEW_TOKENS=8192 \
@@ -574,3 +605,10 @@ BIAS_METRICS_MODE=length_normalized \
 MATH_EVAL_BACKEND=math_verify \
 bash /mnt/ali-sh-1/dataset/zeus/hecunjie/gitlab-source/verl/examples/entropy_ce/run_infer_passk_by_mode_vllm_sharded.sh \
   --minf_sample_parallel_batch 32
+
+
+python3 examples/entropy_ce/recompute_passk_metrics_from_merged.py \
+  --input /mnt/tidal-alsh01/dataset/zeus/hecunjie/entropy_check/qwen3-4b_passk_32/minfmc_nonbranch_greedy_aime24_batch/passk_mode_merged.jsonl \
+  --k_small 4 \
+  --k_large 32 \
+  --mean_n 32
