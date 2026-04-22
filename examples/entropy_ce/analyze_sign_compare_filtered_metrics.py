@@ -293,6 +293,85 @@ def _get_sign_match_mc_compare_vs_ref(st: dict[str, Any]) -> bool | None:
     return bool(v)
 
 
+def _norm_sign(v: Any) -> int | None:
+    try:
+        s = int(v)
+    except (TypeError, ValueError):
+        return None
+    if s > 0:
+        return 1
+    if s < 0:
+        return -1
+    return 0
+
+
+def _get_trend_sign(st: dict[str, Any], use_trend_all: bool) -> int | None:
+    key = "sign_real_trend_all" if use_trend_all else "sign_real_trend_same_label"
+    return _norm_sign(st.get(key))
+
+
+def _get_mc_ref_sign(st: dict[str, Any]) -> int | None:
+    # Prefer explicit sign fields.
+    s = _norm_sign(st.get("sign_mc_ref"))
+    if s is not None:
+        return s
+    s = _norm_sign(st.get("sign_real_mc_128"))
+    if s is not None:
+        return s
+    # Fallback: derive from f_bar_mc_ref/f_real_mc_ref.
+    fb = st.get("f_bar_mc_ref", st.get("f_bar_mc_128"))
+    fr = st.get("f_real_mc_ref", st.get("f_real_mc_128"))
+    try:
+        d = float(fb) - float(fr)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(d):
+        return None
+    if d > 1e-12:
+        return 1
+    if d < -1e-12:
+        return -1
+    return 0
+
+
+def _directional_pr_from_sets(
+    *,
+    precision_steps: list[dict[str, Any]],
+    recall_steps: list[dict[str, Any]],
+    use_trend_all: bool,
+    target_sign: int,
+) -> dict[str, Any]:
+    t = 1 if int(target_sign) > 0 else -1
+    # precision: among predicted sign=t, how many gt sign=t.
+    prec_den_steps = [st for st in precision_steps if _get_trend_sign(st, use_trend_all) == t]
+    n_prec_den = len(prec_den_steps)
+    n_prec_num = sum(1 for st in prec_den_steps if _get_mc_ref_sign(st) == t)
+    prec = float(n_prec_num) / float(n_prec_den) if n_prec_den > 0 else float("nan")
+    # recall: among gt sign=t, how many predicted sign=t.
+    rec_den_steps = [st for st in recall_steps if _get_mc_ref_sign(st) == t]
+    n_rec_den = len(rec_den_steps)
+    n_rec_num = sum(1 for st in rec_den_steps if _get_trend_sign(st, use_trend_all) == t)
+    rec = float(n_rec_num) / float(n_rec_den) if n_rec_den > 0 else float("nan")
+    if math.isfinite(prec) and math.isfinite(rec) and (prec + rec) > 0:
+        f1 = 2.0 * prec * rec / (prec + rec)
+    else:
+        f1 = float("nan")
+    return {
+        "target_sign": int(t),
+        "precision": {
+            "denominator_steps_pred_sign": n_prec_den,
+            "numerator_pred_and_gt_same_sign": n_prec_num,
+            "rate": prec,
+        },
+        "recall": {
+            "denominator_steps_gt_sign": n_rec_den,
+            "numerator_pred_and_gt_same_sign": n_rec_num,
+            "rate": rec,
+        },
+        "f1": f1,
+    }
+
+
 def _mean_finite(xs: list[float]) -> float:
     xs = [float(x) for x in xs if isinstance(x, (int, float)) and math.isfinite(float(x))]
     return float(sum(xs) / len(xs)) if xs else float("nan")
@@ -730,6 +809,18 @@ def main() -> None:
         fn_f1 = 2.0 * fn_precision * fn_recall / (fn_precision + fn_recall)
     else:
         fn_f1 = float("nan")
+    fn_dir_pos = _directional_pr_from_sets(
+        precision_steps=prec_fn_steps,
+        recall_steps=rec_fn_steps,
+        use_trend_all=use_all,
+        target_sign=1,
+    )
+    fn_dir_neg = _directional_pr_from_sets(
+        precision_steps=prec_fn_steps,
+        recall_steps=rec_fn_steps,
+        use_trend_all=use_all,
+        target_sign=-1,
+    )
 
     value_stratification_by_real_rollout_is_correct = _build_value_stratification_by_real_rollout(
         prec_pr_steps, rec_pr_steps
@@ -809,6 +900,15 @@ def main() -> None:
                 "rate": fn_recall,
             },
             "f1": fn_f1,
+        },
+        "precision_recall_first_next_vs_mc_ref_by_sign": {
+            "description": (
+                "Directional PR by sign value for trend-vs-mc_ref: "
+                "sign=1 and sign=-1 are computed separately. "
+                "sign=0 is excluded from both directional denominators."
+            ),
+            "sign_pos_1": fn_dir_pos,
+            "sign_neg_minus_1": fn_dir_neg,
         },
         "value_stratification_by_real_rollout_is_correct": value_stratification_by_real_rollout_is_correct,
         "accuracy_side_lookahead_1step": {
