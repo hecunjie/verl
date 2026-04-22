@@ -177,8 +177,11 @@ def _build_open_source_rm_scorer(
     tokenizer_path: str | None,
     device: str,
     max_length: int,
+    response_tail_tokens: int,
 ):
     tok = AutoTokenizer.from_pretrained(tokenizer_path or model_path, trust_remote_code=True)
+    # Keep newest context when max_length truncation happens.
+    tok.truncation_side = "left"
     target_device = "cuda" if (device == "auto" and torch.cuda.is_available()) else ("cpu" if device == "auto" else device)
     dtype = torch.bfloat16 if target_device.startswith("cuda") else torch.float32
     model = AutoModelForSequenceClassification.from_pretrained(
@@ -190,13 +193,61 @@ def _build_open_source_rm_scorer(
     model.eval()
 
     def _score(prompt_text: str, response_text: str) -> float:
-        packed = f"User:\n{prompt_text}\n\nAssistant:\n{response_text}"
-        enc = tok(
-            packed,
-            return_tensors="pt",
-            truncation=True,
-            max_length=int(max_length),
-        )
+        response_for_rm = response_text
+        tail_n = int(max(response_tail_tokens, 0))
+        if tail_n > 0:
+            resp_ids = tok.encode(response_text, add_special_tokens=False)
+            if len(resp_ids) > tail_n:
+                response_for_rm = tok.decode(resp_ids[-tail_n:], skip_special_tokens=False)
+
+        enc: dict[str, torch.Tensor]
+        msgs = [
+            {"role": "user", "content": prompt_text},
+            {"role": "assistant", "content": response_for_rm},
+        ]
+        if hasattr(tok, "apply_chat_template"):
+            try:
+                # Preferred path: let RM tokenizer build exactly the expected chat format.
+                enc_any = tok.apply_chat_template(
+                    msgs,
+                    tokenize=True,
+                    return_dict=True,
+                    return_tensors="pt",
+                    truncation=True,
+                    max_length=int(max_length),
+                )
+                if isinstance(enc_any, dict):
+                    enc = enc_any
+                else:
+                    ids = enc_any if isinstance(enc_any, torch.Tensor) else torch.as_tensor(enc_any)
+                    if ids.ndim == 1:
+                        ids = ids.unsqueeze(0)
+                    enc = {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
+            except TypeError:
+                # Compatibility path for older tokenizers lacking return_dict/truncation kwargs.
+                enc_any = tok.apply_chat_template(msgs, tokenize=True, return_tensors="pt")
+                if isinstance(enc_any, dict):
+                    enc = dict(enc_any)
+                else:
+                    ids = enc_any if isinstance(enc_any, torch.Tensor) else torch.as_tensor(enc_any)
+                    if ids.ndim == 1:
+                        ids = ids.unsqueeze(0)
+                    enc = {"input_ids": ids}
+                ids = enc["input_ids"]
+                if ids.shape[-1] > int(max_length):
+                    ids = ids[:, -int(max_length) :]
+                    enc["input_ids"] = ids
+                if "attention_mask" not in enc:
+                    enc["attention_mask"] = torch.ones_like(ids)
+        else:
+            # Fallback for tokenizers without chat template support.
+            packed = f"User:\n{prompt_text}\n\nAssistant:\n{response_for_rm}"
+            enc = tok(
+                packed,
+                return_tensors="pt",
+                truncation=True,
+                max_length=int(max_length),
+            )
         enc = {k: v.to(target_device) for k, v in enc.items()}
         with torch.no_grad():
             out = model(**enc)
@@ -828,6 +879,12 @@ def main() -> None:
     parser.add_argument("--rm_model_tokenizer_path", type=str, default="", help="Optional RM tokenizer path.")
     parser.add_argument("--rm_model_device", type=str, default="cpu", help="RM device: auto/cpu/cuda/cuda:1.")
     parser.add_argument("--rm_model_max_length", type=int, default=4096)
+    parser.add_argument(
+        "--rm_response_tail_tokens",
+        type=int,
+        default=0,
+        help="If >0, only keep the latest N response tokens when RM scores continuations (mitigates long-context truncation).",
+    )
 
     parser.add_argument("--vllm_logprobs_topk", type=int, default=20)
     parser.add_argument("--vllm_request_batch_chunk", type=int, default=64)
@@ -899,6 +956,8 @@ def main() -> None:
         raise SystemExit("--bucket_num_bins must be >=2.")
     if args.bucket_min_points_per_bin < 1:
         raise SystemExit("--bucket_min_points_per_bin must be >=1.")
+    if int(args.rm_response_tail_tokens) < 0:
+        raise SystemExit("--rm_response_tail_tokens must be >=0.")
     if str(args.selection_f_mode) == "rm_score_mc":
         if not str(args.rm_model_path).strip():
             raise SystemExit("--rm_model_path is required when --selection_f_mode=rm_score_mc.")
@@ -930,6 +989,7 @@ def main() -> None:
             tokenizer_path=str(args.rm_model_tokenizer_path) or None,
             device=str(args.rm_model_device),
             max_length=int(args.rm_model_max_length),
+            response_tail_tokens=int(args.rm_response_tail_tokens),
         )
 
     _, rank, world_size = init_dist(
@@ -1230,6 +1290,10 @@ def main() -> None:
             "f_sentence_stop": str(args.f_sentence_stop),
             "bias_metrics_mode": str(args.bias_metrics_mode),
             "vllm_request_batch_chunk_mc": int(mc_batch_chunk),
+            "rm_model_path": str(args.rm_model_path),
+            "rm_model_device": str(args.rm_model_device),
+            "rm_model_max_length": int(args.rm_model_max_length),
+            "rm_response_tail_tokens": int(args.rm_response_tail_tokens),
             "result_min_f_mc": {
                 "is_correct": bool(ok_minf),
                 "eval": eval_minf,
@@ -1423,6 +1487,10 @@ def main() -> None:
                 "f_sentence_stop": str(args.f_sentence_stop),
                 "bias_metrics_mode": str(args.bias_metrics_mode),
                 "vllm_request_batch_chunk_mc": int(mc_batch_chunk),
+                "rm_model_path": str(args.rm_model_path),
+                "rm_model_device": str(args.rm_model_device),
+                "rm_model_max_length": int(args.rm_model_max_length),
+                "rm_response_tail_tokens": int(args.rm_response_tail_tokens),
             },
         }
         with open(out_dir / "infer_compare_summary.json", "w", encoding="utf-8") as f:

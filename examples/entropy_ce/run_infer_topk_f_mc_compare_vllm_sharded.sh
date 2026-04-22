@@ -37,6 +37,7 @@ RM_MODEL_PATH="${RM_MODEL_PATH:-}"
 RM_MODEL_TOKENIZER_PATH="${RM_MODEL_TOKENIZER_PATH:-}"
 RM_MODEL_DEVICE="${RM_MODEL_DEVICE:-cpu}"
 RM_MODEL_MAX_LENGTH="${RM_MODEL_MAX_LENGTH:-4096}"
+RM_RESPONSE_TAIL_TOKENS="${RM_RESPONSE_TAIL_TOKENS:-0}"
 
 VLLM_LOGPROBS_TOPK="${VLLM_LOGPROBS_TOPK:-20}"
 VLLM_REQUEST_BATCH_CHUNK="${VLLM_REQUEST_BATCH_CHUNK:-64}"
@@ -141,6 +142,7 @@ for ((r = 0; r < NPROC_PER_NODE; r++)); do
     --rm_model_tokenizer_path "${RM_MODEL_TOKENIZER_PATH}" \
     --rm_model_device "${RM_DEVICE_ARG}" \
     --rm_model_max_length "${RM_MODEL_MAX_LENGTH}" \
+    --rm_response_tail_tokens "${RM_RESPONSE_TAIL_TOKENS}" \
     --vllm_logprobs_topk "${VLLM_LOGPROBS_TOPK}" \
     --vllm_request_batch_chunk "${VLLM_REQUEST_BATCH_CHUNK}" \
     --vllm_request_batch_chunk_mc "${VLLM_REQUEST_BATCH_CHUNK_MC}" \
