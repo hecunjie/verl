@@ -27,6 +27,13 @@
 - 可选条件（均可单独或组合出现）：``min_f_bar``、``min_abs_gap``（|f_bar−f_real| 下限）、
   ``relative_gap_frac``（|f_bar−f_real| ≥ frac×|f_bar|，且 frac>0 时才生效）。
 
+**first_next_sentence vs MC ref 的 precision / recall**（见
+``precision_recall_first_next_vs_mc_ref``）：
+- predict = sign(real_trend from first_next_sentence), gt = sign(mc_ref),
+  Y = ``sign_match_real_trend_same_label``（或 ``--use_trend_all`` 时为 ``sign_match_real_trend_all``）。
+- precision 分母默认用 first_next_sentence 侧过滤；recall 分母默认用 mc_ref 侧过滤。
+- 若未显式传 ``--pr_first_next_*``，会回退复用 ``--pr_precision_*`` / ``--pr_recall_*``。
+
 报告中的 ``value_stratification_by_real_rollout_is_correct``：在 precision / recall 分母子集上，按
 **该条 prompt 的** ``real_rollout_is_correct``（整题回答是否正确）分组，分别输出 compare / ref 侧
 f_bar、f_real、|Δf|、相对差分、entropy_t 等的计数与均值（与逐步 ``sign_match_mc_compare_vs_ref`` 无关）。
@@ -221,6 +228,46 @@ def _include_recall_pr_subset(
     relative_gap_frac: float | None,
 ) -> bool:
     if _get_sign_match_mc_compare_vs_ref(st) is None:
+        return False
+    if min_fbar is None and min_abs_gap is None and relative_gap_frac is None:
+        return True
+    fb = st.get("f_bar_mc_ref", st.get("f_bar_mc_128"))
+    fr = st.get("f_real_mc_ref", st.get("f_real_mc_128"))
+    return _passes_optional_fb_fr_filters(fb, fr, min_fbar, min_abs_gap, relative_gap_frac)
+
+
+def _include_precision_pr_subset_first_next(
+    st: dict[str, Any],
+    min_fbar: float | None,
+    min_abs_gap: float | None,
+    relative_gap_frac: float | None,
+    *,
+    use_trend_all: bool,
+) -> bool:
+    key = "sign_match_real_trend_all" if use_trend_all else "sign_match_real_trend_same_label"
+    if key not in st or st.get(key) is None:
+        return False
+    if min_fbar is None and min_abs_gap is None and relative_gap_frac is None:
+        return True
+    return _passes_optional_fb_fr_filters(
+        st.get("f_bar_first_next_sentence"),
+        st.get("f_real_first_next_sentence"),
+        min_fbar,
+        min_abs_gap,
+        relative_gap_frac,
+    )
+
+
+def _include_recall_pr_subset_first_next(
+    st: dict[str, Any],
+    min_fbar: float | None,
+    min_abs_gap: float | None,
+    relative_gap_frac: float | None,
+    *,
+    use_trend_all: bool,
+) -> bool:
+    key = "sign_match_real_trend_all" if use_trend_all else "sign_match_real_trend_same_label"
+    if key not in st or st.get(key) is None:
         return False
     if min_fbar is None and min_abs_gap is None and relative_gap_frac is None:
         return True
@@ -443,6 +490,42 @@ def main() -> None:
         default=None,
         help="PR recall 分母：仅当传入且 >0 时要求 |Δf| >= frac*|f_bar|（ref 侧）",
     )
+    p.add_argument(
+        "--pr_first_next_precision_min_f_bar",
+        type=float,
+        default=None,
+        help="first_next-vs-ref PR precision 分母：仅当传入时要求 f_bar_first_next_sentence >= 该值。",
+    )
+    p.add_argument(
+        "--pr_first_next_precision_min_abs_gap",
+        type=float,
+        default=None,
+        help="first_next-vs-ref PR precision 分母：仅当传入时要求 |f_bar_first_next_sentence-f_real_first_next_sentence| >= 该值。",
+    )
+    p.add_argument(
+        "--pr_first_next_precision_relative_gap_frac",
+        type=float,
+        default=None,
+        help="first_next-vs-ref PR precision 分母：仅当传入且 >0 时要求 |Δf| >= frac*|f_bar|（first_next 侧）。",
+    )
+    p.add_argument(
+        "--pr_first_next_recall_min_f_bar",
+        type=float,
+        default=None,
+        help="first_next-vs-ref PR recall 分母：仅当传入时要求 f_bar_mc_ref >= 该值。",
+    )
+    p.add_argument(
+        "--pr_first_next_recall_min_abs_gap",
+        type=float,
+        default=None,
+        help="first_next-vs-ref PR recall 分母：仅当传入时要求 |f_bar_mc_ref-f_real_mc_ref| >= 该值。",
+    )
+    p.add_argument(
+        "--pr_first_next_recall_relative_gap_frac",
+        type=float,
+        default=None,
+        help="first_next-vs-ref PR recall 分母：仅当传入且 >0 时要求 |Δf| >= frac*|f_bar|（ref 侧）。",
+    )
     args = p.parse_args()
 
     steps = _iter_steps(args.input)
@@ -454,6 +537,36 @@ def main() -> None:
     pr_f = args.pr_recall_min_f_bar
     pr_a = args.pr_recall_min_abs_gap
     pr_r = args.pr_recall_relative_gap_frac
+    fn_pp_f = (
+        args.pr_first_next_precision_min_f_bar
+        if args.pr_first_next_precision_min_f_bar is not None
+        else pp_f
+    )
+    fn_pp_a = (
+        args.pr_first_next_precision_min_abs_gap
+        if args.pr_first_next_precision_min_abs_gap is not None
+        else pp_a
+    )
+    fn_pp_r = (
+        args.pr_first_next_precision_relative_gap_frac
+        if args.pr_first_next_precision_relative_gap_frac is not None
+        else pp_r
+    )
+    fn_pr_f = (
+        args.pr_first_next_recall_min_f_bar
+        if args.pr_first_next_recall_min_f_bar is not None
+        else pr_f
+    )
+    fn_pr_a = (
+        args.pr_first_next_recall_min_abs_gap
+        if args.pr_first_next_recall_min_abs_gap is not None
+        else pr_a
+    )
+    fn_pr_r = (
+        args.pr_first_next_recall_relative_gap_frac
+        if args.pr_first_next_recall_relative_gap_frac is not None
+        else pr_r
+    )
     use_all = bool(args.use_trend_all)
 
     # 准确率（1-step）
@@ -579,6 +692,38 @@ def main() -> None:
     else:
         pr_f1 = float("nan")
 
+    # --- Precision / Recall for first_next trend vs mc_ref ---
+    prec_fn_steps = [
+        st
+        for st in steps
+        if _include_precision_pr_subset_first_next(
+            st, fn_pp_f, fn_pp_a, fn_pp_r, use_trend_all=use_all
+        )
+    ]
+    n_fn_prec = len(prec_fn_steps)
+    n_fn_prec_pos = sum(1 for st in prec_fn_steps if _get_match(st, use_all))
+    fn_precision = float(n_fn_prec_pos) / float(n_fn_prec) if n_fn_prec > 0 else float("nan")
+
+    rec_fn_steps = [
+        st
+        for st in steps
+        if _include_recall_pr_subset_first_next(
+            st, fn_pr_f, fn_pr_a, fn_pr_r, use_trend_all=use_all
+        )
+    ]
+    n_fn_rec = len(rec_fn_steps)
+    n_fn_rec_pos = sum(1 for st in rec_fn_steps if _get_match(st, use_all))
+    fn_recall = float(n_fn_rec_pos) / float(n_fn_rec) if n_fn_rec > 0 else float("nan")
+
+    if (
+        math.isfinite(fn_precision)
+        and math.isfinite(fn_recall)
+        and (fn_precision + fn_recall) > 0
+    ):
+        fn_f1 = 2.0 * fn_precision * fn_recall / (fn_precision + fn_recall)
+    else:
+        fn_f1 = float("nan")
+
     value_stratification_by_real_rollout_is_correct = _build_value_stratification_by_real_rollout(
         prec_pr_steps, rec_pr_steps
     )
@@ -599,6 +744,22 @@ def main() -> None:
                 "relative_gap_frac": pr_r,
             },
             "note": "仅非 null 的项参与过滤；某一侧若全为 null，则该侧使用全部 sign_match 已定义的 step。",
+        },
+        "pr_filters_first_next": {
+            "precision": {
+                "min_f_bar": fn_pp_f,
+                "min_abs_gap": fn_pp_a,
+                "relative_gap_frac": fn_pp_r,
+            },
+            "recall": {
+                "min_f_bar": fn_pr_f,
+                "min_abs_gap": fn_pr_a,
+                "relative_gap_frac": fn_pr_r,
+            },
+            "note": (
+                "first_next vs mc_ref PR 专用过滤；未显式传 --pr_first_next_* 时，"
+                "自动复用 --pr_precision_* / --pr_recall_*。"
+            ),
         },
         "use_trend_all": use_all,
         "num_steps_total_in_traces": len(steps),
@@ -621,6 +782,24 @@ def main() -> None:
                 "rate": pr_recall,
             },
             "f1": pr_f1,
+        },
+        "precision_recall_first_next_vs_mc_ref": {
+            "description": (
+                "predict = sign(real_trend from first_next_sentence), gt = sign(mc_ref), "
+                "Y = sign_match_real_trend_same_label (or sign_match_real_trend_all with --use_trend_all). "
+                "Precision denominator uses first_next filters; recall denominator uses mc_ref filters."
+            ),
+            "precision": {
+                "denominator_steps": n_fn_prec,
+                "numerator_positive": n_fn_prec_pos,
+                "rate": fn_precision,
+            },
+            "recall": {
+                "denominator_steps": n_fn_rec,
+                "numerator_positive": n_fn_rec_pos,
+                "rate": fn_recall,
+            },
+            "f1": fn_f1,
         },
         "value_stratification_by_real_rollout_is_correct": value_stratification_by_real_rollout_is_correct,
         "accuracy_side_lookahead_1step": {
