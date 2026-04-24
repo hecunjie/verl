@@ -73,6 +73,7 @@ def _run_fepo_lowtail_adv_phase(
     # Realized suffix entropy-rate per token (exclusive future).
     f_rate = _suffix_entropy_rate_exclusive(entropy, response_mask)
     high_mask = (entropy >= h_threshold) & response_mask & torch.isfinite(f_rate)
+    low_mask = (entropy < h_threshold) & response_mask
     m = torch.ones_like(advantages)
     q = torch.full_like(advantages, float("nan"))
 
@@ -102,6 +103,9 @@ def _run_fepo_lowtail_adv_phase(
 
     q_valid = q[torch.isfinite(q)]
     m_valid = m[high_mask]
+    n_resp = int(response_mask.sum().item())
+    n_low = int(low_mask.sum().item())
+    low_entropy_vals = entropy[low_mask]
     metrics: dict[str, float] = {
         "fepo/n_selected": float(n_high),
         "fepo/lowtail_mode": 1.0,
@@ -112,6 +116,11 @@ def _run_fepo_lowtail_adv_phase(
         "fepo/boost_hit_rate": (float(n_boost) / float(n_high)) if n_high > 0 else 0.0,
         "fepo/q_mean": float(torch.mean(q_valid).item()) if q_valid.numel() > 0 else float("nan"),
         "fepo/m_mean_on_high": float(torch.mean(m_valid).item()) if m_valid.numel() > 0 else 1.0,
+        "fepo/n_low_entropy": float(n_low),
+        "fepo/low_entropy_ratio": (float(n_low) / float(n_resp)) if n_resp > 0 else 0.0,
+        "fepo/low_entropy_mean": float(torch.mean(low_entropy_vals.float()).item())
+        if low_entropy_vals.numel() > 0
+        else float("nan"),
     }
 
     point_records: list[dict[str, Any]] = []
