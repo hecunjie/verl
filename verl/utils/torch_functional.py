@@ -263,7 +263,7 @@ def entropy_from_logits_with_chunking(logits: torch.Tensor, chunk_size: int = 20
     return entropy
 
 
-def entropy_from_logits_topp(logits: torch.Tensor, top_p: float) -> torch.Tensor:
+def entropy_from_logits_topp(logits: torch.Tensor, top_p: float, chunk_size: int = 2048) -> torch.Tensor:
     """Top-p truncated entropy with renormalization.
 
     For each distribution p over vocab, select minimal prefix in descending-probability
@@ -276,15 +276,21 @@ def entropy_from_logits_topp(logits: torch.Tensor, top_p: float) -> torch.Tensor
     if tp <= 0.0:
         # degenerate: keep argmax only
         return torch.zeros(logits.shape[:-1], device=logits.device, dtype=logits.dtype)
-    probs = torch.nn.functional.softmax(logits, dim=-1)
-    sorted_probs, _ = torch.sort(probs, dim=-1, descending=True)
-    prev_cum = torch.cumsum(sorted_probs, dim=-1) - sorted_probs
-    keep = prev_cum < tp
-    kept = sorted_probs * keep.to(sorted_probs.dtype)
-    z = kept.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-    p = kept / z
-    entropy = -(p * p.clamp_min(1e-12).log()).sum(dim=-1)
-    return entropy
+    original_shape = logits.shape[:-1]
+    flat = logits.reshape(-1, logits.shape[-1])
+    ent = torch.zeros(flat.shape[0], device=flat.device, dtype=flat.dtype)
+    step = max(int(chunk_size), 1)
+    for i in range(0, flat.shape[0], step):
+        x = flat[i : i + step]
+        probs = torch.nn.functional.softmax(x, dim=-1)
+        sorted_probs, _ = torch.sort(probs, dim=-1, descending=True)
+        prev_cum = torch.cumsum(sorted_probs, dim=-1) - sorted_probs
+        keep = prev_cum < tp
+        kept = sorted_probs * keep.to(sorted_probs.dtype)
+        z = kept.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        p = kept / z
+        ent[i : i + step] = -(p * p.clamp_min(1e-12).log()).sum(dim=-1)
+    return ent.reshape(original_shape)
 
 
 def masked_sum(values: torch.Tensor, mask: torch.Tensor, axis: int | tuple[int, ...] | None = None) -> torch.Tensor:
