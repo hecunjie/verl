@@ -128,6 +128,87 @@ def _suffix_entropy_rate_to_sentence_end(
     return out, keep, int(n_filtered_short)
 
 
+def _suffix_entropy_rate_to_sentence_end_simple_fast(
+    entropy: torch.Tensor,
+    responses: torch.Tensor,
+    response_mask: torch.Tensor,
+    *,
+    tokenizer: Any,
+    min_suffix_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Fast path for `simple` sentence stop mode.
+
+    Strategy:
+    - Decode each token once to text piece.
+    - Mark token positions that can terminate a sentence (heuristic aligned with simple mode).
+    - Precompute nearest sentence-end index to the right in O(T).
+    - Use prefix-sum on entropy to compute mean suffix entropy in O(1) per token.
+    """
+    B, T = entropy.shape
+    out = torch.full((B, T), float("nan"), device=entropy.device, dtype=entropy.dtype)
+    keep = torch.zeros((B, T), device=entropy.device, dtype=torch.int32)
+    n_filtered_short = 0
+    min_k = max(int(min_suffix_tokens), 1)
+    ent_cpu = entropy.detach().cpu().float()
+    resp_cpu = responses.detach().cpu()
+    mask_cpu = response_mask.detach().cpu().bool()
+
+    for b in range(B):
+        n = int(mask_cpu[b].sum().item())
+        if n <= 1:
+            continue
+        row_ent = ent_cpu[b, :n]
+        row_resp = [int(x) for x in resp_cpu[b, :n].tolist()]
+        pieces = [tokenizer.decode([tid], skip_special_tokens=True) for tid in row_resp]
+
+        # Heuristic sentence-end marker per token for simple mode.
+        stop = [False] * n
+        prev_non_empty_tail = ""
+        for i, p in enumerate(pieces):
+            p_strip = p.rstrip()
+            if not p_strip:
+                continue
+            tail = p_strip[-1]
+            is_stop = False
+            if "\n\n" in p:
+                is_stop = True
+            elif tail in "。！？!?":
+                is_stop = True
+            elif tail == ".":
+                # Keep simple mode's decimal-tail safeguard approximately.
+                left = p_strip[:-1].rstrip()
+                prev_char = left[-1] if left else (prev_non_empty_tail[-1] if prev_non_empty_tail else "")
+                is_stop = not (prev_char.isdigit())
+            stop[i] = is_stop
+            prev_non_empty_tail = p_strip
+
+        # nearest stop index >= i, else -1
+        next_stop = [-1] * n
+        nxt = -1
+        for i in range(n - 1, -1, -1):
+            if stop[i]:
+                nxt = i
+            next_stop[i] = nxt
+
+        # Prefix sum for O(1) segment mean.
+        csum = torch.zeros((n + 1,), dtype=row_ent.dtype)
+        csum[1:] = torch.cumsum(row_ent, dim=0)
+
+        for t in range(n - 1):
+            s = t + 1
+            e = next_stop[s]
+            if e < 0:
+                e = n - 1
+            k = e - s + 1
+            if k < min_k:
+                n_filtered_short += 1
+                continue
+            seg_sum = csum[e + 1] - csum[s]
+            out[b, t] = (seg_sum / float(k)).to(dtype=entropy.dtype)
+            keep[b, t] = int(k)
+    return out, keep, int(n_filtered_short)
+
+
 def _run_fepo_lowtail_adv_phase(
     batch: DataProto,
     tokenizer: Any,
@@ -159,15 +240,24 @@ def _run_fepo_lowtail_adv_phase(
     keep_k = torch.zeros_like(advantages, dtype=torch.int32)
     if suffix_mode == "sentence":
         responses = batch.batch["responses"]
-        stop_check = _make_sentence_stop_check(f_sentence_stop)
-        f_rate, keep_k, n_filtered_short_sentence = _suffix_entropy_rate_to_sentence_end(
-            entropy,
-            responses,
-            response_mask,
-            tokenizer=tokenizer,
-            sentence_stop_check=stop_check,
-            min_suffix_tokens=sentence_min_suffix_tokens,
-        )
+        if str(f_sentence_stop) == "simple":
+            f_rate, keep_k, n_filtered_short_sentence = _suffix_entropy_rate_to_sentence_end_simple_fast(
+                entropy,
+                responses,
+                response_mask,
+                tokenizer=tokenizer,
+                min_suffix_tokens=sentence_min_suffix_tokens,
+            )
+        else:
+            stop_check = _make_sentence_stop_check(f_sentence_stop)
+            f_rate, keep_k, n_filtered_short_sentence = _suffix_entropy_rate_to_sentence_end(
+                entropy,
+                responses,
+                response_mask,
+                tokenizer=tokenizer,
+                sentence_stop_check=stop_check,
+                min_suffix_tokens=sentence_min_suffix_tokens,
+            )
     else:
         f_rate = _suffix_entropy_rate_exclusive(entropy, response_mask)
         n_filtered_short_sentence = 0
