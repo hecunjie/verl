@@ -66,6 +66,10 @@ FEPO_VARIANT="${FEPO_VARIANT:-lowtail_adv}"  # lowtail_adv / legacy_mc_bonus
 FEPO_H_THRESHOLD="${FEPO_H_THRESHOLD:-2.0}"  # 复用现有熵阈值参数
 FEPO_ALPHA="${FEPO_ALPHA:-0.2}"              # m = 1 + alpha * I(q<=beta)
 FEPO_BETA="${FEPO_BETA:-0.2}"                # low-tail 分位阈值
+FEPO_SUFFIX_MODE="${FEPO_SUFFIX_MODE:-sentence}"   # sentence / full
+FEPO_F_SENTENCE_STOP="${FEPO_F_SENTENCE_STOP:-simple}"  # simple / pysbd
+FEPO_SENTENCE_MIN_SUFFIX_TOKENS="${FEPO_SENTENCE_MIN_SUFFIX_TOKENS:-5}"
+FEPO_ENTROPY_TOP_P="${FEPO_ENTROPY_TOP_P:-0.95}"  # 1.0=全词表熵，<1 为 topp 截断熵
 FEPO_DUMP_FREQ="${FEPO_DUMP_FREQ:-50}"
 
 DUMP_ARGS=()
@@ -94,6 +98,10 @@ python3 -m verl.trainer.main_ppo \
   +algorithm.fepo.h_threshold="${FEPO_H_THRESHOLD}" \
   +algorithm.fepo.alpha="${FEPO_ALPHA}" \
   +algorithm.fepo.beta="${FEPO_BETA}" \
+  +algorithm.fepo.suffix_mode="${FEPO_SUFFIX_MODE}" \
+  +algorithm.fepo.f_sentence_stop="${FEPO_F_SENTENCE_STOP}" \
+  +algorithm.fepo.sentence_min_suffix_tokens="${FEPO_SENTENCE_MIN_SUFFIX_TOKENS}" \
+  +algorithm.fepo.entropy_top_p="${FEPO_ENTROPY_TOP_P}" \
   data.train_files="${TRAIN_FILES}" \
   data.val_files="['${MATH500_VAL}','${AIME24_VAL}']" \
   data.train_batch_size="${TRAIN_BATCH_SIZE}" \

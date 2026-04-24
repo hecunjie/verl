@@ -263,6 +263,30 @@ def entropy_from_logits_with_chunking(logits: torch.Tensor, chunk_size: int = 20
     return entropy
 
 
+def entropy_from_logits_topp(logits: torch.Tensor, top_p: float) -> torch.Tensor:
+    """Top-p truncated entropy with renormalization.
+
+    For each distribution p over vocab, select minimal prefix in descending-probability
+    order whose cumulative mass reaches top_p, renormalize on that set, then compute
+    Shannon entropy on the truncated distribution.
+    """
+    tp = float(top_p)
+    if tp >= 1.0:
+        return entropy_from_logits(logits)
+    if tp <= 0.0:
+        # degenerate: keep argmax only
+        return torch.zeros(logits.shape[:-1], device=logits.device, dtype=logits.dtype)
+    probs = torch.nn.functional.softmax(logits, dim=-1)
+    sorted_probs, _ = torch.sort(probs, dim=-1, descending=True)
+    prev_cum = torch.cumsum(sorted_probs, dim=-1) - sorted_probs
+    keep = prev_cum < tp
+    kept = sorted_probs * keep.to(sorted_probs.dtype)
+    z = kept.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+    p = kept / z
+    entropy = -(p * p.clamp_min(1e-12).log()).sum(dim=-1)
+    return entropy
+
+
 def masked_sum(values: torch.Tensor, mask: torch.Tensor, axis: int | tuple[int, ...] | None = None) -> torch.Tensor:
     """Compute sum of tensor values where mask is True.
 

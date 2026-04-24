@@ -863,6 +863,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
         pad_mode = tu.get_non_tensor_data(data=micro_batch, key="pad_mode", default=DatasetPadMode.NO_PADDING)
         use_fused_kernels = tu.get_non_tensor_data(data=micro_batch, key="use_fused_kernels", default=False)
         calculate_entropy = tu.get_non_tensor_data(data=micro_batch, key="calculate_entropy", default=False)
+        entropy_top_p = float(tu.get_non_tensor_data(data=micro_batch, key="entropy_top_p", default=1.0))
 
         model_output = {}
 
@@ -892,7 +893,9 @@ class FSDPEngineWithLMHead(FSDPEngine):
 
                 # compute entropy
                 if calculate_entropy:
-                    if not self.engine_config.entropy_checkpointing:
+                    if entropy_top_p < 1.0:
+                        entropy_rmpad = verl_F.entropy_from_logits_topp(logits_rmpad, top_p=entropy_top_p)
+                    elif not self.engine_config.entropy_checkpointing:
                         entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)  # ((total_nnz / sp) + pad)
                     else:
                         entropy_rmpad = torch.utils.checkpoint.checkpoint(
@@ -940,7 +943,9 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 logits.div_(temperature.clamp(min=1e-8).to(logits.dtype))
 
                 if calculate_entropy:
-                    if not self.engine_config.entropy_checkpointing:
+                    if entropy_top_p < 1.0:
+                        entropy = verl_F.entropy_from_logits_topp(logits, top_p=entropy_top_p)
+                    elif not self.engine_config.entropy_checkpointing:
                         entropy = verl_F.entropy_from_logits(logits)
                     else:
                         entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)

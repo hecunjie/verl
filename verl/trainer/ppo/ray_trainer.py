@@ -1334,6 +1334,10 @@ class RayPPOTrainer:
         return ref_log_prob
 
     def _compute_old_log_prob(self, batch: DataProto):
+        fepo_cfg = self.config.algorithm.get("fepo", {})
+        fepo_enable = bool(fepo_cfg.get("enable", False))
+        entropy_top_p = float(fepo_cfg.get("entropy_top_p", 1.0))
+        use_entropy_top_p = fepo_enable and (entropy_top_p < 1.0)
         if self.use_legacy_worker_impl == "disable":
             # TODO: remove step 1, 2, 4 after we make the whole training tensordict and padding free
             # step 1: convert dataproto to tensordict.
@@ -1341,7 +1345,10 @@ class RayPPOTrainer:
             # step 2: convert from padding to nopadding
             batch_td = left_right_2_no_padding(batch_td)
             # step 3: add meta info
-            tu.assign_non_tensor(batch_td, calculate_entropy=True, compute_loss=False)
+            assign_kwargs = dict(calculate_entropy=True, compute_loss=False)
+            if use_entropy_top_p:
+                assign_kwargs["entropy_top_p"] = entropy_top_p
+            tu.assign_non_tensor(batch_td, **assign_kwargs)
             output = self.actor_rollout_wg.compute_log_prob(batch_td)
             # gather output
             entropy = tu.get(output, "entropy")
@@ -1354,6 +1361,8 @@ class RayPPOTrainer:
             old_log_prob = tu.get_tensordict({"old_log_probs": log_probs.float(), "entropys": entropy.float()})
             old_log_prob = DataProto.from_tensordict(old_log_prob)
         else:
+            if use_entropy_top_p:
+                batch.meta_info["entropy_top_p"] = entropy_top_p
             old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
             old_log_prob_mfu = 0
         return old_log_prob, old_log_prob_mfu

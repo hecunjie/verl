@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import numpy as np
 import ray
@@ -47,8 +47,90 @@ def _suffix_entropy_rate_exclusive(entropy: torch.Tensor, response_mask: torch.T
     return out
 
 
+def _simple_sentence_stop_check(text: str, *, min_chars: int = 2) -> bool:
+    t = text
+    if len(t.strip()) < min_chars:
+        return False
+    if "\n\n" in t:
+        return True
+    tt = t.rstrip()
+    if not tt:
+        return False
+    if tt[-1] in "。！？!?":
+        return True
+    # Treat '.' as sentence end unless it's likely decimal tail.
+    if tt[-1] == ".":
+        prev = tt[:-1].rstrip()
+        if prev and prev[-1].isdigit():
+            return False
+        return True
+    return False
+
+
+def _make_sentence_stop_check(mode: str) -> Callable[[str], bool]:
+    if str(mode) == "pysbd":
+        try:
+            from sentence_stop_utils import make_pysbd_first_sentence_stop_check
+
+            return make_pysbd_first_sentence_stop_check()
+        except Exception:
+            return _simple_sentence_stop_check
+    return _simple_sentence_stop_check
+
+
+def _suffix_entropy_rate_to_sentence_end(
+    entropy: torch.Tensor,
+    responses: torch.Tensor,
+    response_mask: torch.Tensor,
+    *,
+    tokenizer: Any,
+    sentence_stop_check: Callable[[str], bool],
+    min_suffix_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Sentence-bounded suffix entropy-rate from t+1 to sentence end.
+
+    Returns:
+      - rate tensor [B,T], NaN where undefined / filtered
+      - keep_k tensor [B,T], number of kept suffix tokens for each t
+    """
+    B, T = entropy.shape
+    out = torch.full((B, T), float("nan"), device=entropy.device, dtype=entropy.dtype)
+    keep = torch.zeros((B, T), device=entropy.device, dtype=torch.int32)
+    n_filtered_short = 0
+    min_k = max(int(min_suffix_tokens), 1)
+    ent_cpu = entropy.detach().cpu()
+    resp_cpu = responses.detach().cpu()
+    mask_cpu = response_mask.detach().cpu().bool()
+    for b in range(B):
+        n = int(mask_cpu[b].sum().item())
+        if n <= 1:
+            continue
+        row_ent = ent_cpu[b, :n]
+        row_resp = [int(x) for x in resp_cpu[b, :n].tolist()]
+        for t in range(n - 1):
+            suffix_ids = row_resp[t + 1 :]
+            if not suffix_ids:
+                continue
+            k = 0
+            for kk in range(1, len(suffix_ids) + 1):
+                frag = tokenizer.decode(suffix_ids[:kk], skip_special_tokens=True)
+                if sentence_stop_check(frag):
+                    k = kk
+                    break
+            if k <= 0:
+                k = len(suffix_ids)
+            if k < min_k:
+                n_filtered_short += 1
+                continue
+            vals = row_ent[t + 1 : t + 1 + k].float()
+            out[b, t] = torch.mean(vals).to(dtype=entropy.dtype)
+            keep[b, t] = int(k)
+    return out, keep, int(n_filtered_short)
+
+
 def _run_fepo_lowtail_adv_phase(
     batch: DataProto,
+    tokenizer: Any,
     fepo_cfg: dict[str, Any],
 ) -> tuple[DataProto, dict[str, float], list[dict[str, Any]]]:
     """New FEPO v2: direction from A_t, strength from low-tail suffix entropy-rate quantile."""
@@ -66,12 +148,29 @@ def _run_fepo_lowtail_adv_phase(
     h_threshold = float(fepo_cfg.get("h_threshold", 2.0))
     alpha = float(fepo_cfg.get("alpha", fepo_cfg.get("bonus_pos", 0.2)))
     beta = float(fepo_cfg.get("beta", 0.2))
+    suffix_mode = str(fepo_cfg.get("suffix_mode", "full"))  # full / sentence
+    f_sentence_stop = str(fepo_cfg.get("f_sentence_stop", "simple"))
+    sentence_min_suffix_tokens = int(fepo_cfg.get("sentence_min_suffix_tokens", 5))
     alpha = max(alpha, 0.0)
     beta = float(np.clip(beta, 0.0, 1.0))
     collect_point_records = bool(fepo_cfg.get("__collect_point_records", True))
 
     # Realized suffix entropy-rate per token (exclusive future).
-    f_rate = _suffix_entropy_rate_exclusive(entropy, response_mask)
+    keep_k = torch.zeros_like(advantages, dtype=torch.int32)
+    if suffix_mode == "sentence":
+        responses = batch.batch["responses"]
+        stop_check = _make_sentence_stop_check(f_sentence_stop)
+        f_rate, keep_k, n_filtered_short_sentence = _suffix_entropy_rate_to_sentence_end(
+            entropy,
+            responses,
+            response_mask,
+            tokenizer=tokenizer,
+            sentence_stop_check=stop_check,
+            min_suffix_tokens=sentence_min_suffix_tokens,
+        )
+    else:
+        f_rate = _suffix_entropy_rate_exclusive(entropy, response_mask)
+        n_filtered_short_sentence = 0
     high_mask = (entropy >= h_threshold) & response_mask & torch.isfinite(f_rate)
     low_mask = (entropy < h_threshold) & response_mask
     m = torch.ones_like(advantages)
@@ -106,6 +205,20 @@ def _run_fepo_lowtail_adv_phase(
     n_resp = int(response_mask.sum().item())
     n_low = int(low_mask.sum().item())
     low_entropy_vals = entropy[low_mask]
+    n_sentence_used = int((keep_k >= max(sentence_min_suffix_tokens, 1)).sum().item()) if suffix_mode == "sentence" else 0
+    # Distribution stats on valid suffix-rate positions.
+    f_valid_all = f_rate[response_mask & torch.isfinite(f_rate)].float()
+    f_valid_high = f_rate[high_mask].float()
+    if suffix_mode == "sentence":
+        len_valid = keep_k[keep_k > 0].float()
+    else:
+        len_valid = torch.zeros((0,), device=advantages.device, dtype=torch.float32)
+
+    def _pct(x: torch.Tensor, qv: float) -> float:
+        if x.numel() == 0:
+            return float("nan")
+        return float(torch.quantile(x, qv).item())
+
     metrics: dict[str, float] = {
         "fepo/n_selected": float(n_high),
         "fepo/lowtail_mode": 1.0,
@@ -121,6 +234,22 @@ def _run_fepo_lowtail_adv_phase(
         "fepo/low_entropy_mean": float(torch.mean(low_entropy_vals.float()).item())
         if low_entropy_vals.numel() > 0
         else float("nan"),
+        "fepo/suffix_mode_sentence": 1.0 if suffix_mode == "sentence" else 0.0,
+        "fepo/sentence_min_suffix_tokens": float(max(sentence_min_suffix_tokens, 1)),
+        "fepo/sentence_positions_used": float(n_sentence_used),
+        "fepo/sentence_positions_filtered_short": float(n_filtered_short_sentence),
+        "fepo/f_suffix_rate_mean_all_valid": float(torch.mean(f_valid_all).item()) if f_valid_all.numel() > 0 else float("nan"),
+        "fepo/f_suffix_rate_p10_all_valid": _pct(f_valid_all, 0.10),
+        "fepo/f_suffix_rate_p50_all_valid": _pct(f_valid_all, 0.50),
+        "fepo/f_suffix_rate_p90_all_valid": _pct(f_valid_all, 0.90),
+        "fepo/f_suffix_rate_mean_high": float(torch.mean(f_valid_high).item()) if f_valid_high.numel() > 0 else float("nan"),
+        "fepo/f_suffix_rate_p10_high": _pct(f_valid_high, 0.10),
+        "fepo/f_suffix_rate_p50_high": _pct(f_valid_high, 0.50),
+        "fepo/f_suffix_rate_p90_high": _pct(f_valid_high, 0.90),
+        "fepo/sentence_suffix_len_mean": float(torch.mean(len_valid).item()) if len_valid.numel() > 0 else float("nan"),
+        "fepo/sentence_suffix_len_p10": _pct(len_valid, 0.10),
+        "fepo/sentence_suffix_len_p50": _pct(len_valid, 0.50),
+        "fepo/sentence_suffix_len_p90": _pct(len_valid, 0.90),
     }
 
     point_records: list[dict[str, Any]] = []
@@ -134,6 +263,7 @@ def _run_fepo_lowtail_adv_phase(
                         "response_t": int(t),
                         "h_t": float(entropy[b, t].item()),
                         "f_suffix_rate": float(f_rate[b, t].item()),
+                        "suffix_tokens_used": int(keep_k[b, t].item()) if suffix_mode == "sentence" else None,
                         "q": float(q[b, t].item()),
                         "m": float(m[b, t].item()),
                         "adv_before": float(advantages[b, t].item()),
@@ -302,7 +432,7 @@ def run_fepo_advantage_phase(
         return batch, {}, []
     fepo_variant = str(fepo_cfg.get("variant", "legacy_mc_bonus"))
     if fepo_variant == "lowtail_adv":
-        return _run_fepo_lowtail_adv_phase(batch, fepo_cfg)
+        return _run_fepo_lowtail_adv_phase(batch, tokenizer, fepo_cfg)
     collect_point_records = bool(fepo_cfg.get("__collect_point_records", True))
 
     h_threshold = float(fepo_cfg.get("h_threshold", 2.0))
