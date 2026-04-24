@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+import threading
 from typing import Any, Callable, Optional
 
 import numpy as np
@@ -135,6 +137,7 @@ def _suffix_entropy_rate_to_sentence_end_simple_fast(
     *,
     tokenizer: Any,
     min_suffix_tokens: int,
+    num_threads: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
     """Fast path for `simple` sentence stop mode.
 
@@ -145,21 +148,33 @@ def _suffix_entropy_rate_to_sentence_end_simple_fast(
     - Use prefix-sum on entropy to compute mean suffix entropy in O(1) per token.
     """
     B, T = entropy.shape
-    out = torch.full((B, T), float("nan"), device=entropy.device, dtype=entropy.dtype)
-    keep = torch.zeros((B, T), device=entropy.device, dtype=torch.int32)
+    out_cpu = torch.full((B, T), float("nan"), dtype=entropy.dtype, device="cpu")
+    keep_cpu = torch.zeros((B, T), dtype=torch.int32, device="cpu")
     n_filtered_short = 0
     min_k = max(int(min_suffix_tokens), 1)
     ent_cpu = entropy.detach().cpu().float()
     resp_cpu = responses.detach().cpu()
     mask_cpu = response_mask.detach().cpu().bool()
+    decode_cache: dict[int, str] = {}
+    cache_lock = threading.Lock()
 
-    for b in range(B):
+    def _decode_piece(tid: int) -> str:
+        v = decode_cache.get(tid, None)
+        if v is not None:
+            return v
+        piece = tokenizer.decode([tid], skip_special_tokens=True)
+        with cache_lock:
+            decode_cache.setdefault(tid, piece)
+        return piece
+
+    def _process_one_row(b: int) -> int:
+        local_filtered = 0
         n = int(mask_cpu[b].sum().item())
         if n <= 1:
-            continue
+            return local_filtered
         row_ent = ent_cpu[b, :n]
         row_resp = [int(x) for x in resp_cpu[b, :n].tolist()]
-        pieces = [tokenizer.decode([tid], skip_special_tokens=True) for tid in row_resp]
+        pieces = [_decode_piece(tid) for tid in row_resp]
 
         # Heuristic sentence-end marker per token for simple mode.
         stop = [False] * n
@@ -201,11 +216,24 @@ def _suffix_entropy_rate_to_sentence_end_simple_fast(
                 e = n - 1
             k = e - s + 1
             if k < min_k:
-                n_filtered_short += 1
+                local_filtered += 1
                 continue
             seg_sum = csum[e + 1] - csum[s]
-            out[b, t] = (seg_sum / float(k)).to(dtype=entropy.dtype)
-            keep[b, t] = int(k)
+            out_cpu[b, t] = (seg_sum / float(k)).to(dtype=entropy.dtype)
+            keep_cpu[b, t] = int(k)
+        return local_filtered
+
+    workers = max(int(num_threads), 1)
+    if workers == 1:
+        for b in range(B):
+            n_filtered_short += _process_one_row(b)
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            for local_filtered in ex.map(_process_one_row, range(B)):
+                n_filtered_short += int(local_filtered)
+
+    out = out_cpu.to(device=entropy.device)
+    keep = keep_cpu.to(device=entropy.device)
     return out, keep, int(n_filtered_short)
 
 
@@ -232,6 +260,7 @@ def _run_fepo_lowtail_adv_phase(
     suffix_mode = str(fepo_cfg.get("suffix_mode", "full"))  # full / sentence
     f_sentence_stop = str(fepo_cfg.get("f_sentence_stop", "simple"))
     sentence_min_suffix_tokens = int(fepo_cfg.get("sentence_min_suffix_tokens", 5))
+    sentence_num_threads = int(fepo_cfg.get("sentence_num_threads", 1))
     alpha = max(alpha, 0.0)
     beta = float(np.clip(beta, 0.0, 1.0))
     collect_point_records = bool(fepo_cfg.get("__collect_point_records", True))
@@ -247,6 +276,7 @@ def _run_fepo_lowtail_adv_phase(
                 response_mask,
                 tokenizer=tokenizer,
                 min_suffix_tokens=sentence_min_suffix_tokens,
+                num_threads=sentence_num_threads,
             )
         else:
             stop_check = _make_sentence_stop_check(f_sentence_stop)
@@ -326,6 +356,7 @@ def _run_fepo_lowtail_adv_phase(
         else float("nan"),
         "fepo/suffix_mode_sentence": 1.0 if suffix_mode == "sentence" else 0.0,
         "fepo/sentence_min_suffix_tokens": float(max(sentence_min_suffix_tokens, 1)),
+        "fepo/sentence_num_threads": float(max(sentence_num_threads, 1)),
         "fepo/sentence_positions_used": float(n_sentence_used),
         "fepo/sentence_positions_filtered_short": float(n_filtered_short_sentence),
         "fepo/f_suffix_rate_mean_all_valid": float(torch.mean(f_valid_all).item()) if f_valid_all.numel() > 0 else float("nan"),
