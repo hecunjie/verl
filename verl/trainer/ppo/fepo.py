@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
-import threading
 from typing import Any, Callable, Optional
 
 import numpy as np
@@ -138,6 +137,7 @@ def _suffix_entropy_rate_to_sentence_end_simple_fast(
     tokenizer: Any,
     min_suffix_tokens: int,
     num_threads: int = 1,
+    eligible_mask: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
     """Fast path for `simple` sentence stop mode.
 
@@ -155,17 +155,18 @@ def _suffix_entropy_rate_to_sentence_end_simple_fast(
     ent_cpu = entropy.detach().cpu().float()
     resp_cpu = responses.detach().cpu()
     mask_cpu = response_mask.detach().cpu().bool()
-    decode_cache: dict[int, str] = {}
-    cache_lock = threading.Lock()
-
-    def _decode_piece(tid: int) -> str:
-        v = decode_cache.get(tid, None)
-        if v is not None:
-            return v
-        piece = tokenizer.decode([tid], skip_special_tokens=True)
-        with cache_lock:
-            decode_cache.setdefault(tid, piece)
-        return piece
+    eligible_cpu = eligible_mask.detach().cpu().bool() if eligible_mask is not None else None
+    # Decode once for all unique token ids in current batch to avoid
+    # high lock contention and repeated tokenizer calls across threads.
+    unique_ids: set[int] = set()
+    for b in range(B):
+        n = int(mask_cpu[b].sum().item())
+        if n <= 0:
+            continue
+        unique_ids.update(int(x) for x in resp_cpu[b, :n].tolist())
+    decode_cache: dict[int, str] = {
+        tid: tokenizer.decode([tid], skip_special_tokens=True) for tid in unique_ids
+    }
 
     def _process_one_row(b: int) -> int:
         local_filtered = 0
@@ -174,7 +175,7 @@ def _suffix_entropy_rate_to_sentence_end_simple_fast(
             return local_filtered
         row_ent = ent_cpu[b, :n]
         row_resp = [int(x) for x in resp_cpu[b, :n].tolist()]
-        pieces = [_decode_piece(tid) for tid in row_resp]
+        pieces = [decode_cache.get(tid, "") for tid in row_resp]
 
         # Heuristic sentence-end marker per token for simple mode.
         stop = [False] * n
@@ -210,6 +211,8 @@ def _suffix_entropy_rate_to_sentence_end_simple_fast(
         csum[1:] = torch.cumsum(row_ent, dim=0)
 
         for t in range(n - 1):
+            if eligible_cpu is not None and not bool(eligible_cpu[b, t].item()):
+                continue
             s = t + 1
             e = next_stop[s]
             if e < 0:
@@ -261,6 +264,7 @@ def _run_fepo_lowtail_adv_phase(
     f_sentence_stop = str(fepo_cfg.get("f_sentence_stop", "simple"))
     sentence_min_suffix_tokens = int(fepo_cfg.get("sentence_min_suffix_tokens", 5))
     sentence_num_threads = int(fepo_cfg.get("sentence_num_threads", 1))
+    sentence_only_high_entropy = bool(fepo_cfg.get("sentence_only_high_entropy", True))
     alpha = max(alpha, 0.0)
     beta = float(np.clip(beta, 0.0, 1.0))
     collect_point_records = bool(fepo_cfg.get("__collect_point_records", True))
@@ -269,6 +273,7 @@ def _run_fepo_lowtail_adv_phase(
     keep_k = torch.zeros_like(advantages, dtype=torch.int32)
     if suffix_mode == "sentence":
         responses = batch.batch["responses"]
+        eligible_mask = (entropy >= h_threshold) & response_mask if sentence_only_high_entropy else None
         if str(f_sentence_stop) == "simple":
             f_rate, keep_k, n_filtered_short_sentence = _suffix_entropy_rate_to_sentence_end_simple_fast(
                 entropy,
@@ -277,6 +282,7 @@ def _run_fepo_lowtail_adv_phase(
                 tokenizer=tokenizer,
                 min_suffix_tokens=sentence_min_suffix_tokens,
                 num_threads=sentence_num_threads,
+                eligible_mask=eligible_mask,
             )
         else:
             stop_check = _make_sentence_stop_check(f_sentence_stop)
@@ -357,6 +363,7 @@ def _run_fepo_lowtail_adv_phase(
         "fepo/suffix_mode_sentence": 1.0 if suffix_mode == "sentence" else 0.0,
         "fepo/sentence_min_suffix_tokens": float(max(sentence_min_suffix_tokens, 1)),
         "fepo/sentence_num_threads": float(max(sentence_num_threads, 1)),
+        "fepo/sentence_only_high_entropy": 1.0 if sentence_only_high_entropy else 0.0,
         "fepo/sentence_positions_used": float(n_sentence_used),
         "fepo/sentence_positions_filtered_short": float(n_filtered_short_sentence),
         "fepo/f_suffix_rate_mean_all_valid": float(torch.mean(f_valid_all).item()) if f_valid_all.numel() > 0 else float("nan"),

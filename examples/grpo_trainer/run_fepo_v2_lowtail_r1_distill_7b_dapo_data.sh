@@ -70,6 +70,7 @@ FEPO_SUFFIX_MODE="${FEPO_SUFFIX_MODE:-sentence}"   # sentence / full
 FEPO_F_SENTENCE_STOP="${FEPO_F_SENTENCE_STOP:-simple}"  # simple / pysbd
 FEPO_SENTENCE_MIN_SUFFIX_TOKENS="${FEPO_SENTENCE_MIN_SUFFIX_TOKENS:-5}"
 FEPO_SENTENCE_NUM_THREADS="${FEPO_SENTENCE_NUM_THREADS:-8}"
+FEPO_SENTENCE_ONLY_HIGH_ENTROPY="${FEPO_SENTENCE_ONLY_HIGH_ENTROPY:-true}"
 FEPO_ENTROPY_TOP_P="${FEPO_ENTROPY_TOP_P:-0.95}"  # 1.0=全词表熵，<1 为 topp 截断熵
 FEPO_DUMP_FREQ="${FEPO_DUMP_FREQ:-50}"
 
@@ -103,6 +104,7 @@ python3 -m verl.trainer.main_ppo \
   +algorithm.fepo.f_sentence_stop="${FEPO_F_SENTENCE_STOP}" \
   +algorithm.fepo.sentence_min_suffix_tokens="${FEPO_SENTENCE_MIN_SUFFIX_TOKENS}" \
   +algorithm.fepo.sentence_num_threads="${FEPO_SENTENCE_NUM_THREADS}" \
+  +algorithm.fepo.sentence_only_high_entropy="${FEPO_SENTENCE_ONLY_HIGH_ENTROPY}" \
   +algorithm.fepo.entropy_top_p="${FEPO_ENTROPY_TOP_P}" \
   data.train_files="${TRAIN_FILES}" \
   data.val_files="['${MATH500_VAL}','${AIME24_VAL}']" \
