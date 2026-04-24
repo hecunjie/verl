@@ -16,6 +16,125 @@ import torch
 from verl import DataProto
 
 
+def _prompt_group_indices(prompts: torch.Tensor) -> dict[bytes, list[int]]:
+    """Group batch rows by identical prompt token ids."""
+    p = prompts.detach().cpu().contiguous()
+    groups: dict[bytes, list[int]] = defaultdict(list)
+    for i in range(int(p.size(0))):
+        key = p[i].numpy().tobytes()
+        groups[key].append(i)
+    return groups
+
+
+def _suffix_entropy_rate_exclusive(entropy: torch.Tensor, response_mask: torch.Tensor) -> torch.Tensor:
+    """Realized suffix entropy rate F_t = mean_{k>t} H_k on valid response range; NaN if undefined."""
+    B, T = entropy.shape
+    out = torch.full((B, T), float("nan"), device=entropy.device, dtype=entropy.dtype)
+    for b in range(B):
+        m = response_mask[b].bool()
+        n = int(m.sum().item())
+        if n <= 1:
+            continue
+        row = entropy[b, :n].float()
+        # suffix including current: S_t = H_t + ... + H_{n-1}
+        s_incl = torch.flip(torch.cumsum(torch.flip(row, dims=[0]), dim=0), dims=[0])
+        s_excl = s_incl - row
+        den = torch.arange(n - 1, -1, -1, device=row.device, dtype=row.dtype)  # n-t-1
+        valid = den > 0
+        vals = torch.full((n,), float("nan"), device=row.device, dtype=row.dtype)
+        vals[valid] = s_excl[valid] / den[valid]
+        out[b, :n] = vals.to(dtype=entropy.dtype)
+    return out
+
+
+def _run_fepo_lowtail_adv_phase(
+    batch: DataProto,
+    fepo_cfg: dict[str, Any],
+) -> tuple[DataProto, dict[str, float], list[dict[str, Any]]]:
+    """New FEPO v2: direction from A_t, strength from low-tail suffix entropy-rate quantile."""
+    ent_key = "fepo_token_entropy" if "fepo_token_entropy" in batch.batch else "token_entropy"
+    if ent_key not in batch.batch:
+        raise ValueError(
+            "FEPO lowtail_adv requires per-token entropy in batch['fepo_token_entropy'] (preferred) "
+            "or batch['token_entropy']."
+        )
+    entropy = batch.batch[ent_key]
+    response_mask = batch.batch["response_mask"].bool()
+    advantages = batch.batch["advantages"]
+    prompts = batch.batch["prompts"]
+
+    h_threshold = float(fepo_cfg.get("h_threshold", 2.0))
+    alpha = float(fepo_cfg.get("alpha", fepo_cfg.get("bonus_pos", 0.2)))
+    beta = float(fepo_cfg.get("beta", 0.2))
+    alpha = max(alpha, 0.0)
+    beta = float(np.clip(beta, 0.0, 1.0))
+    collect_point_records = bool(fepo_cfg.get("__collect_point_records", True))
+
+    # Realized suffix entropy-rate per token (exclusive future).
+    f_rate = _suffix_entropy_rate_exclusive(entropy, response_mask)
+    high_mask = (entropy >= h_threshold) & response_mask & torch.isfinite(f_rate)
+    m = torch.ones_like(advantages)
+    q = torch.full_like(advantages, float("nan"))
+
+    groups = _prompt_group_indices(prompts)
+    n_high = 0
+    n_boost = 0
+
+    for idxs in groups.values():
+        positions: list[tuple[int, int, float]] = []
+        for b in idxs:
+            ts = torch.where(high_mask[b])[0].tolist()
+            for t in ts:
+                positions.append((int(b), int(t), float(f_rate[b, t].item())))
+        if not positions:
+            continue
+        positions_sorted = sorted(positions, key=lambda x: x[2])  # low-tail first
+        k = len(positions_sorted)
+        n_high += int(k)
+        for rank, (b, t, _f) in enumerate(positions_sorted):
+            qi = (float(rank) / float(k - 1)) if k > 1 else 0.0
+            q[b, t] = qi
+            if qi <= beta:
+                m[b, t] = 1.0 + alpha
+                n_boost += 1
+
+    batch.batch["advantages"] = advantages * m * response_mask.float()
+
+    q_valid = q[torch.isfinite(q)]
+    m_valid = m[high_mask]
+    metrics: dict[str, float] = {
+        "fepo/n_selected": float(n_high),
+        "fepo/lowtail_mode": 1.0,
+        "fepo/h_threshold": float(h_threshold),
+        "fepo/alpha": float(alpha),
+        "fepo/beta": float(beta),
+        "fepo/n_boosted": float(n_boost),
+        "fepo/boost_hit_rate": (float(n_boost) / float(n_high)) if n_high > 0 else 0.0,
+        "fepo/q_mean": float(torch.mean(q_valid).item()) if q_valid.numel() > 0 else float("nan"),
+        "fepo/m_mean_on_high": float(torch.mean(m_valid).item()) if m_valid.numel() > 0 else 1.0,
+    }
+
+    point_records: list[dict[str, Any]] = []
+    if collect_point_records and n_high > 0:
+        for b in range(int(entropy.size(0))):
+            ts = torch.where(high_mask[b])[0].tolist()
+            for t in ts:
+                point_records.append(
+                    {
+                        "batch_index": int(b),
+                        "response_t": int(t),
+                        "h_t": float(entropy[b, t].item()),
+                        "f_suffix_rate": float(f_rate[b, t].item()),
+                        "q": float(q[b, t].item()),
+                        "m": float(m[b, t].item()),
+                        "adv_before": float(advantages[b, t].item()),
+                        "adv_after": float((advantages[b, t] * m[b, t]).item()),
+                        "boosted": bool(float(m[b, t].item()) > 1.0),
+                    }
+                )
+    return batch, metrics, point_records
+
+
 def select_high_entropy_positions(
     entropy: torch.Tensor,
     response_mask: torch.Tensor,
@@ -172,6 +291,9 @@ def run_fepo_advantage_phase(
     enable = bool(fepo_cfg.get("enable", False))
     if not enable:
         return batch, {}, []
+    fepo_variant = str(fepo_cfg.get("variant", "legacy_mc_bonus"))
+    if fepo_variant == "lowtail_adv":
+        return _run_fepo_lowtail_adv_phase(batch, fepo_cfg)
     collect_point_records = bool(fepo_cfg.get("__collect_point_records", True))
 
     h_threshold = float(fepo_cfg.get("h_threshold", 2.0))

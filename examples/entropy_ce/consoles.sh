@@ -552,15 +552,26 @@ bash verl/examples/entropy_ce/run_compare_bias_sign_bucket_vs_mc_sharded.sh
 
 # 跑完后：analyze 脚本里 PR 准召只应用你显式传入的 --pr_precision_* / --pr_recall_*；未传的过滤条件一律不用
 python3 examples/entropy_ce/analyze_sign_compare_filtered_metrics.py \
-  --input /mnt/tidal-alsh01/dataset/zeus/hecunjie/entropy_check/compare_bias_sign_mc128_vs_mc1_qwen3_4b/sign_compare_merged.jsonl \
-  --pr_precision_min_abs_gap 0.08 \
-  --pr_recall_min_abs_gap 0.08 > /mnt/tidal-alsh01/dataset/zeus/hecunjie/entropy_check/compare_bias_sign_mc128_vs_mc1_qwen3_4b/sign_compare_filtered_metrics.log
-
-    --pr_precision_relative_gap_frac 0.3 \
-  --pr_recall_relative_gap_frac 0.3 \
-
+  --input /mnt/tidal-alsh01/dataset/zeus/hecunjie/entropy_check/compare_bias_sign_trend_mc_qwen3_4b_16k_rollouts/sign_compare_merged.jsonl \
+  --pr_precision_relative_gap_frac 0.4 \
+  --pr_precision_min_abs_gap 0.3 \
+  --pr_precision_min_f_bar 0.3 \
+  --pr_recall_relative_gap_frac 0.2 \
+  --pr_recall_min_abs_gap 0.1 > /mnt/tidal-alsh01/dataset/zeus/hecunjie/entropy_check/compare_bias_sign_trend_mc_qwen3_4b_16k_rollouts/sign_compare_filtered_metrics.log
+python3 examples/entropy_ce/analyze_sign_compare_filtered_metrics.py \
+  --input /mnt/tidal-alsh01/dataset/zeus/hecunjie/entropy_check/compare_bias_sign_single_local40_mc_qwen3_4b/sign_compare_merged.jsonl \
+  --pr_precision_relative_gap_frac 0.4 \
+  --pr_precision_min_abs_gap 0.3 \
+  --pr_precision_min_f_bar 0.3 \
+  --pr_recall_relative_gap_frac 0.2 \
+  --pr_recall_min_abs_gap 0.1 > /mnt/tidal-alsh01/dataset/zeus/hecunjie/entropy_check/compare_bias_sign_single_local40_mc_qwen3_4b/sign_compare_filtered_metrics.log
 
 # MODE=greedy \
+
+
+
+
+MODE=greedy \
 
 MODE=sampling \
 NUM_SAMPLES_PER_PROMPT=32 \
@@ -569,9 +580,9 @@ PASS_K_LARGE=32 \
 VLLM_REQUEST_BATCH_CHUNK_MC=256 \
 SAMPLING_TEMPERATURE=1.0 \
 SAMPLING_TOP_P=0.95 \
-MODEL_PATH=/mnt/tidal-alsh01/dataset/zeus/hecunjie/models/Qwen/Qwen3-4B \
-INPUT_DATA=/mnt/ali-sh-1/dataset/zeus/hecunjie/rl_data/grpo/aime2025_test.parquet \
-OUTPUT_DIR=/mnt/tidal-alsh01/dataset/zeus/hecunjie/entropy_check/qwen3-4b_passk_32/sampling_aime25 \
+MODEL_PATH=/mnt/tidal-alsh01/dataset/zeus/hecunjie/models/Qwen/Qwen3-4B-base \
+INPUT_DATA=/mnt/ali-sh-1/dataset/zeus/hecunjie/rl_data/grpo/aime2024_test.parquet \
+OUTPUT_DIR=/mnt/tidal-alsh01/dataset/zeus/hecunjie/entropy_check/qwen3-4b-base_passk_32/sampling_aime24 \
 NPROC_PER_NODE=8 \
 MAX_SAMPLES=500 \
 MAX_NEW_TOKENS=8192 \
@@ -579,20 +590,20 @@ MATH_EVAL_BACKEND=math_verify \
 bash /mnt/ali-sh-1/dataset/zeus/hecunjie/gitlab-source/verl/examples/entropy_ce/run_infer_passk_by_mode_vllm_sharded.sh
 
 MODE=min_f_mc \
-MINF_NONBRANCH_MODE=sampling \
+MINF_NONBRANCH_MODE=greedy \
 NUM_SAMPLES_PER_PROMPT=32 \
 PASS_K_SMALL=4 \
 PASS_K_LARGE=32 \
 SAMPLING_TEMPERATURE=1.0 \
 SAMPLING_TOP_P=0.95 \
 SELECTION_F_MODE=mc \
-MC_M_SAMPLES=10 \
+MC_M_SAMPLES=32 \
 MC_TEMPERATURE=1.0 \
 MC_TOP_P=0.95 \
 VLLM_REQUEST_BATCH_CHUNK_MC=256 \
 MODEL_PATH=/mnt/tidal-alsh01/dataset/zeus/hecunjie/models/Qwen/Qwen3-4B \
 INPUT_DATA=/mnt/ali-sh-1/dataset/zeus/hecunjie/rl_data/grpo/aime2025_test.parquet \
-OUTPUT_DIR=/mnt/tidal-alsh01/dataset/zeus/hecunjie/entropy_check/qwen3-4b_passk_32/minfmc_nonbranch_sampling_aime25_batch \
+OUTPUT_DIR=/mnt/tidal-alsh01/dataset/zeus/hecunjie/entropy_check/qwen3-4b_passk_32/minfmc_nonbranch_greedy_aime25_batch_mc32 \
 NPROC_PER_NODE=8 \
 MAX_SAMPLES=500 \
 MAX_NEW_TOKENS=8192 \
@@ -601,7 +612,7 @@ CANDIDATE_TOP_P=0.95 \
 CANDIDATE_MAX_K=5 \
 MAX_BRANCH_STEPS=64 \
 F_CONTINUATION_MODE=first_sentence \
-F_SENTENCE_MAX_NEW_TOKENS=256 \
+F_SENTENCE_MAX_NEW_TOKENS=128 \
 BIAS_METRICS_MODE=length_normalized \
 MATH_EVAL_BACKEND=math_verify \
 bash /mnt/ali-sh-1/dataset/zeus/hecunjie/gitlab-source/verl/examples/entropy_ce/run_infer_passk_by_mode_vllm_sharded.sh \
