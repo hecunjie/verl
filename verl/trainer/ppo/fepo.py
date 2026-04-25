@@ -269,6 +269,7 @@ def _run_fepo_lowtail_adv_phase(
     h_threshold = float(fepo_cfg.get("h_threshold", 2.0))
     alpha = float(fepo_cfg.get("alpha", fepo_cfg.get("bonus_pos", 0.2)))
     beta = float(fepo_cfg.get("beta", 0.2))
+    high_head_penalty = float(fepo_cfg.get("high_head_penalty", 0.0))
     suffix_mode = str(fepo_cfg.get("suffix_mode", "full"))  # full / sentence
     f_sentence_stop = str(fepo_cfg.get("f_sentence_stop", "simple"))
     sentence_min_suffix_tokens = int(fepo_cfg.get("sentence_min_suffix_tokens", 5))
@@ -277,6 +278,7 @@ def _run_fepo_lowtail_adv_phase(
     sentence_max_scan_tokens = int(fepo_cfg.get("sentence_max_scan_tokens", 256))
     sentence_high_entropy_ratio = float(fepo_cfg.get("sentence_high_entropy_ratio", 0.01))
     alpha = max(alpha, 0.0)
+    high_head_penalty = max(high_head_penalty, 0.0)
     beta = float(np.clip(beta, 0.0, 1.0))
     collect_point_records = bool(fepo_cfg.get("__collect_point_records", True))
 
@@ -337,6 +339,7 @@ def _run_fepo_lowtail_adv_phase(
     groups = _prompt_group_indices(prompts)
     n_high = 0
     n_boost = 0
+    n_head_penalized = 0
 
     for idxs in groups.values():
         positions: list[tuple[int, int, float]] = []
@@ -355,6 +358,10 @@ def _run_fepo_lowtail_adv_phase(
             if qi <= beta:
                 m[b, t] = 1.0 + alpha
                 n_boost += 1
+            elif high_head_penalty > 0.0 and qi >= (1.0 - beta):
+                # high-head penalty: downweight very high-q positions.
+                m[b, t] = max(0.0, 1.0 - high_head_penalty)
+                n_head_penalized += 1
 
     batch.batch["advantages"] = advantages * m * response_mask.float()
 
@@ -383,8 +390,11 @@ def _run_fepo_lowtail_adv_phase(
         "fepo/h_threshold": float(h_threshold),
         "fepo/alpha": float(alpha),
         "fepo/beta": float(beta),
+        "fepo/high_head_penalty": float(high_head_penalty),
         "fepo/n_boosted": float(n_boost),
+        "fepo/n_head_penalized": float(n_head_penalized),
         "fepo/boost_hit_rate": (float(n_boost) / float(n_high)) if n_high > 0 else 0.0,
+        "fepo/head_penalty_hit_rate": (float(n_head_penalized) / float(n_high)) if n_high > 0 else 0.0,
         "fepo/q_mean": float(torch.mean(q_valid).item()) if q_valid.numel() > 0 else float("nan"),
         "fepo/m_mean_on_high": float(torch.mean(m_valid).item()) if m_valid.numel() > 0 else 1.0,
         "fepo/n_low_entropy": float(n_low),
