@@ -157,6 +157,7 @@ def _suffix_entropy_rate_to_sentence_end_simple_fast(
     resp_cpu = responses.detach().cpu()
     mask_cpu = response_mask.detach().cpu().bool()
     eligible_cpu = eligible_mask.detach().cpu().bool() if eligible_mask is not None else None
+    row_need_n: dict[int, int] = {}
     # Decode once for all unique token ids in current batch to avoid
     # high lock contention and repeated tokenizer calls across threads.
     unique_ids: set[int] = set()
@@ -165,67 +166,72 @@ def _suffix_entropy_rate_to_sentence_end_simple_fast(
         n = int(mask_cpu[b].sum().item())
         if n <= 0:
             continue
+        n_need = n
         if eligible_cpu is not None:
             # Skip rows that have no eligible positions at all.
-            if not bool(eligible_cpu[b, : max(n - 1, 0)].any().item()):
+            elig = torch.where(eligible_cpu[b, : max(n - 1, 0)])[0]
+            if elig.numel() == 0:
                 continue
+            # Only decode/scan prefix up to the furthest needed candidate window.
+            if max_scan_tokens > 0:
+                max_t = int(torch.max(elig).item())
+                n_need = min(n, max_t + 1 + max_scan_tokens)
+        row_need_n[b] = n_need
         active_rows.append(b)
-        unique_ids.update(int(x) for x in resp_cpu[b, :n].tolist())
+        unique_ids.update(int(x) for x in resp_cpu[b, :n_need].tolist())
     decode_cache: dict[int, str] = {
         tid: tokenizer.decode([tid], skip_special_tokens=True) for tid in unique_ids
     }
+    # Precompute per-token-id stop flag (approximation of simple mode).
+    # Ignore the decimal-tail safeguard here: rare and the tradeoff favors speed.
+    stop_id_cache: dict[int, bool] = {}
+    for tid, p in decode_cache.items():
+        p_strip = p.rstrip()
+        if not p_strip:
+            stop_id_cache[tid] = False
+            continue
+        tail = p_strip[-1]
+        if "\n\n" in p or tail in "。！？!?.":
+            stop_id_cache[tid] = True
+        else:
+            stop_id_cache[tid] = False
 
     def _process_one_row(b: int) -> int:
         local_filtered = 0
         n = int(mask_cpu[b].sum().item())
         if n <= 1:
             return local_filtered
-        row_ent = ent_cpu[b, :n]
-        row_resp = [int(x) for x in resp_cpu[b, :n].tolist()]
-        pieces = [decode_cache.get(tid, "") for tid in row_resp]
+        n_need = int(row_need_n.get(b, n))
+        if n_need <= 1:
+            return local_filtered
+        row_ent = ent_cpu[b, :n_need]
+        row_resp_tensor = resp_cpu[b, :n_need]
+        row_resp = row_resp_tensor.tolist()
 
-        # Heuristic sentence-end marker per token for simple mode.
-        stop = [False] * n
-        prev_non_empty_tail = ""
-        for i, p in enumerate(pieces):
-            p_strip = p.rstrip()
-            if not p_strip:
-                continue
-            tail = p_strip[-1]
-            is_stop = False
-            if "\n\n" in p:
-                is_stop = True
-            elif tail in "。！？!?":
-                is_stop = True
-            elif tail == ".":
-                # Keep simple mode's decimal-tail safeguard approximately.
-                left = p_strip[:-1].rstrip()
-                prev_char = left[-1] if left else (prev_non_empty_tail[-1] if prev_non_empty_tail else "")
-                is_stop = not (prev_char.isdigit())
-            stop[i] = is_stop
-            prev_non_empty_tail = p_strip
+        # Vectorized stop via cache.
+        stop = [stop_id_cache.get(int(tid), False) for tid in row_resp]
 
         # nearest stop index >= i, else -1
-        next_stop = [-1] * n
+        next_stop = [-1] * n_need
         nxt = -1
-        for i in range(n - 1, -1, -1):
+        for i in range(n_need - 1, -1, -1):
             if stop[i]:
                 nxt = i
             next_stop[i] = nxt
 
         # Prefix sum for O(1) segment mean.
-        csum = torch.zeros((n + 1,), dtype=row_ent.dtype)
+        csum = torch.zeros((n_need + 1,), dtype=row_ent.dtype)
         csum[1:] = torch.cumsum(row_ent, dim=0)
 
-        for t in range(n - 1):
+        for t in range(n_need - 1):
             if eligible_cpu is not None and not bool(eligible_cpu[b, t].item()):
                 continue
             s = t + 1
             e = next_stop[s]
             if e < 0:
-                e = n - 1
+                e = n_need - 1
             if max_scan_tokens > 0:
-                e = min(e, s + max_scan_tokens - 1, n - 1)
+                e = min(e, s + max_scan_tokens - 1, n_need - 1)
             k = e - s + 1
             if k < min_k:
                 local_filtered += 1
