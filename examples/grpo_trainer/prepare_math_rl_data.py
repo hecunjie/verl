@@ -275,7 +275,7 @@ def iter_aime24_test():
             _user_content_dapo_processed(str(p).strip()),
             _gt(a),
             "aime2024",
-            extra_info={"index": idx, "split": "aime2024", "source_id": ex.get("id", str(idx))},
+            extra_info={"index": idx, "split": "aime2024", "source_id": str(ex.get("id", str(idx)))},
         )
 
 
@@ -294,7 +294,7 @@ def iter_aime25_test():
             _user_content_dapo_processed(str(p).strip()),
             _gt(a),
             "aime2025",
-            extra_info={"index": idx, "split": "aime2025", "source_id": ex.get("id", str(idx))},
+            extra_info={"index": idx, "split": "aime2025", "source_id": str(ex.get("id", str(idx)))},
         )
 
 
