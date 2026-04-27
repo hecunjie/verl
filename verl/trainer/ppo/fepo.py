@@ -369,6 +369,19 @@ def _run_fepo_lowtail_adv_phase(
                 m[b, t] = max(0.0, 1.0 - high_head_penalty)
                 n_head_penalized += 1
 
+    # Effective split masks on selected high-entropy points.
+    q_finite_mask = torch.isfinite(q)
+    low_tail_mask = high_mask & q_finite_mask & (q <= beta)
+    high_head_mask = high_mask & q_finite_mask & (q >= (1.0 - beta))
+    adv_pos_mask = advantages > 0
+    adv_neg_mask = advantages <= 0
+    n_low_tail = int(low_tail_mask.sum().item())
+    n_high_head = int(high_head_mask.sum().item())
+    n_adv_pos_high = int((high_mask & adv_pos_mask).sum().item())
+    n_adv_neg_high = int((high_mask & adv_neg_mask).sum().item())
+    n_low_tail_adv_pos = int((low_tail_mask & adv_pos_mask).sum().item())
+    n_high_head_adv_pos = int((high_head_mask & adv_pos_mask).sum().item())
+
     batch.batch["advantages"] = advantages * m * response_mask.float()
 
     q_valid = q[torch.isfinite(q)]
@@ -399,8 +412,28 @@ def _run_fepo_lowtail_adv_phase(
         "fepo/high_head_penalty": float(high_head_penalty),
         "fepo/n_boosted": float(n_boost),
         "fepo/n_head_penalized": float(n_head_penalized),
+        "fepo/n_low_tail_effective": float(n_low_tail),
+        "fepo/n_high_head_effective": float(n_high_head),
         "fepo/boost_hit_rate": (float(n_boost) / float(n_high)) if n_high > 0 else 0.0,
         "fepo/head_penalty_hit_rate": (float(n_head_penalized) / float(n_high)) if n_high > 0 else 0.0,
+        # Adv-sign diagnostics on effective low-tail / high-head points.
+        "fepo/low_tail_adv_pos_ratio": (float(n_low_tail_adv_pos) / float(n_low_tail)) if n_low_tail > 0 else float("nan"),
+        "fepo/high_head_adv_pos_ratio": (float(n_high_head_adv_pos) / float(n_high_head))
+        if n_high_head > 0
+        else float("nan"),
+        # Composition diagnostics: in positive/negative-adv high points, how many are low-tail/high-head.
+        "fepo/adv_pos_low_tail_ratio_in_high": (float(n_low_tail_adv_pos) / float(n_adv_pos_high))
+        if n_adv_pos_high > 0
+        else float("nan"),
+        "fepo/adv_pos_high_head_ratio_in_high": (float(n_high_head_adv_pos) / float(n_adv_pos_high))
+        if n_adv_pos_high > 0
+        else float("nan"),
+        "fepo/adv_neg_low_tail_ratio_in_high": (float(int((low_tail_mask & adv_neg_mask).sum().item())) / float(n_adv_neg_high))
+        if n_adv_neg_high > 0
+        else float("nan"),
+        "fepo/adv_neg_high_head_ratio_in_high": (float(int((high_head_mask & adv_neg_mask).sum().item())) / float(n_adv_neg_high))
+        if n_adv_neg_high > 0
+        else float("nan"),
         "fepo/q_mean": float(torch.mean(q_valid).item()) if q_valid.numel() > 0 else float("nan"),
         "fepo/m_mean_on_high": float(torch.mean(m_valid).item()) if m_valid.numel() > 0 else 1.0,
         "fepo/n_low_entropy": float(n_low),
