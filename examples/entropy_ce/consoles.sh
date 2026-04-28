@@ -612,7 +612,7 @@ CANDIDATE_TOP_P=0.95 \
 CANDIDATE_MAX_K=10 \
 MAX_BRANCH_STEPS=64 \
 F_CONTINUATION_MODE=first_sentence \
-F_SENTENCE_MAX_NEW_TOKENS=256 \
+F_SENTENCE_MAX_NEW_TOKENS=128 \
 BIAS_METRICS_MODE=length_normalized \
 MATH_EVAL_BACKEND=math_verify \
 bash /mnt/ali-sh-1/dataset/zeus/hecunjie/gitlab-source/verl/examples/entropy_ce/run_infer_passk_by_mode_vllm_sharded.sh \

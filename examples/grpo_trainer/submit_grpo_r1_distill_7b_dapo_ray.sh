@@ -35,6 +35,11 @@ WANDB_ENTITY="${WANDB_ENTITY:-}"
 WANDB_MODE="${WANDB_MODE:-online}" # online | offline | disabled
 WANDB_DIR="${WANDB_DIR:-${HOME}/wandb}"
 
+# Ray runtime_env package temporary reference TTL (seconds).
+# Increase default to reduce failures on large/slow uploads.
+RAY_RUNTIME_ENV_TEMPORARY_REFERENCE_EXPIRATION_S="${RAY_RUNTIME_ENV_TEMPORARY_REFERENCE_EXPIRATION_S:-3600}"
+export RAY_RUNTIME_ENV_TEMPORARY_REFERENCE_EXPIRATION_S
+
 # Make it runnable out-of-the-box: if user didn't provide WANDB_API_KEY, don't try online logging.
 if [[ -z "${WANDB_API_KEY}" && "${WANDB_MODE}" == "online" ]]; then
   WANDB_MODE="offline"
@@ -69,11 +74,35 @@ runtime_env = {
   "env_vars": env_vars,
   # Avoid uploading large or irrelevant local artifacts into Ray runtime_env package.
   "excludes": [
+    ".git/**",
+    ".idea/**",
+    ".vscode/**",
+    ".venv/**",
+    "venv/**",
     "wandb/**",
     "outputs/**",
-    ".git/**",
+    "logs/**",
+    "checkpoints/**",
+    "data/**",
+    "datasets/**",
+    "cache/**",
+    ".cache/**",
     "**/__pycache__/**",
+    "**/.pytest_cache/**",
+    "**/.mypy_cache/**",
     "*.pyc",
+    "*.pyo",
+    "*.pt",
+    "*.pth",
+    "*.ckpt",
+    "*.bin",
+    "*.npy",
+    "*.npz",
+    "*.parquet",
+    "*.csv",
+    "*.zip",
+    "*.tar",
+    "*.tar.gz",
   ],
 }
 print(json.dumps(runtime_env, ensure_ascii=False))
@@ -82,6 +111,7 @@ PY
 
 echo "Submitting Ray job to: ${RAY_ADDRESS}"
 echo "Working dir (runtime_env.working_dir): ${VERL_ROOT}"
+echo "Runtime env temporary reference TTL: ${RAY_RUNTIME_ENV_TEMPORARY_REFERENCE_EXPIRATION_S}s"
 echo "Env vars: VLLM_USE_V1=${VLLM_USE_V1}, WANDB_PROJECT=${WANDB_PROJECT}, WANDB_MODE=${WANDB_MODE}"
 if [[ -n "${WANDB_ENTITY}" ]]; then
   echo "Env vars: WANDB_ENTITY=${WANDB_ENTITY}"
