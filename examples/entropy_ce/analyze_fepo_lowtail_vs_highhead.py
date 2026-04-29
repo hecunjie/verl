@@ -135,7 +135,19 @@ def main() -> None:
         default=0.2,
         help="q 近邻统计中的低目标值。",
     )
+    parser.add_argument(
+        "--quantile_levels",
+        type=str,
+        default="0.1,0.2,0.3,0.5,0.8,0.9",
+        help="用于分位图的分位点，逗号分隔。",
+    )
     args = parser.parse_args()
+    quantile_levels = [float(x.strip()) for x in str(args.quantile_levels).split(",") if x.strip()]
+    if not quantile_levels:
+        raise SystemExit("--quantile_levels 不能为空。")
+    for ql in quantile_levels:
+        if not (0.0 <= ql <= 1.0):
+            raise SystemExit(f"非法分位点 {ql}，必须在 [0,1]。")
 
     input_dir = Path(args.input_dir).expanduser().resolve()
     output_dir = Path(args.output_dir).expanduser().resolve()
@@ -386,6 +398,34 @@ def main() -> None:
                 f"{r['q_target_low']:.8f},{r['q_nearest_low']:.8f},{r['abs_diff_low']:.8f},{r['suffix_rate_at_q_low']:.8f},{r['h_t_at_q_low']:.8f}\n"
             )
 
+    quantile_rows: list[dict[str, float | int]] = []
+    for step in steps:
+        candidates = q_probe_by_step.get(step, [])
+        if not candidates:
+            continue
+        suffix_arr = np.array([x["suffix_rate"] for x in candidates], dtype=np.float64)
+        ht_arr = np.array([x["h_t"] for x in candidates], dtype=np.float64)
+        row: dict[str, float | int] = {
+            "step": int(step),
+            "n_candidates_with_q_h_suffix": int(suffix_arr.size),
+        }
+        for ql in quantile_levels:
+            qname = f"{ql:.1f}"
+            row[f"suffix_q{qname}"] = float(np.quantile(suffix_arr, ql))
+            row[f"h_t_q{qname}"] = float(np.quantile(ht_arr, ql))
+        quantile_rows.append(row)
+
+    quantile_csv_path = output_dir / "suffix_ht_quantiles_by_step.csv"
+    with open(quantile_csv_path, "w", encoding="utf-8") as f:
+        suffix_cols = [f"suffix_q{ql:.1f}" for ql in quantile_levels]
+        ht_cols = [f"h_t_q{ql:.1f}" for ql in quantile_levels]
+        f.write("step,n_candidates_with_q_h_suffix," + ",".join(suffix_cols + ht_cols) + "\n")
+        for r in quantile_rows:
+            values = [f"{r['step']}", f"{r['n_candidates_with_q_h_suffix']}"]
+            values += [f"{float(r[c]):.8f}" for c in suffix_cols]
+            values += [f"{float(r[c]):.8f}" for c in ht_cols]
+            f.write(",".join(values) + "\n")
+
     try:
         import matplotlib
 
@@ -466,11 +506,43 @@ def main() -> None:
             fig4.tight_layout()
             fig4.savefig(output_dir / "q_target_nearest_suffix_ht_by_step.png", dpi=160)
             plt.close(fig4)
+
+        if quantile_rows:
+            x_quant = np.array([r["step"] for r in quantile_rows], dtype=np.float64)
+
+            fig5, ax7 = plt.subplots(figsize=(10, 5))
+            for ql in quantile_levels:
+                col = f"suffix_q{ql:.1f}"
+                y = np.array([r[col] for r in quantile_rows], dtype=np.float64)
+                ax7.plot(x_quant, y, linewidth=2, label=f"q={ql:.1f}")
+            ax7.set_xlabel("step")
+            ax7.set_ylabel("suffix entropy metric")
+            ax7.set_title("Suffix metric quantiles by step")
+            ax7.grid(True, alpha=0.3)
+            ax7.legend(ncol=3, fontsize=9)
+            fig5.tight_layout()
+            fig5.savefig(output_dir / "suffix_quantiles_by_step.png", dpi=160)
+            plt.close(fig5)
+
+            fig6, ax8 = plt.subplots(figsize=(10, 5))
+            for ql in quantile_levels:
+                col = f"h_t_q{ql:.1f}"
+                y = np.array([r[col] for r in quantile_rows], dtype=np.float64)
+                ax8.plot(x_quant, y, linewidth=2, label=f"q={ql:.1f}")
+            ax8.set_xlabel("step")
+            ax8.set_ylabel("h_t")
+            ax8.set_title("h_t quantiles by step")
+            ax8.grid(True, alpha=0.3)
+            ax8.legend(ncol=3, fontsize=9)
+            fig6.tight_layout()
+            fig6.savefig(output_dir / "h_t_quantiles_by_step.png", dpi=160)
+            plt.close(fig6)
     except Exception as e:  # pragma: no cover
         print(f"[warn] 画图失败（可能未安装 matplotlib）: {e}")
 
     print(f"Wrote CSV: {csv_path}")
     print(f"Wrote CSV: {q_targets_csv_path}")
+    print(f"Wrote CSV: {quantile_csv_path}")
     print(f"Wrote Summary: {summary_path}")
     print(f"Done. steps={len(steps)}, used={n_used}, skipped={n_bad}")
 
