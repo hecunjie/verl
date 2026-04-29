@@ -460,6 +460,7 @@ def main() -> None:
             f.write(",".join(values) + "\n")
 
     top_suffix_rows: list[dict[str, float | int]] = []
+    tail_suffix_rows: list[dict[str, float | int]] = []
     for step in steps:
         candidates = raw_by_step.get(step, [])
         if not candidates:
@@ -467,8 +468,10 @@ def main() -> None:
         suffix_arr = np.array([x["suffix_rate"] for x in candidates], dtype=np.float64)
         adv_arr = np.array([x["advantage"] for x in candidates], dtype=np.float64)
         order = np.argsort(-suffix_arr)  # descending by suffix entropy metric
+        order_tail = np.argsort(suffix_arr)  # ascending by suffix entropy metric
         n = int(suffix_arr.size)
         row: dict[str, float | int] = {"step": int(step), "n_candidates": n}
+        row_tail: dict[str, float | int] = {"step": int(step), "n_candidates": n}
         for tl in top_suffix_levels:
             k = max(1, int(math.ceil(n * float(tl))))
             idx = order[:k]
@@ -486,7 +489,22 @@ def main() -> None:
             row[f"n_top{tname}_adv_nonzero"] = int(n_nonzero)
             row[f"p_pos_top{tname}"] = float(p_pos)
             row[f"e_adv_top{tname}"] = float(e_adv)
+            idx_tail = order_tail[:k]
+            sub_adv_tail = adv_arr[idx_tail]
+            nonzero_mask_tail = np.abs(sub_adv_tail) > float(args.adv_zero_eps)
+            n_nonzero_tail = int(np.sum(nonzero_mask_tail))
+            p_pos_tail = (
+                float(np.sum(sub_adv_tail[nonzero_mask_tail] > 0.0) / n_nonzero_tail)
+                if n_nonzero_tail >= min_group_count
+                else float("nan")
+            )
+            e_adv_tail = float(np.mean(sub_adv_tail)) if sub_adv_tail.size >= min_group_count else float("nan")
+            row_tail[f"n_tail{tname}"] = int(k)
+            row_tail[f"n_tail{tname}_adv_nonzero"] = int(n_nonzero_tail)
+            row_tail[f"p_pos_tail{tname}"] = float(p_pos_tail)
+            row_tail[f"e_adv_tail{tname}"] = float(e_adv_tail)
         top_suffix_rows.append(row)
+        tail_suffix_rows.append(row_tail)
 
     top_suffix_csv_path = output_dir / "top_suffix_levels_adv_stats_by_step.csv"
     with open(top_suffix_csv_path, "w", encoding="utf-8") as f:
@@ -496,6 +514,21 @@ def main() -> None:
         e_cols = [f"e_adv_top{tl:.1f}" for tl in top_suffix_levels]
         f.write("step,n_candidates," + ",".join(n_cols + nz_cols + p_cols + e_cols) + "\n")
         for r in top_suffix_rows:
+            vals = [f"{r['step']}", f"{r['n_candidates']}"]
+            vals += [f"{int(r[c])}" for c in n_cols]
+            vals += [f"{int(r[c])}" for c in nz_cols]
+            vals += [f"{float(r[c]):.8f}" for c in p_cols]
+            vals += [f"{float(r[c]):.8f}" for c in e_cols]
+            f.write(",".join(vals) + "\n")
+
+    tail_suffix_csv_path = output_dir / "tail_suffix_levels_adv_stats_by_step.csv"
+    with open(tail_suffix_csv_path, "w", encoding="utf-8") as f:
+        n_cols = [f"n_tail{tl:.1f}" for tl in top_suffix_levels]
+        nz_cols = [f"n_tail{tl:.1f}_adv_nonzero" for tl in top_suffix_levels]
+        p_cols = [f"p_pos_tail{tl:.1f}" for tl in top_suffix_levels]
+        e_cols = [f"e_adv_tail{tl:.1f}" for tl in top_suffix_levels]
+        f.write("step,n_candidates," + ",".join(n_cols + nz_cols + p_cols + e_cols) + "\n")
+        for r in tail_suffix_rows:
             vals = [f"{r['step']}", f"{r['n_candidates']}"]
             vals += [f"{int(r[c])}" for c in n_cols]
             vals += [f"{int(r[c])}" for c in nz_cols]
@@ -712,6 +745,29 @@ def main() -> None:
             fig8.tight_layout()
             fig8.savefig(output_dir / "top_suffix_levels_adv_stats.png", dpi=160)
             plt.close(fig8)
+
+        if tail_suffix_rows:
+            xt = np.array([r["step"] for r in tail_suffix_rows], dtype=np.float64)
+            fig9, (ax12, ax13) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+            for tl in top_suffix_levels:
+                tname = f"{tl:.1f}"
+                pvals = np.array([r[f"p_pos_tail{tname}"] for r in tail_suffix_rows], dtype=np.float64)
+                evals = np.array([r[f"e_adv_tail{tname}"] for r in tail_suffix_rows], dtype=np.float64)
+                label = f"tail {int(tl * 100)}%"
+                ax12.plot(xt, pvals, linewidth=2, label=label)
+                ax13.plot(xt, evals, linewidth=2, label=label)
+            ax12.set_ylabel("P(adv>0 | adv!=0)")
+            ax12.set_title("Tail suffix-entropy levels: positive-adv probability")
+            ax12.grid(True, alpha=0.3)
+            ax12.legend(ncol=2)
+            ax13.set_xlabel("step")
+            ax13.set_ylabel("E[adv]")
+            ax13.set_title("Tail suffix-entropy levels: expected advantage")
+            ax13.grid(True, alpha=0.3)
+            ax13.legend(ncol=2)
+            fig9.tight_layout()
+            fig9.savefig(output_dir / "tail_suffix_levels_adv_stats.png", dpi=160)
+            plt.close(fig9)
     except Exception as e:  # pragma: no cover
         print(f"[warn] 画图失败（可能未安装 matplotlib）: {e}")
 
@@ -720,6 +776,7 @@ def main() -> None:
     print(f"Wrote CSV: {quantile_csv_path}")
     print(f"Wrote CSV: {suffix_used_csv_path}")
     print(f"Wrote CSV: {top_suffix_csv_path}")
+    print(f"Wrote CSV: {tail_suffix_csv_path}")
     print(f"Wrote Summary: {summary_path}")
     print(f"Done. steps={len(steps)}, used={n_used}, skipped={n_bad}")
 
