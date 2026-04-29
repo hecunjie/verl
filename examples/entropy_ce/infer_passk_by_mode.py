@@ -56,6 +56,8 @@ def _policy_from_mode(mode: str) -> str:
         return "sampling_baseline"
     if mode == "min_f_mc":
         return "min_f_mc"
+    if mode == "max_f_mc":
+        return "max_f_mc"
     raise ValueError(f"unsupported mode: {mode}")
 
 
@@ -183,6 +185,7 @@ def _decode_many_minf_policy(
     max_branch_steps: int,
     eos_token_id: int | None,
     bucket_group_estimator: dict[str, Any] | None,
+    maximize_f: bool = False,
 ) -> tuple[list[list[int]], list[list[dict[str, Any]]]]:
     response_ids: list[list[int]] = [[] for _ in range(num_samples)]
     traces: list[list[dict[str, Any]]] = [[] for _ in range(num_samples)]
@@ -259,7 +262,7 @@ def _decode_many_minf_policy(
             if remaining <= 0:
                 for idx in branch_indices:
                     chosen_by_idx[idx] = int(cands_by_idx[idx][0])
-            elif selection_f_mode in {"greedy_path", "mc"}:
+            elif selection_f_mode in {"greedy_path", "mc", "mc_max"}:
                 if selection_f_mode == "greedy_path":
                     m_samples_use, temp_use, top_p_use = 1, 0.0, 1.0
                 else:
@@ -297,7 +300,9 @@ def _decode_many_minf_policy(
                     if not f_values or len(f_values) != len(cands):
                         chosen = int(cands[0])
                     else:
-                        best_i = int(np.argmin(np.array(f_values, dtype=np.float64)))
+                        arr_f = np.array(f_values, dtype=np.float64)
+                        prefer_max = bool(maximize_f) or str(selection_f_mode) == "mc_max"
+                        best_i = int(np.argmax(arr_f)) if prefer_max else int(np.argmin(arr_f))
                         chosen = int(cands[best_i])
                     chosen_by_idx[idx] = chosen
                     traces[idx].append(
@@ -342,7 +347,8 @@ def _decode_many_minf_policy(
                             f_values.append(float(_bucket_estimate_bar_f(bucket_group_estimator, p_rate)))
                     else:
                         raise ValueError(f"unsupported selection_f_mode: {selection_f_mode}")
-                    best_i = int(np.argmin(np.array(f_values, dtype=np.float64)))
+                    arr_f = np.array(f_values, dtype=np.float64)
+                    best_i = int(np.argmax(arr_f)) if maximize_f else int(np.argmin(arr_f))
                     chosen = int(cands[best_i])
                     chosen_by_idx[idx] = chosen
                     traces[idx].append(
@@ -377,7 +383,7 @@ def main() -> None:
     parser.add_argument("--input_data", type=str, required=True)
     parser.add_argument("--model_path", type=str, required=True)
     parser.add_argument("--output_dir", type=str, required=True)
-    parser.add_argument("--mode", choices=["greedy", "sampling", "min_f_mc"], required=True)
+    parser.add_argument("--mode", choices=["greedy", "sampling", "min_f_mc", "max_f_mc"], required=True)
     parser.add_argument("--num_samples_per_prompt", type=int, default=32)
     parser.add_argument("--pass_k_small", type=int, default=4)
     parser.add_argument("--pass_k_large", type=int, default=32)
@@ -391,7 +397,7 @@ def main() -> None:
     parser.add_argument("--candidate_max_k", type=int, default=5)
     parser.add_argument(
         "--selection_f_mode",
-        choices=["mc", "greedy_path", "lookahead_1step", "bucket_group_estimate"],
+        choices=["mc", "mc_max", "greedy_path", "lookahead_1step", "bucket_group_estimate"],
         default="greedy_path",
     )
     parser.add_argument("--max_branch_steps", type=int, default=0)
@@ -406,7 +412,7 @@ def main() -> None:
         "--minf_sample_parallel_batch",
         type=int,
         default=8,
-        help="For mode=min_f_mc, how many samples to decode in parallel per prompt.",
+        help="For mode=min_f_mc/max_f_mc, how many samples to decode in parallel per prompt.",
     )
     parser.add_argument("--bias_metrics_mode", choices=["raw", "length_normalized"], default="length_normalized")
     parser.add_argument("--f_continuation_mode", choices=["full", "first_sentence"], default="first_sentence")
@@ -533,7 +539,7 @@ def main() -> None:
         ground_truth = _ground_truth_from_row(row)
 
         bucket_estimator: dict[str, Any] | None = None
-        if policy == "min_f_mc" and str(args.selection_f_mode) == "bucket_group_estimate":
+        if policy in {"min_f_mc", "max_f_mc"} and str(args.selection_f_mode) == "bucket_group_estimate":
             bucket_estimator = _build_bucket_group_estimator(
                 llm=llm,
                 prompt_ids=prompt_ids,
@@ -605,6 +611,7 @@ def main() -> None:
                     max_branch_steps=int(args.max_branch_steps),
                     eos_token_id=tokenizer.eos_token_id,
                     bucket_group_estimator=bucket_estimator,
+                    maximize_f=(policy == "max_f_mc"),
                 )
                 for response_ids in batched_ids:
                     text = tokenizer.decode(response_ids, skip_special_tokens=True)
