@@ -121,6 +121,20 @@ def main() -> None:
         default=1e-12,
         help="计算 P(correct) 时，将 |adv|<=eps 视为 0 并从分母剔除。",
     )
+    parser.add_argument("--q_key", type=str, default="q", help="用于 q 近邻统计的字段名。")
+    parser.add_argument("--h_t_key", type=str, default="h_t", help="用于 q 近邻统计的 token 熵字段名。")
+    parser.add_argument(
+        "--q_target_high",
+        type=float,
+        default=0.8,
+        help="q 近邻统计中的高目标值。",
+    )
+    parser.add_argument(
+        "--q_target_low",
+        type=float,
+        default=0.2,
+        help="q 近邻统计中的低目标值。",
+    )
     args = parser.parse_args()
 
     input_dir = Path(args.input_dir).expanduser().resolve()
@@ -132,6 +146,7 @@ def main() -> None:
         raise SystemExit(f"未在目录中找到 jsonl: {input_dir}")
 
     raw_by_step: dict[int, list[dict[str, float]]] = {}
+    q_probe_by_step: dict[int, list[dict[str, float]]] = {}
     n_lines = 0
     n_used = 0
     n_bad = 0
@@ -163,6 +178,8 @@ def main() -> None:
                 suffix_rate = _safe_float(rec.get(args.suffix_rate_key))
                 m_value = _safe_float(rec.get(args.m_key))
                 advantage = _safe_float(rec.get(args.advantage_key))
+                q_value = _safe_float(rec.get(args.q_key))
+                h_t_value = _safe_float(rec.get(args.h_t_key))
                 if advantage is None:
                     n_bad += 1
                     continue
@@ -180,6 +197,14 @@ def main() -> None:
                         "advantage": float(advantage),
                     }
                 )
+                if q_value is not None and h_t_value is not None and suffix_rate is not None:
+                    q_probe_by_step.setdefault(step, []).append(
+                        {
+                            "q": float(q_value),
+                            "h_t": float(h_t_value),
+                            "suffix_rate": float(suffix_rate),
+                        }
+                    )
                 n_used += 1
 
     if not raw_by_step:
@@ -307,6 +332,10 @@ def main() -> None:
         "m_key": args.m_key,
         "m_equal_eps": float(args.m_equal_eps),
         "advantage_key": args.advantage_key,
+        "q_key": args.q_key,
+        "h_t_key": args.h_t_key,
+        "q_target_high": float(args.q_target_high),
+        "q_target_low": float(args.q_target_low),
         "adv_zero_eps": float(args.adv_zero_eps),
         "p_correct_definition": "count(adv>0) / count(|adv|>adv_zero_eps)",
         "min_group_count": int(min_group_count),
@@ -315,6 +344,47 @@ def main() -> None:
     summary_path = output_dir / "fepo_lowtail_highhead_summary.json"
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
+
+    q_targets_rows: list[dict[str, float | int]] = []
+    for step in steps:
+        candidates = q_probe_by_step.get(step, [])
+        if not candidates:
+            continue
+        q_arr = np.array([x["q"] for x in candidates], dtype=np.float64)
+        h_arr = np.array([x["h_t"] for x in candidates], dtype=np.float64)
+        s_arr = np.array([x["suffix_rate"] for x in candidates], dtype=np.float64)
+        idx_high = int(np.argmin(np.abs(q_arr - float(args.q_target_high))))
+        idx_low = int(np.argmin(np.abs(q_arr - float(args.q_target_low))))
+        q_targets_rows.append(
+            {
+                "step": int(step),
+                "n_candidates_with_q_h_suffix": int(q_arr.size),
+                "q_target_high": float(args.q_target_high),
+                "q_nearest_high": float(q_arr[idx_high]),
+                "abs_diff_high": float(abs(q_arr[idx_high] - float(args.q_target_high))),
+                "suffix_rate_at_q_high": float(s_arr[idx_high]),
+                "h_t_at_q_high": float(h_arr[idx_high]),
+                "q_target_low": float(args.q_target_low),
+                "q_nearest_low": float(q_arr[idx_low]),
+                "abs_diff_low": float(abs(q_arr[idx_low] - float(args.q_target_low))),
+                "suffix_rate_at_q_low": float(s_arr[idx_low]),
+                "h_t_at_q_low": float(h_arr[idx_low]),
+            }
+        )
+
+    q_targets_csv_path = output_dir / "q_target_nearest_suffix_ht_by_step.csv"
+    with open(q_targets_csv_path, "w", encoding="utf-8") as f:
+        f.write(
+            "step,n_candidates_with_q_h_suffix,"
+            "q_target_high,q_nearest_high,abs_diff_high,suffix_rate_at_q_high,h_t_at_q_high,"
+            "q_target_low,q_nearest_low,abs_diff_low,suffix_rate_at_q_low,h_t_at_q_low\n"
+        )
+        for r in q_targets_rows:
+            f.write(
+                f"{r['step']},{r['n_candidates_with_q_h_suffix']},"
+                f"{r['q_target_high']:.8f},{r['q_nearest_high']:.8f},{r['abs_diff_high']:.8f},{r['suffix_rate_at_q_high']:.8f},{r['h_t_at_q_high']:.8f},"
+                f"{r['q_target_low']:.8f},{r['q_nearest_low']:.8f},{r['abs_diff_low']:.8f},{r['suffix_rate_at_q_low']:.8f},{r['h_t_at_q_low']:.8f}\n"
+            )
 
     try:
         import matplotlib
@@ -369,10 +439,38 @@ def main() -> None:
         fig3.tight_layout()
         fig3.savefig(output_dir / "e_adv_four_conditions.png", dpi=160)
         plt.close(fig3)
+
+        if q_targets_rows:
+            xq = np.array([r["step"] for r in q_targets_rows], dtype=np.float64)
+            suffix_high = np.array([r["suffix_rate_at_q_high"] for r in q_targets_rows], dtype=np.float64)
+            suffix_low = np.array([r["suffix_rate_at_q_low"] for r in q_targets_rows], dtype=np.float64)
+            ht_high = np.array([r["h_t_at_q_high"] for r in q_targets_rows], dtype=np.float64)
+            ht_low = np.array([r["h_t_at_q_low"] for r in q_targets_rows], dtype=np.float64)
+
+            fig4, (ax4, ax5) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+            ax4.plot(xq, suffix_high, label=f"suffix rate @ q~{float(args.q_target_high):.2f}", color="tab:blue", linewidth=2)
+            ax4.plot(xq, suffix_low, label=f"suffix rate @ q~{float(args.q_target_low):.2f}", color="tab:orange", linewidth=2)
+            ax4.set_ylabel("suffix rate")
+            ax4.set_title("Nearest-q suffix entropy metric by step")
+            ax4.grid(True, alpha=0.3)
+            ax4.legend()
+
+            ax5.plot(xq, ht_high, label=f"h_t @ q~{float(args.q_target_high):.2f}", color="tab:green", linewidth=2)
+            ax5.plot(xq, ht_low, label=f"h_t @ q~{float(args.q_target_low):.2f}", color="tab:red", linewidth=2)
+            ax5.set_xlabel("step")
+            ax5.set_ylabel("h_t")
+            ax5.set_title("Nearest-q h_t by step")
+            ax5.grid(True, alpha=0.3)
+            ax5.legend()
+
+            fig4.tight_layout()
+            fig4.savefig(output_dir / "q_target_nearest_suffix_ht_by_step.png", dpi=160)
+            plt.close(fig4)
     except Exception as e:  # pragma: no cover
         print(f"[warn] 画图失败（可能未安装 matplotlib）: {e}")
 
     print(f"Wrote CSV: {csv_path}")
+    print(f"Wrote CSV: {q_targets_csv_path}")
     print(f"Wrote Summary: {summary_path}")
     print(f"Done. steps={len(steps)}, used={n_used}, skipped={n_bad}")
 
