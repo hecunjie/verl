@@ -67,13 +67,14 @@ FEPO_H_THRESHOLD="${FEPO_H_THRESHOLD:-2.0}"  # 复用现有熵阈值参数
 FEPO_ALPHA="${FEPO_ALPHA:-0.2}"              # m = 1 + alpha * I(q<=beta)
 FEPO_BETA="${FEPO_BETA:-0.2}"                # low-tail 分位阈值
 FEPO_HIGH_HEAD_PENALTY="${FEPO_HIGH_HEAD_PENALTY:-0.0}"  # m = 1 - penalty * I(q>=1-beta)
-FEPO_SUFFIX_MODE="${FEPO_SUFFIX_MODE:-sentence}"   # sentence / full
+FEPO_SUFFIX_MODE="${FEPO_SUFFIX_MODE:-sentence}"   # sentence / full / fixed_window
 FEPO_F_SENTENCE_STOP="${FEPO_F_SENTENCE_STOP:-simple}"  # simple / pysbd
 FEPO_SENTENCE_MIN_SUFFIX_TOKENS="${FEPO_SENTENCE_MIN_SUFFIX_TOKENS:-5}"
 FEPO_SENTENCE_NUM_THREADS="${FEPO_SENTENCE_NUM_THREADS:-8}"
 FEPO_SENTENCE_ONLY_HIGH_ENTROPY="${FEPO_SENTENCE_ONLY_HIGH_ENTROPY:-true}"
 FEPO_SENTENCE_MAX_SCAN_TOKENS="${FEPO_SENTENCE_MAX_SCAN_TOKENS:-256}"
 FEPO_SENTENCE_HIGH_ENTROPY_RATIO="${FEPO_SENTENCE_HIGH_ENTROPY_RATIO:-0.01}"
+FEPO_FIXED_WINDOW_TOKENS="${FEPO_FIXED_WINDOW_TOKENS:-32}"  # used when FEPO_SUFFIX_MODE=fixed_window
 FEPO_ENTROPY_TOP_P="${FEPO_ENTROPY_TOP_P:-0.95}"  # 1.0=全词表熵，<1 为 topp 截断熵
 FEPO_DUMP_FREQ="${FEPO_DUMP_FREQ:-50}"
 
@@ -111,6 +112,7 @@ python3 -m verl.trainer.main_ppo \
   +algorithm.fepo.sentence_only_high_entropy="${FEPO_SENTENCE_ONLY_HIGH_ENTROPY}" \
   +algorithm.fepo.sentence_max_scan_tokens="${FEPO_SENTENCE_MAX_SCAN_TOKENS}" \
   +algorithm.fepo.sentence_high_entropy_ratio="${FEPO_SENTENCE_HIGH_ENTROPY_RATIO}" \
+  +algorithm.fepo.fixed_window_tokens="${FEPO_FIXED_WINDOW_TOKENS}" \
   +algorithm.fepo.entropy_top_p="${FEPO_ENTROPY_TOP_P}" \
   data.train_files="${TRAIN_FILES}" \
   data.val_files="['${MATH500_VAL}','${AIME24_VAL}']" \

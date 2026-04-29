@@ -77,13 +77,14 @@ FEPO_BETA="${FEPO_BETA:-0.2}"
 FEPO_HIGH_HEAD_PENALTY="${FEPO_HIGH_HEAD_PENALTY:-0.2}"
 
 # Suffix entropy mode
-FEPO_SUFFIX_MODE="${FEPO_SUFFIX_MODE:-sentence}"                  # sentence / full
+FEPO_SUFFIX_MODE="${FEPO_SUFFIX_MODE:-sentence}"                  # sentence / full / fixed_window
 FEPO_F_SENTENCE_STOP="${FEPO_F_SENTENCE_STOP:-simple}"           # simple / pysbd
 FEPO_SENTENCE_MIN_SUFFIX_TOKENS="${FEPO_SENTENCE_MIN_SUFFIX_TOKENS:-5}"
 FEPO_SENTENCE_ONLY_HIGH_ENTROPY="${FEPO_SENTENCE_ONLY_HIGH_ENTROPY:-true}"
 FEPO_SENTENCE_HIGH_ENTROPY_RATIO="${FEPO_SENTENCE_HIGH_ENTROPY_RATIO:-0.01}"   # per-response cap
 FEPO_SENTENCE_MAX_SCAN_TOKENS="${FEPO_SENTENCE_MAX_SCAN_TOKENS:-256}"           # per-point scan cap
 FEPO_SENTENCE_NUM_THREADS="${FEPO_SENTENCE_NUM_THREADS:-64}"
+FEPO_FIXED_WINDOW_TOKENS="${FEPO_FIXED_WINDOW_TOKENS:-16}"       # used when FEPO_SUFFIX_MODE=fixed_window
 
 # Entropy estimator in FEPO path
 FEPO_ENTROPY_TOP_P="${FEPO_ENTROPY_TOP_P:-0.95}"                 # 1.0 => full-vocab entropy
@@ -129,6 +130,7 @@ python3 -m verl.trainer.main_ppo \
   +algorithm.fepo.sentence_high_entropy_ratio="${FEPO_SENTENCE_HIGH_ENTROPY_RATIO}" \
   +algorithm.fepo.sentence_max_scan_tokens="${FEPO_SENTENCE_MAX_SCAN_TOKENS}" \
   +algorithm.fepo.sentence_num_threads="${FEPO_SENTENCE_NUM_THREADS}" \
+  +algorithm.fepo.fixed_window_tokens="${FEPO_FIXED_WINDOW_TOKENS}" \
   +algorithm.fepo.entropy_top_p="${FEPO_ENTROPY_TOP_P}" \
   data.train_files="${TRAIN_FILES}" \
   data.val_files="['${MATH500_VAL}','${AIME24_VAL}']" \

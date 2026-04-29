@@ -255,6 +255,50 @@ def _suffix_entropy_rate_to_sentence_end_simple_fast(
     return out, keep, int(n_filtered_short)
 
 
+def _suffix_entropy_rate_fixed_window(
+    entropy: torch.Tensor,
+    response_mask: torch.Tensor,
+    *,
+    window_tokens: int,
+    min_suffix_tokens: int,
+    eligible_mask: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Fixed-window suffix entropy-rate from t+1 to t+window_tokens."""
+    B, T = entropy.shape
+    out_cpu = torch.full((B, T), float("nan"), dtype=entropy.dtype, device="cpu")
+    keep_cpu = torch.zeros((B, T), dtype=torch.int32, device="cpu")
+    n_filtered_short = 0
+    min_k = max(int(min_suffix_tokens), 1)
+    w = max(int(window_tokens), 1)
+    ent_cpu = entropy.detach().cpu().float()
+    mask_cpu = response_mask.detach().cpu().bool()
+    eligible_cpu = eligible_mask.detach().cpu().bool() if eligible_mask is not None else None
+
+    for b in range(B):
+        n = int(mask_cpu[b].sum().item())
+        if n <= 1:
+            continue
+        row_ent = ent_cpu[b, :n]
+        csum = torch.zeros((n + 1,), dtype=row_ent.dtype)
+        csum[1:] = torch.cumsum(row_ent, dim=0)
+        for t in range(n - 1):
+            if eligible_cpu is not None and not bool(eligible_cpu[b, t].item()):
+                continue
+            s = t + 1
+            e = min(n - 1, t + w)
+            k = e - s + 1
+            if k < min_k:
+                n_filtered_short += 1
+                continue
+            seg_sum = csum[e + 1] - csum[s]
+            out_cpu[b, t] = (seg_sum / float(k)).to(dtype=entropy.dtype)
+            keep_cpu[b, t] = int(k)
+
+    out = out_cpu.to(device=entropy.device)
+    keep = keep_cpu.to(device=entropy.device)
+    return out, keep, int(n_filtered_short)
+
+
 def _run_fepo_lowtail_adv_phase(
     batch: DataProto,
     tokenizer: Any,
@@ -283,6 +327,7 @@ def _run_fepo_lowtail_adv_phase(
     sentence_only_high_entropy = bool(fepo_cfg.get("sentence_only_high_entropy", True))
     sentence_max_scan_tokens = int(fepo_cfg.get("sentence_max_scan_tokens", 256))
     sentence_high_entropy_ratio = float(fepo_cfg.get("sentence_high_entropy_ratio", 0.01))
+    fixed_window_tokens = int(fepo_cfg.get("fixed_window_tokens", 32))
     alpha = max(alpha, 0.0)
     high_head_penalty = max(high_head_penalty, 0.0)
     beta = float(np.clip(beta, 0.0, 1.0))
@@ -334,6 +379,15 @@ def _run_fepo_lowtail_adv_phase(
                 sentence_stop_check=stop_check,
                 min_suffix_tokens=sentence_min_suffix_tokens,
             )
+    elif suffix_mode == "fixed_window":
+        eligible_mask = eligible_cap_mask if sentence_only_high_entropy else None
+        f_rate, keep_k, n_filtered_short_sentence = _suffix_entropy_rate_fixed_window(
+            entropy,
+            response_mask,
+            window_tokens=fixed_window_tokens,
+            min_suffix_tokens=sentence_min_suffix_tokens,
+            eligible_mask=eligible_mask,
+        )
     else:
         f_rate = _suffix_entropy_rate_exclusive(entropy, response_mask)
         n_filtered_short_sentence = 0
@@ -389,7 +443,11 @@ def _run_fepo_lowtail_adv_phase(
     n_resp = int(response_mask.sum().item())
     n_low = int(low_mask.sum().item())
     low_entropy_vals = entropy[low_mask]
-    n_sentence_used = int((keep_k >= max(sentence_min_suffix_tokens, 1)).sum().item()) if suffix_mode == "sentence" else 0
+    n_suffix_used = (
+        int((keep_k >= max(sentence_min_suffix_tokens, 1)).sum().item())
+        if suffix_mode in {"sentence", "fixed_window"}
+        else 0
+    )
     # Distribution stats on valid suffix-rate positions.
     f_valid_all = f_rate[response_mask & torch.isfinite(f_rate)].float()
     f_valid_high = f_rate[high_mask].float()
@@ -442,13 +500,15 @@ def _run_fepo_lowtail_adv_phase(
         if low_entropy_vals.numel() > 0
         else float("nan"),
         "fepo/suffix_mode_sentence": 1.0 if suffix_mode == "sentence" else 0.0,
+        "fepo/suffix_mode_fixed_window": 1.0 if suffix_mode == "fixed_window" else 0.0,
         "fepo/sentence_min_suffix_tokens": float(max(sentence_min_suffix_tokens, 1)),
         "fepo/sentence_num_threads": float(max(sentence_num_threads, 1)),
         "fepo/sentence_only_high_entropy": 1.0 if sentence_only_high_entropy else 0.0,
         "fepo/sentence_max_scan_tokens": float(max(sentence_max_scan_tokens, 0)),
         "fepo/sentence_high_entropy_ratio": float(max(sentence_high_entropy_ratio, 0.0)),
+        "fepo/fixed_window_tokens": float(max(fixed_window_tokens, 1)),
         "fepo/sentence_high_entropy_cap_count": float(eligible_cap_mask.sum().item()),
-        "fepo/sentence_positions_used": float(n_sentence_used),
+        "fepo/sentence_positions_used": float(n_suffix_used),
         "fepo/sentence_positions_filtered_short": float(n_filtered_short_sentence),
         "fepo/f_suffix_rate_mean_all_valid": float(torch.mean(f_valid_all).item()) if f_valid_all.numel() > 0 else float("nan"),
         "fepo/f_suffix_rate_p10_all_valid": _pct(f_valid_all, 0.10),
