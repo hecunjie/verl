@@ -675,7 +675,7 @@ def _decode_one_policy(
                         m_samples_use = 1
                         temp_use = 0.0
                         top_p_use = 1.0
-                    elif selection_f_mode == "mc":
+                    elif selection_f_mode in {"mc", "mc_max"}:
                         m_samples_use = int(mc_m_samples)
                         temp_use = float(mc_temperature)
                         top_p_use = float(mc_top_p)
@@ -748,7 +748,7 @@ def _decode_one_policy(
                     else:
                         raise ValueError(f"unsupported selection_f_mode: {selection_f_mode}")
 
-                    if selection_f_mode in ("greedy_path", "mc"):
+                    if selection_f_mode in ("greedy_path", "mc", "mc_max"):
                         n_req = len(prefixes) * int(m_samples_use)
                         bs = int(vllm_request_batch_chunk_mc)
                         chunk_starts = range(0, n_req, bs)
@@ -781,7 +781,11 @@ def _decode_one_policy(
                         if not f_values or len(f_values) != len(cands):
                             chosen_token = int(cands[0])
                         else:
-                            best_i = int(np.argmin(np.array(f_values, dtype=np.float64)))
+                            arr_f = np.array(f_values, dtype=np.float64)
+                            if selection_f_mode == "mc_max":
+                                best_i = int(np.argmax(arr_f))
+                            else:
+                                best_i = int(np.argmin(arr_f))
                             chosen_token = int(cands[best_i])
             else:
                 raise ValueError(f"unsupported policy: {policy}")
@@ -845,10 +849,11 @@ def main() -> None:
     parser.add_argument("--candidate_max_k", type=int, default=5)
     parser.add_argument(
         "--selection_f_mode",
-        choices=["mc", "greedy_path", "lookahead_1step", "bucket_group_estimate", "rm_score_mc"],
+        choices=["mc", "mc_max", "greedy_path", "lookahead_1step", "bucket_group_estimate", "rm_score_mc"],
         default="greedy_path",
         help=(
             "How to select branch token in min-F policy: mc (min expected F by multi-sample), "
+            "mc_max (max expected F by multi-sample), "
             "greedy_path, lookahead_1step, bucket_group_estimate, or rm_score_mc "
             "(max expected reward over MC-sampled continuations)."
         ),
