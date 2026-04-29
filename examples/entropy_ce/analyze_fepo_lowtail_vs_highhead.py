@@ -124,6 +124,12 @@ def main() -> None:
     parser.add_argument("--q_key", type=str, default="q", help="用于 q 近邻统计的字段名。")
     parser.add_argument("--h_t_key", type=str, default="h_t", help="用于 q 近邻统计的 token 熵字段名。")
     parser.add_argument(
+        "--suffix_tokens_used_key",
+        type=str,
+        default="suffix_tokens_used",
+        help="用于统计 suffix_tokens_used 均值的字段名。",
+    )
+    parser.add_argument(
         "--q_target_high",
         type=float,
         default=0.8,
@@ -159,6 +165,7 @@ def main() -> None:
 
     raw_by_step: dict[int, list[dict[str, float]]] = {}
     q_probe_by_step: dict[int, list[dict[str, float]]] = {}
+    suffix_used_by_step: dict[int, list[float]] = {}
     n_lines = 0
     n_used = 0
     n_bad = 0
@@ -192,6 +199,7 @@ def main() -> None:
                 advantage = _safe_float(rec.get(args.advantage_key))
                 q_value = _safe_float(rec.get(args.q_key))
                 h_t_value = _safe_float(rec.get(args.h_t_key))
+                suffix_tokens_used = _safe_float(rec.get(args.suffix_tokens_used_key))
                 if advantage is None:
                     n_bad += 1
                     continue
@@ -217,6 +225,8 @@ def main() -> None:
                             "suffix_rate": float(suffix_rate),
                         }
                     )
+                if suffix_tokens_used is not None and suffix_tokens_used >= 0:
+                    suffix_used_by_step.setdefault(step, []).append(float(suffix_tokens_used))
                 n_used += 1
 
     if not raw_by_step:
@@ -346,6 +356,7 @@ def main() -> None:
         "advantage_key": args.advantage_key,
         "q_key": args.q_key,
         "h_t_key": args.h_t_key,
+        "suffix_tokens_used_key": args.suffix_tokens_used_key,
         "q_target_high": float(args.q_target_high),
         "q_target_low": float(args.q_target_low),
         "adv_zero_eps": float(args.adv_zero_eps),
@@ -425,6 +436,35 @@ def main() -> None:
             values += [f"{float(r[c]):.8f}" for c in suffix_cols]
             values += [f"{float(r[c]):.8f}" for c in ht_cols]
             f.write(",".join(values) + "\n")
+
+    suffix_used_rows: list[dict[str, float | int]] = []
+    for step in steps:
+        vals = suffix_used_by_step.get(step, [])
+        if not vals:
+            suffix_used_rows.append(
+                {
+                    "step": int(step),
+                    "n_suffix_tokens_used_valid": 0,
+                    "mean_suffix_tokens_used": float("nan"),
+                }
+            )
+            continue
+        arr = np.array(vals, dtype=np.float64)
+        suffix_used_rows.append(
+            {
+                "step": int(step),
+                "n_suffix_tokens_used_valid": int(arr.size),
+                "mean_suffix_tokens_used": float(np.mean(arr)),
+            }
+        )
+
+    suffix_used_csv_path = output_dir / "suffix_tokens_used_mean_by_step.csv"
+    with open(suffix_used_csv_path, "w", encoding="utf-8") as f:
+        f.write("step,n_suffix_tokens_used_valid,mean_suffix_tokens_used\n")
+        for r in suffix_used_rows:
+            f.write(
+                f"{r['step']},{r['n_suffix_tokens_used_valid']},{r['mean_suffix_tokens_used']:.8f}\n"
+            )
 
     try:
         import matplotlib
@@ -537,12 +577,27 @@ def main() -> None:
             fig6.tight_layout()
             fig6.savefig(output_dir / "h_t_quantiles_by_step.png", dpi=160)
             plt.close(fig6)
+
+        if suffix_used_rows:
+            xs_su = np.array([r["step"] for r in suffix_used_rows], dtype=np.float64)
+            ys_su = np.array([r["mean_suffix_tokens_used"] for r in suffix_used_rows], dtype=np.float64)
+            fig7, ax9 = plt.subplots(figsize=(10, 5))
+            ax9.plot(xs_su, ys_su, color="tab:purple", linewidth=2, label="mean suffix_tokens_used")
+            ax9.set_xlabel("step")
+            ax9.set_ylabel("mean suffix_tokens_used")
+            ax9.set_title("Mean suffix_tokens_used by step")
+            ax9.grid(True, alpha=0.3)
+            ax9.legend()
+            fig7.tight_layout()
+            fig7.savefig(output_dir / "mean_suffix_tokens_used_by_step.png", dpi=160)
+            plt.close(fig7)
     except Exception as e:  # pragma: no cover
         print(f"[warn] 画图失败（可能未安装 matplotlib）: {e}")
 
     print(f"Wrote CSV: {csv_path}")
     print(f"Wrote CSV: {q_targets_csv_path}")
     print(f"Wrote CSV: {quantile_csv_path}")
+    print(f"Wrote CSV: {suffix_used_csv_path}")
     print(f"Wrote Summary: {summary_path}")
     print(f"Done. steps={len(steps)}, used={n_used}, skipped={n_bad}")
 
