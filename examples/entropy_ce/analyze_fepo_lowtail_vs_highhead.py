@@ -109,6 +109,12 @@ def main() -> None:
         default=1,
         help="每个组在每个 step 的最小样本数，不足则该 step 记为 NaN。",
     )
+    parser.add_argument(
+        "--m_equal_eps",
+        type=float,
+        default=1e-8,
+        help="group_mode=m 时，将 |m-1|<=eps 视为 m==1 并过滤。",
+    )
     args = parser.parse_args()
 
     input_dir = Path(args.input_dir).expanduser().resolve()
@@ -123,6 +129,7 @@ def main() -> None:
     n_lines = 0
     n_used = 0
     n_bad = 0
+    n_dropped_m_eq_1 = 0
 
     for p in paths:
         with open(p, encoding="utf-8") as f:
@@ -183,7 +190,8 @@ def main() -> None:
         adv = np.array([x["advantage"] for x in items], dtype=np.float64)
 
         if args.group_mode == "m":
-            valid_mask = m_vals != 1.0
+            valid_mask = np.abs(m_vals - 1.0) > float(args.m_equal_eps)
+            n_dropped_m_eq_1 += int(np.sum(~valid_mask))
             sr = sr[valid_mask]
             m_vals = m_vals[valid_mask]
             adv = adv[valid_mask]
@@ -218,11 +226,14 @@ def main() -> None:
         e_adv_low_neg = float(np.mean(adv[low_neg_mask])) if n_low_neg >= min_group_count else float("nan")
         e_adv_high_neg = float(np.mean(adv[high_neg_mask])) if n_high_neg >= min_group_count else float("nan")
 
+        n_drop_step = int(np.sum(np.abs(np.array([x["m_value"] for x in items], dtype=np.float64) - 1.0) <= float(args.m_equal_eps)))
+
         rows.append(
             {
                 "step": int(step),
                 "split_threshold": float(thr),
                 "n_total": int(adv.size),
+                "n_dropped_m_eq_1": n_drop_step,
                 "n_low_tail": n_low,
                 "n_high_head": n_high,
                 "n_low_tail_adv_pos": n_low_pos,
@@ -243,14 +254,14 @@ def main() -> None:
     csv_path = output_dir / "fepo_lowtail_highhead_by_step.csv"
     with open(csv_path, "w", encoding="utf-8") as f:
         f.write(
-            "step,split_threshold,n_total,n_low_tail,n_high_head,"
+            "step,split_threshold,n_total,n_dropped_m_eq_1,n_low_tail,n_high_head,"
             "n_low_tail_adv_pos,n_high_head_adv_pos,n_low_tail_adv_neg,n_high_head_adv_neg,"
             "p_correct_low_tail,p_correct_high_head,e_adv_low_tail,e_adv_high_head,"
             "e_adv_low_tail_adv_pos,e_adv_high_head_adv_pos,e_adv_low_tail_adv_neg,e_adv_high_head_adv_neg\n"
         )
         for r in rows:
             f.write(
-                f"{r['step']},{r['split_threshold']:.8f},{r['n_total']},{r['n_low_tail']},{r['n_high_head']},"
+                f"{r['step']},{r['split_threshold']:.8f},{r['n_total']},{r['n_dropped_m_eq_1']},{r['n_low_tail']},{r['n_high_head']},"
                 f"{r['n_low_tail_adv_pos']},{r['n_high_head_adv_pos']},{r['n_low_tail_adv_neg']},{r['n_high_head_adv_neg']},"
                 f"{r['p_correct_low_tail']:.8f},{r['p_correct_high_head']:.8f},"
                 f"{r['e_adv_low_tail']:.8f},{r['e_adv_high_head']:.8f},"
@@ -265,11 +276,13 @@ def main() -> None:
         "num_lines_total": n_lines,
         "num_lines_used": n_used,
         "num_lines_skipped": n_bad,
+        "num_lines_dropped_m_eq_1": int(n_dropped_m_eq_1),
         "split_mode": args.split_mode,
         "group_mode": args.group_mode,
         "fixed_suffix_threshold": float(args.fixed_suffix_threshold),
         "suffix_rate_key": args.suffix_rate_key,
         "m_key": args.m_key,
+        "m_equal_eps": float(args.m_equal_eps),
         "advantage_key": args.advantage_key,
         "p_correct_definition": "advantage > 0",
         "min_group_count": int(min_group_count),
