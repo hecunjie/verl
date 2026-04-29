@@ -115,6 +115,12 @@ def main() -> None:
         default=1e-8,
         help="group_mode=m 时，将 |m-1|<=eps 视为 m==1 并过滤。",
     )
+    parser.add_argument(
+        "--adv_zero_eps",
+        type=float,
+        default=1e-12,
+        help="计算 P(correct) 时，将 |adv|<=eps 视为 0 并从分母剔除。",
+    )
     args = parser.parse_args()
 
     input_dir = Path(args.input_dir).expanduser().resolve()
@@ -209,8 +215,21 @@ def main() -> None:
         n_low = int(np.sum(low_mask))
         n_high = int(np.sum(high_mask))
 
-        p_corr_low = float(np.mean(adv[low_mask] > 0.0)) if n_low >= min_group_count else float("nan")
-        p_corr_high = float(np.mean(adv[high_mask] > 0.0)) if n_high >= min_group_count else float("nan")
+        nonzero_mask = np.abs(adv) > float(args.adv_zero_eps)
+        low_nonzero_mask = low_mask & nonzero_mask
+        high_nonzero_mask = high_mask & nonzero_mask
+        n_low_nonzero = int(np.sum(low_nonzero_mask))
+        n_high_nonzero = int(np.sum(high_nonzero_mask))
+        p_corr_low = (
+            float(np.sum(adv[low_nonzero_mask] > 0.0) / n_low_nonzero)
+            if n_low_nonzero >= min_group_count
+            else float("nan")
+        )
+        p_corr_high = (
+            float(np.sum(adv[high_nonzero_mask] > 0.0) / n_high_nonzero)
+            if n_high_nonzero >= min_group_count
+            else float("nan")
+        )
         e_adv_low = float(np.mean(adv[low_mask])) if n_low >= min_group_count else float("nan")
         e_adv_high = float(np.mean(adv[high_mask])) if n_high >= min_group_count else float("nan")
         low_pos_mask = low_mask & (adv > 0.0)
@@ -236,6 +255,8 @@ def main() -> None:
                 "n_dropped_m_eq_1": n_drop_step,
                 "n_low_tail": n_low,
                 "n_high_head": n_high,
+                "n_low_tail_adv_nonzero": n_low_nonzero,
+                "n_high_head_adv_nonzero": n_high_nonzero,
                 "n_low_tail_adv_pos": n_low_pos,
                 "n_high_head_adv_pos": n_high_pos,
                 "n_low_tail_adv_neg": n_low_neg,
@@ -255,6 +276,7 @@ def main() -> None:
     with open(csv_path, "w", encoding="utf-8") as f:
         f.write(
             "step,split_threshold,n_total,n_dropped_m_eq_1,n_low_tail,n_high_head,"
+            "n_low_tail_adv_nonzero,n_high_head_adv_nonzero,"
             "n_low_tail_adv_pos,n_high_head_adv_pos,n_low_tail_adv_neg,n_high_head_adv_neg,"
             "p_correct_low_tail,p_correct_high_head,e_adv_low_tail,e_adv_high_head,"
             "e_adv_low_tail_adv_pos,e_adv_high_head_adv_pos,e_adv_low_tail_adv_neg,e_adv_high_head_adv_neg\n"
@@ -262,6 +284,7 @@ def main() -> None:
         for r in rows:
             f.write(
                 f"{r['step']},{r['split_threshold']:.8f},{r['n_total']},{r['n_dropped_m_eq_1']},{r['n_low_tail']},{r['n_high_head']},"
+                f"{r['n_low_tail_adv_nonzero']},{r['n_high_head_adv_nonzero']},"
                 f"{r['n_low_tail_adv_pos']},{r['n_high_head_adv_pos']},{r['n_low_tail_adv_neg']},{r['n_high_head_adv_neg']},"
                 f"{r['p_correct_low_tail']:.8f},{r['p_correct_high_head']:.8f},"
                 f"{r['e_adv_low_tail']:.8f},{r['e_adv_high_head']:.8f},"
@@ -284,7 +307,8 @@ def main() -> None:
         "m_key": args.m_key,
         "m_equal_eps": float(args.m_equal_eps),
         "advantage_key": args.advantage_key,
-        "p_correct_definition": "advantage > 0",
+        "adv_zero_eps": float(args.adv_zero_eps),
+        "p_correct_definition": "count(adv>0) / count(|adv|>adv_zero_eps)",
         "min_group_count": int(min_group_count),
         "steps_covered": steps,
     }
