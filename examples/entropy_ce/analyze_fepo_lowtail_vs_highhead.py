@@ -57,31 +57,6 @@ def _iter_jsonl_paths(input_dir: Path) -> list[Path]:
     return files
 
 
-def _is_correct_from_value(v: Any, threshold: float) -> int | None:
-    if isinstance(v, bool):
-        return int(v)
-    if isinstance(v, (int, float)):
-        x = float(v)
-        if not math.isfinite(x):
-            return None
-        if x in (0.0, 1.0):
-            return int(x)
-        return int(x >= threshold)
-    return None
-
-
-def _is_correct_from_advantage(adv: float, zero_as: str) -> int | None:
-    if adv > 0.0:
-        return 1
-    if adv < 0.0:
-        return 0
-    if zero_as == "correct":
-        return 1
-    if zero_as == "wrong":
-        return 0
-    return None
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
@@ -115,30 +90,6 @@ def main() -> None:
         type=str,
         default="adv_after",
         help="advantage 字段名（可改成 adv_before）。",
-    )
-    parser.add_argument(
-        "--correct_key",
-        type=str,
-        default="q",
-        help="correct 标签字段名（0/1 或 bool；若为连续值将按阈值二值化）。",
-    )
-    parser.add_argument(
-        "--correct_mode",
-        choices=["adv_sign", "field"],
-        default="adv_sign",
-        help="correct 定义：adv_sign=按 advantage 正负；field=按 correct_key。",
-    )
-    parser.add_argument(
-        "--correct_threshold",
-        type=float,
-        default=0.5,
-        help="当 correct_key 为连续值时，>= 该阈值视作 correct。",
-    )
-    parser.add_argument(
-        "--adv_zero_as",
-        choices=["ignore", "correct", "wrong"],
-        default="ignore",
-        help="correct_mode=adv_sign 时，adv=0 的处理方式。",
     )
     parser.add_argument(
         "--split_mode",
@@ -202,13 +153,6 @@ def main() -> None:
                 if advantage is None:
                     n_bad += 1
                     continue
-                if args.correct_mode == "adv_sign":
-                    correct = _is_correct_from_advantage(float(advantage), zero_as=str(args.adv_zero_as))
-                else:
-                    correct = _is_correct_from_value(rec.get(args.correct_key), threshold=float(args.correct_threshold))
-                if correct is None:
-                    n_bad += 1
-                    continue
                 if args.group_mode == "suffix_rate" and suffix_rate is None:
                     n_bad += 1
                     continue
@@ -221,7 +165,6 @@ def main() -> None:
                         "suffix_rate": float(suffix_rate) if suffix_rate is not None else float("nan"),
                         "m_value": float(m_value) if m_value is not None else float("nan"),
                         "advantage": float(advantage),
-                        "correct": float(correct),
                     }
                 )
                 n_used += 1
@@ -238,9 +181,12 @@ def main() -> None:
         sr = np.array([x["suffix_rate"] for x in items], dtype=np.float64)
         m_vals = np.array([x["m_value"] for x in items], dtype=np.float64)
         adv = np.array([x["advantage"] for x in items], dtype=np.float64)
-        corr = np.array([x["correct"] for x in items], dtype=np.float64)
 
         if args.group_mode == "m":
+            valid_mask = m_vals != 1.0
+            sr = sr[valid_mask]
+            m_vals = m_vals[valid_mask]
+            adv = adv[valid_mask]
             thr = 1.0
             low_mask = m_vals > 1.0
             high_mask = m_vals < 1.0
@@ -255,8 +201,8 @@ def main() -> None:
         n_low = int(np.sum(low_mask))
         n_high = int(np.sum(high_mask))
 
-        p_corr_low = float(np.mean(corr[low_mask])) if n_low >= min_group_count else float("nan")
-        p_corr_high = float(np.mean(corr[high_mask])) if n_high >= min_group_count else float("nan")
+        p_corr_low = float(np.mean(adv[low_mask] > 0.0)) if n_low >= min_group_count else float("nan")
+        p_corr_high = float(np.mean(adv[high_mask] > 0.0)) if n_high >= min_group_count else float("nan")
         e_adv_low = float(np.mean(adv[low_mask])) if n_low >= min_group_count else float("nan")
         e_adv_high = float(np.mean(adv[high_mask])) if n_high >= min_group_count else float("nan")
 
@@ -264,7 +210,7 @@ def main() -> None:
             {
                 "step": int(step),
                 "split_threshold": float(thr),
-                "n_total": int(sr.size),
+                "n_total": int(adv.size),
                 "n_low_tail": n_low,
                 "n_high_head": n_high,
                 "p_correct_low_tail": p_corr_low,
@@ -300,10 +246,7 @@ def main() -> None:
         "suffix_rate_key": args.suffix_rate_key,
         "m_key": args.m_key,
         "advantage_key": args.advantage_key,
-        "correct_mode": args.correct_mode,
-        "adv_zero_as": args.adv_zero_as,
-        "correct_key": args.correct_key,
-        "correct_threshold": float(args.correct_threshold),
+        "p_correct_definition": "advantage > 0",
         "min_group_count": int(min_group_count),
         "steps_covered": steps,
     }
