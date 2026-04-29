@@ -70,6 +70,18 @@ def _is_correct_from_value(v: Any, threshold: float) -> int | None:
     return None
 
 
+def _is_correct_from_advantage(adv: float, zero_as: str) -> int | None:
+    if adv > 0.0:
+        return 1
+    if adv < 0.0:
+        return 0
+    if zero_as == "correct":
+        return 1
+    if zero_as == "wrong":
+        return 0
+    return None
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
@@ -81,10 +93,22 @@ def main() -> None:
     parser.add_argument("--input_dir", type=str, required=True, help="包含多个 step.jsonl 的目录。")
     parser.add_argument("--output_dir", type=str, required=True, help="输出目录。")
     parser.add_argument(
+        "--group_mode",
+        choices=["suffix_rate", "m"],
+        default="m",
+        help="low-tail/high-head 分组方式：suffix_rate=按 f_suffix_rate 切分；m=按 m>1 或 m<1。",
+    )
+    parser.add_argument(
         "--suffix_rate_key",
         type=str,
         default="f_suffix_rate",
-        help="用于 low-tail/high-head 切分的字段名。",
+        help="group_mode=suffix_rate 时用于切分的字段名。",
+    )
+    parser.add_argument(
+        "--m_key",
+        type=str,
+        default="m",
+        help="group_mode=m 时使用的权重字段名（m>1: low-tail, m<1: high-head）。",
     )
     parser.add_argument(
         "--advantage_key",
@@ -95,14 +119,26 @@ def main() -> None:
     parser.add_argument(
         "--correct_key",
         type=str,
-        default="m",
+        default="q",
         help="correct 标签字段名（0/1 或 bool；若为连续值将按阈值二值化）。",
+    )
+    parser.add_argument(
+        "--correct_mode",
+        choices=["adv_sign", "field"],
+        default="adv_sign",
+        help="correct 定义：adv_sign=按 advantage 正负；field=按 correct_key。",
     )
     parser.add_argument(
         "--correct_threshold",
         type=float,
         default=0.5,
         help="当 correct_key 为连续值时，>= 该阈值视作 correct。",
+    )
+    parser.add_argument(
+        "--adv_zero_as",
+        choices=["ignore", "correct", "wrong"],
+        default="ignore",
+        help="correct_mode=adv_sign 时，adv=0 的处理方式。",
     )
     parser.add_argument(
         "--split_mode",
@@ -161,15 +197,29 @@ def main() -> None:
                     continue
 
                 suffix_rate = _safe_float(rec.get(args.suffix_rate_key))
+                m_value = _safe_float(rec.get(args.m_key))
                 advantage = _safe_float(rec.get(args.advantage_key))
-                correct = _is_correct_from_value(rec.get(args.correct_key), threshold=float(args.correct_threshold))
-                if suffix_rate is None or advantage is None or correct is None:
+                if advantage is None:
+                    n_bad += 1
+                    continue
+                if args.correct_mode == "adv_sign":
+                    correct = _is_correct_from_advantage(float(advantage), zero_as=str(args.adv_zero_as))
+                else:
+                    correct = _is_correct_from_value(rec.get(args.correct_key), threshold=float(args.correct_threshold))
+                if correct is None:
+                    n_bad += 1
+                    continue
+                if args.group_mode == "suffix_rate" and suffix_rate is None:
+                    n_bad += 1
+                    continue
+                if args.group_mode == "m" and m_value is None:
                     n_bad += 1
                     continue
 
                 raw_by_step.setdefault(step, []).append(
                     {
-                        "suffix_rate": float(suffix_rate),
+                        "suffix_rate": float(suffix_rate) if suffix_rate is not None else float("nan"),
+                        "m_value": float(m_value) if m_value is not None else float("nan"),
                         "advantage": float(advantage),
                         "correct": float(correct),
                     }
@@ -186,16 +236,22 @@ def main() -> None:
     for step in steps:
         items = raw_by_step[step]
         sr = np.array([x["suffix_rate"] for x in items], dtype=np.float64)
+        m_vals = np.array([x["m_value"] for x in items], dtype=np.float64)
         adv = np.array([x["advantage"] for x in items], dtype=np.float64)
         corr = np.array([x["correct"] for x in items], dtype=np.float64)
 
-        if args.split_mode == "median":
+        if args.group_mode == "m":
+            thr = 1.0
+            low_mask = m_vals > 1.0
+            high_mask = m_vals < 1.0
+        elif args.split_mode == "median":
             thr = float(np.median(sr))
+            low_mask = sr <= thr
+            high_mask = sr > thr
         else:
             thr = float(args.fixed_suffix_threshold)
-
-        low_mask = sr <= thr
-        high_mask = sr > thr
+            low_mask = sr <= thr
+            high_mask = sr > thr
         n_low = int(np.sum(low_mask))
         n_high = int(np.sum(high_mask))
 
@@ -239,9 +295,13 @@ def main() -> None:
         "num_lines_used": n_used,
         "num_lines_skipped": n_bad,
         "split_mode": args.split_mode,
+        "group_mode": args.group_mode,
         "fixed_suffix_threshold": float(args.fixed_suffix_threshold),
         "suffix_rate_key": args.suffix_rate_key,
+        "m_key": args.m_key,
         "advantage_key": args.advantage_key,
+        "correct_mode": args.correct_mode,
+        "adv_zero_as": args.adv_zero_as,
         "correct_key": args.correct_key,
         "correct_threshold": float(args.correct_threshold),
         "min_group_count": int(min_group_count),
