@@ -205,6 +205,18 @@ def main() -> None:
         p_corr_high = float(np.mean(adv[high_mask] > 0.0)) if n_high >= min_group_count else float("nan")
         e_adv_low = float(np.mean(adv[low_mask])) if n_low >= min_group_count else float("nan")
         e_adv_high = float(np.mean(adv[high_mask])) if n_high >= min_group_count else float("nan")
+        low_pos_mask = low_mask & (adv > 0.0)
+        high_pos_mask = high_mask & (adv > 0.0)
+        low_neg_mask = low_mask & (adv < 0.0)
+        high_neg_mask = high_mask & (adv < 0.0)
+        n_low_pos = int(np.sum(low_pos_mask))
+        n_high_pos = int(np.sum(high_pos_mask))
+        n_low_neg = int(np.sum(low_neg_mask))
+        n_high_neg = int(np.sum(high_neg_mask))
+        e_adv_low_pos = float(np.mean(adv[low_pos_mask])) if n_low_pos >= min_group_count else float("nan")
+        e_adv_high_pos = float(np.mean(adv[high_pos_mask])) if n_high_pos >= min_group_count else float("nan")
+        e_adv_low_neg = float(np.mean(adv[low_neg_mask])) if n_low_neg >= min_group_count else float("nan")
+        e_adv_high_neg = float(np.mean(adv[high_neg_mask])) if n_high_neg >= min_group_count else float("nan")
 
         rows.append(
             {
@@ -213,10 +225,18 @@ def main() -> None:
                 "n_total": int(adv.size),
                 "n_low_tail": n_low,
                 "n_high_head": n_high,
+                "n_low_tail_adv_pos": n_low_pos,
+                "n_high_head_adv_pos": n_high_pos,
+                "n_low_tail_adv_neg": n_low_neg,
+                "n_high_head_adv_neg": n_high_neg,
                 "p_correct_low_tail": p_corr_low,
                 "p_correct_high_head": p_corr_high,
                 "e_adv_low_tail": e_adv_low,
                 "e_adv_high_head": e_adv_high,
+                "e_adv_low_tail_adv_pos": e_adv_low_pos,
+                "e_adv_high_head_adv_pos": e_adv_high_pos,
+                "e_adv_low_tail_adv_neg": e_adv_low_neg,
+                "e_adv_high_head_adv_neg": e_adv_high_neg,
             }
         )
 
@@ -224,13 +244,18 @@ def main() -> None:
     with open(csv_path, "w", encoding="utf-8") as f:
         f.write(
             "step,split_threshold,n_total,n_low_tail,n_high_head,"
-            "p_correct_low_tail,p_correct_high_head,e_adv_low_tail,e_adv_high_head\n"
+            "n_low_tail_adv_pos,n_high_head_adv_pos,n_low_tail_adv_neg,n_high_head_adv_neg,"
+            "p_correct_low_tail,p_correct_high_head,e_adv_low_tail,e_adv_high_head,"
+            "e_adv_low_tail_adv_pos,e_adv_high_head_adv_pos,e_adv_low_tail_adv_neg,e_adv_high_head_adv_neg\n"
         )
         for r in rows:
             f.write(
                 f"{r['step']},{r['split_threshold']:.8f},{r['n_total']},{r['n_low_tail']},{r['n_high_head']},"
+                f"{r['n_low_tail_adv_pos']},{r['n_high_head_adv_pos']},{r['n_low_tail_adv_neg']},{r['n_high_head_adv_neg']},"
                 f"{r['p_correct_low_tail']:.8f},{r['p_correct_high_head']:.8f},"
-                f"{r['e_adv_low_tail']:.8f},{r['e_adv_high_head']:.8f}\n"
+                f"{r['e_adv_low_tail']:.8f},{r['e_adv_high_head']:.8f},"
+                f"{r['e_adv_low_tail_adv_pos']:.8f},{r['e_adv_high_head_adv_pos']:.8f},"
+                f"{r['e_adv_low_tail_adv_neg']:.8f},{r['e_adv_high_head_adv_neg']:.8f}\n"
             )
 
     summary = {
@@ -265,6 +290,10 @@ def main() -> None:
         p_high = np.array([r["p_correct_high_head"] for r in rows], dtype=np.float64)
         a_low = np.array([r["e_adv_low_tail"] for r in rows], dtype=np.float64)
         a_high = np.array([r["e_adv_high_head"] for r in rows], dtype=np.float64)
+        a_low_pos = np.array([r["e_adv_low_tail_adv_pos"] for r in rows], dtype=np.float64)
+        a_high_pos = np.array([r["e_adv_high_head_adv_pos"] for r in rows], dtype=np.float64)
+        a_low_neg = np.array([r["e_adv_low_tail_adv_neg"] for r in rows], dtype=np.float64)
+        a_high_neg = np.array([r["e_adv_high_head_adv_neg"] for r in rows], dtype=np.float64)
 
         fig1, ax1 = plt.subplots(figsize=(10, 5))
         ax1.plot(xs, p_low, label="P(correct | low-tail)", color="tab:blue", linewidth=2)
@@ -289,6 +318,50 @@ def main() -> None:
         fig2.tight_layout()
         fig2.savefig(output_dir / "e_adv_lowtail_vs_highhead.png", dpi=160)
         plt.close(fig2)
+
+        fig3, ax3 = plt.subplots(figsize=(10, 5))
+        ax3.plot(xs, a_low_pos, label="E[adv | low-tail, A>0]", color="tab:blue", linewidth=2)
+        ax3.set_xlabel("step")
+        ax3.set_ylabel("advantage")
+        ax3.set_title("E[adv | low-tail, A>0]")
+        ax3.grid(True, alpha=0.3)
+        ax3.legend()
+        fig3.tight_layout()
+        fig3.savefig(output_dir / "e_adv_lowtail_A_gt_0.png", dpi=160)
+        plt.close(fig3)
+
+        fig4, ax4 = plt.subplots(figsize=(10, 5))
+        ax4.plot(xs, a_high_pos, label="E[adv | high-head, A>0]", color="tab:orange", linewidth=2)
+        ax4.set_xlabel("step")
+        ax4.set_ylabel("advantage")
+        ax4.set_title("E[adv | high-head, A>0]")
+        ax4.grid(True, alpha=0.3)
+        ax4.legend()
+        fig4.tight_layout()
+        fig4.savefig(output_dir / "e_adv_highhead_A_gt_0.png", dpi=160)
+        plt.close(fig4)
+
+        fig5, ax5 = plt.subplots(figsize=(10, 5))
+        ax5.plot(xs, a_low_neg, label="E[adv | low-tail, A<0]", color="tab:green", linewidth=2)
+        ax5.set_xlabel("step")
+        ax5.set_ylabel("advantage")
+        ax5.set_title("E[adv | low-tail, A<0]")
+        ax5.grid(True, alpha=0.3)
+        ax5.legend()
+        fig5.tight_layout()
+        fig5.savefig(output_dir / "e_adv_lowtail_A_lt_0.png", dpi=160)
+        plt.close(fig5)
+
+        fig6, ax6 = plt.subplots(figsize=(10, 5))
+        ax6.plot(xs, a_high_neg, label="E[adv | high-head, A<0]", color="tab:red", linewidth=2)
+        ax6.set_xlabel("step")
+        ax6.set_ylabel("advantage")
+        ax6.set_title("E[adv | high-head, A<0]")
+        ax6.grid(True, alpha=0.3)
+        ax6.legend()
+        fig6.tight_layout()
+        fig6.savefig(output_dir / "e_adv_highhead_A_lt_0.png", dpi=160)
+        plt.close(fig6)
     except Exception as e:  # pragma: no cover
         print(f"[warn] 画图失败（可能未安装 matplotlib）: {e}")
 
