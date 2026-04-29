@@ -147,6 +147,12 @@ def main() -> None:
         default="0.1,0.2,0.3,0.5,0.8,0.9",
         help="用于分位图的分位点，逗号分隔。",
     )
+    parser.add_argument(
+        "--top_suffix_levels",
+        type=str,
+        default="0.1,0.2,0.3,0.5",
+        help="按后缀熵取 Top-K%% 的比例列表，逗号分隔。",
+    )
     args = parser.parse_args()
     quantile_levels = [float(x.strip()) for x in str(args.quantile_levels).split(",") if x.strip()]
     if not quantile_levels:
@@ -154,6 +160,12 @@ def main() -> None:
     for ql in quantile_levels:
         if not (0.0 <= ql <= 1.0):
             raise SystemExit(f"非法分位点 {ql}，必须在 [0,1]。")
+    top_suffix_levels = [float(x.strip()) for x in str(args.top_suffix_levels).split(",") if x.strip()]
+    if not top_suffix_levels:
+        raise SystemExit("--top_suffix_levels 不能为空。")
+    for tl in top_suffix_levels:
+        if not (0.0 < tl <= 1.0):
+            raise SystemExit(f"非法 top 比例 {tl}，必须在 (0,1]。")
 
     input_dir = Path(args.input_dir).expanduser().resolve()
     output_dir = Path(args.output_dir).expanduser().resolve()
@@ -447,6 +459,50 @@ def main() -> None:
             values += [f"{float(r[c]):.8f}" for c in ht_cols]
             f.write(",".join(values) + "\n")
 
+    top_suffix_rows: list[dict[str, float | int]] = []
+    for step in steps:
+        candidates = raw_by_step.get(step, [])
+        if not candidates:
+            continue
+        suffix_arr = np.array([x["suffix_rate"] for x in candidates], dtype=np.float64)
+        adv_arr = np.array([x["advantage"] for x in candidates], dtype=np.float64)
+        order = np.argsort(-suffix_arr)  # descending by suffix entropy metric
+        n = int(suffix_arr.size)
+        row: dict[str, float | int] = {"step": int(step), "n_candidates": n}
+        for tl in top_suffix_levels:
+            k = max(1, int(math.ceil(n * float(tl))))
+            idx = order[:k]
+            sub_adv = adv_arr[idx]
+            nonzero_mask = np.abs(sub_adv) > float(args.adv_zero_eps)
+            n_nonzero = int(np.sum(nonzero_mask))
+            p_pos = (
+                float(np.sum(sub_adv[nonzero_mask] > 0.0) / n_nonzero)
+                if n_nonzero >= min_group_count
+                else float("nan")
+            )
+            e_adv = float(np.mean(sub_adv)) if sub_adv.size >= min_group_count else float("nan")
+            tname = f"{tl:.1f}"
+            row[f"n_top{tname}"] = int(k)
+            row[f"n_top{tname}_adv_nonzero"] = int(n_nonzero)
+            row[f"p_pos_top{tname}"] = float(p_pos)
+            row[f"e_adv_top{tname}"] = float(e_adv)
+        top_suffix_rows.append(row)
+
+    top_suffix_csv_path = output_dir / "top_suffix_levels_adv_stats_by_step.csv"
+    with open(top_suffix_csv_path, "w", encoding="utf-8") as f:
+        n_cols = [f"n_top{tl:.1f}" for tl in top_suffix_levels]
+        nz_cols = [f"n_top{tl:.1f}_adv_nonzero" for tl in top_suffix_levels]
+        p_cols = [f"p_pos_top{tl:.1f}" for tl in top_suffix_levels]
+        e_cols = [f"e_adv_top{tl:.1f}" for tl in top_suffix_levels]
+        f.write("step,n_candidates," + ",".join(n_cols + nz_cols + p_cols + e_cols) + "\n")
+        for r in top_suffix_rows:
+            vals = [f"{r['step']}", f"{r['n_candidates']}"]
+            vals += [f"{int(r[c])}" for c in n_cols]
+            vals += [f"{int(r[c])}" for c in nz_cols]
+            vals += [f"{float(r[c]):.8f}" for c in p_cols]
+            vals += [f"{float(r[c]):.8f}" for c in e_cols]
+            f.write(",".join(vals) + "\n")
+
     suffix_used_rows: list[dict[str, float | int]] = []
     for step in steps:
         vals = suffix_used_by_step.get(step, [])
@@ -633,6 +689,29 @@ def main() -> None:
             fig7.tight_layout()
             fig7.savefig(output_dir / "mean_suffix_tokens_used_by_step.png", dpi=160)
             plt.close(fig7)
+
+        if top_suffix_rows:
+            xt = np.array([r["step"] for r in top_suffix_rows], dtype=np.float64)
+            fig8, (ax10, ax11) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+            for tl in top_suffix_levels:
+                tname = f"{tl:.1f}"
+                pvals = np.array([r[f"p_pos_top{tname}"] for r in top_suffix_rows], dtype=np.float64)
+                evals = np.array([r[f"e_adv_top{tname}"] for r in top_suffix_rows], dtype=np.float64)
+                label = f"top {int(tl * 100)}%"
+                ax10.plot(xt, pvals, linewidth=2, label=label)
+                ax11.plot(xt, evals, linewidth=2, label=label)
+            ax10.set_ylabel("P(adv>0 | adv!=0)")
+            ax10.set_title("Top suffix-entropy levels: positive-adv probability")
+            ax10.grid(True, alpha=0.3)
+            ax10.legend(ncol=2)
+            ax11.set_xlabel("step")
+            ax11.set_ylabel("E[adv]")
+            ax11.set_title("Top suffix-entropy levels: expected advantage")
+            ax11.grid(True, alpha=0.3)
+            ax11.legend(ncol=2)
+            fig8.tight_layout()
+            fig8.savefig(output_dir / "top_suffix_levels_adv_stats.png", dpi=160)
+            plt.close(fig8)
     except Exception as e:  # pragma: no cover
         print(f"[warn] 画图失败（可能未安装 matplotlib）: {e}")
 
@@ -640,6 +719,7 @@ def main() -> None:
     print(f"Wrote CSV: {q_targets_csv_path}")
     print(f"Wrote CSV: {quantile_csv_path}")
     print(f"Wrote CSV: {suffix_used_csv_path}")
+    print(f"Wrote CSV: {top_suffix_csv_path}")
     print(f"Wrote Summary: {summary_path}")
     print(f"Done. steps={len(steps)}, used={n_used}, skipped={n_bad}")
 
