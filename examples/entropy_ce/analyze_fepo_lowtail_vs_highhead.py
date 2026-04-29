@@ -166,6 +166,9 @@ def main() -> None:
     raw_by_step: dict[int, list[dict[str, float]]] = {}
     q_probe_by_step: dict[int, list[dict[str, float]]] = {}
     suffix_used_by_step: dict[int, list[float]] = {}
+    suffix_used_by_step_m_gt1: dict[int, list[float]] = {}
+    suffix_used_by_step_m_lt1: dict[int, list[float]] = {}
+    suffix_used_by_step_m_eq1: dict[int, list[float]] = {}
     n_lines = 0
     n_used = 0
     n_bad = 0
@@ -227,6 +230,13 @@ def main() -> None:
                     )
                 if suffix_tokens_used is not None and suffix_tokens_used >= 0:
                     suffix_used_by_step.setdefault(step, []).append(float(suffix_tokens_used))
+                    if m_value is not None:
+                        if abs(float(m_value) - 1.0) <= float(args.m_equal_eps):
+                            suffix_used_by_step_m_eq1.setdefault(step, []).append(float(suffix_tokens_used))
+                        elif float(m_value) > 1.0:
+                            suffix_used_by_step_m_gt1.setdefault(step, []).append(float(suffix_tokens_used))
+                        else:
+                            suffix_used_by_step_m_lt1.setdefault(step, []).append(float(suffix_tokens_used))
                 n_used += 1
 
     if not raw_by_step:
@@ -440,30 +450,56 @@ def main() -> None:
     suffix_used_rows: list[dict[str, float | int]] = []
     for step in steps:
         vals = suffix_used_by_step.get(step, [])
+        vals_gt1 = suffix_used_by_step_m_gt1.get(step, [])
+        vals_lt1 = suffix_used_by_step_m_lt1.get(step, [])
+        vals_eq1 = suffix_used_by_step_m_eq1.get(step, [])
         if not vals:
             suffix_used_rows.append(
                 {
                     "step": int(step),
                     "n_suffix_tokens_used_valid": 0,
                     "mean_suffix_tokens_used": float("nan"),
+                    "n_suffix_tokens_used_m_gt_1": 0,
+                    "mean_suffix_tokens_used_m_gt_1": float("nan"),
+                    "n_suffix_tokens_used_m_lt_1": 0,
+                    "mean_suffix_tokens_used_m_lt_1": float("nan"),
+                    "n_suffix_tokens_used_m_eq_1": 0,
+                    "mean_suffix_tokens_used_m_eq_1": float("nan"),
                 }
             )
             continue
         arr = np.array(vals, dtype=np.float64)
+        arr_gt1 = np.array(vals_gt1, dtype=np.float64) if vals_gt1 else np.array([], dtype=np.float64)
+        arr_lt1 = np.array(vals_lt1, dtype=np.float64) if vals_lt1 else np.array([], dtype=np.float64)
+        arr_eq1 = np.array(vals_eq1, dtype=np.float64) if vals_eq1 else np.array([], dtype=np.float64)
         suffix_used_rows.append(
             {
                 "step": int(step),
                 "n_suffix_tokens_used_valid": int(arr.size),
                 "mean_suffix_tokens_used": float(np.mean(arr)),
+                "n_suffix_tokens_used_m_gt_1": int(arr_gt1.size),
+                "mean_suffix_tokens_used_m_gt_1": float(np.mean(arr_gt1)) if arr_gt1.size > 0 else float("nan"),
+                "n_suffix_tokens_used_m_lt_1": int(arr_lt1.size),
+                "mean_suffix_tokens_used_m_lt_1": float(np.mean(arr_lt1)) if arr_lt1.size > 0 else float("nan"),
+                "n_suffix_tokens_used_m_eq_1": int(arr_eq1.size),
+                "mean_suffix_tokens_used_m_eq_1": float(np.mean(arr_eq1)) if arr_eq1.size > 0 else float("nan"),
             }
         )
 
     suffix_used_csv_path = output_dir / "suffix_tokens_used_mean_by_step.csv"
     with open(suffix_used_csv_path, "w", encoding="utf-8") as f:
-        f.write("step,n_suffix_tokens_used_valid,mean_suffix_tokens_used\n")
+        f.write(
+            "step,n_suffix_tokens_used_valid,mean_suffix_tokens_used,"
+            "n_suffix_tokens_used_m_gt_1,mean_suffix_tokens_used_m_gt_1,"
+            "n_suffix_tokens_used_m_lt_1,mean_suffix_tokens_used_m_lt_1,"
+            "n_suffix_tokens_used_m_eq_1,mean_suffix_tokens_used_m_eq_1\n"
+        )
         for r in suffix_used_rows:
             f.write(
-                f"{r['step']},{r['n_suffix_tokens_used_valid']},{r['mean_suffix_tokens_used']:.8f}\n"
+                f"{r['step']},{r['n_suffix_tokens_used_valid']},{r['mean_suffix_tokens_used']:.8f},"
+                f"{r['n_suffix_tokens_used_m_gt_1']},{r['mean_suffix_tokens_used_m_gt_1']:.8f},"
+                f"{r['n_suffix_tokens_used_m_lt_1']},{r['mean_suffix_tokens_used_m_lt_1']:.8f},"
+                f"{r['n_suffix_tokens_used_m_eq_1']},{r['mean_suffix_tokens_used_m_eq_1']:.8f}\n"
             )
 
     try:
@@ -581,11 +617,17 @@ def main() -> None:
         if suffix_used_rows:
             xs_su = np.array([r["step"] for r in suffix_used_rows], dtype=np.float64)
             ys_su = np.array([r["mean_suffix_tokens_used"] for r in suffix_used_rows], dtype=np.float64)
+            ys_su_gt1 = np.array([r["mean_suffix_tokens_used_m_gt_1"] for r in suffix_used_rows], dtype=np.float64)
+            ys_su_lt1 = np.array([r["mean_suffix_tokens_used_m_lt_1"] for r in suffix_used_rows], dtype=np.float64)
+            ys_su_eq1 = np.array([r["mean_suffix_tokens_used_m_eq_1"] for r in suffix_used_rows], dtype=np.float64)
             fig7, ax9 = plt.subplots(figsize=(10, 5))
-            ax9.plot(xs_su, ys_su, color="tab:purple", linewidth=2, label="mean suffix_tokens_used")
+            ax9.plot(xs_su, ys_su, color="tab:purple", linewidth=2, label="overall")
+            ax9.plot(xs_su, ys_su_gt1, color="tab:blue", linewidth=2, label="m > 1")
+            ax9.plot(xs_su, ys_su_lt1, color="tab:orange", linewidth=2, label="m < 1")
+            ax9.plot(xs_su, ys_su_eq1, color="tab:green", linewidth=2, label="m = 1")
             ax9.set_xlabel("step")
             ax9.set_ylabel("mean suffix_tokens_used")
-            ax9.set_title("Mean suffix_tokens_used by step")
+            ax9.set_title("Mean suffix_tokens_used by step (overall / m groups)")
             ax9.grid(True, alpha=0.3)
             ax9.legend()
             fig7.tight_layout()
