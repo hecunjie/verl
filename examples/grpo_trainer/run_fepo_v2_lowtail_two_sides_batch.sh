@@ -78,7 +78,7 @@ FEPO_HIGH_HEAD_PENALTY="${FEPO_HIGH_HEAD_PENALTY:-0.2}"
 FEPO_RANK_SCOPE="${FEPO_RANK_SCOPE:-batch}"                      # group / batch
 
 # Suffix entropy mode
-FEPO_SUFFIX_MODE="${FEPO_SUFFIX_MODE:-sentence}"                  # sentence / full / fixed_window
+FEPO_SUFFIX_MODE="${FEPO_SUFFIX_MODE:-fixed_window}"                  # sentence / full / fixed_window
 FEPO_F_SENTENCE_STOP="${FEPO_F_SENTENCE_STOP:-simple}"           # simple / pysbd
 FEPO_SENTENCE_MIN_SUFFIX_TOKENS="${FEPO_SENTENCE_MIN_SUFFIX_TOKENS:-5}"
 FEPO_SENTENCE_ONLY_HIGH_ENTROPY="${FEPO_SENTENCE_ONLY_HIGH_ENTROPY:-true}"
