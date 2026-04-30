@@ -328,6 +328,9 @@ def _run_fepo_lowtail_adv_phase(
     sentence_max_scan_tokens = int(fepo_cfg.get("sentence_max_scan_tokens", 256))
     sentence_high_entropy_ratio = float(fepo_cfg.get("sentence_high_entropy_ratio", 0.01))
     fixed_window_tokens = int(fepo_cfg.get("fixed_window_tokens", 32))
+    rank_scope = str(fepo_cfg.get("rank_scope", "group")).strip().lower()
+    if rank_scope not in {"group", "batch"}:
+        rank_scope = "group"
     alpha = max(alpha, 0.0)
     high_head_penalty = max(high_head_penalty, 0.0)
     beta = float(np.clip(beta, 0.0, 1.0))
@@ -396,7 +399,7 @@ def _run_fepo_lowtail_adv_phase(
     m = torch.ones_like(advantages)
     q = torch.full_like(advantages, float("nan"))
 
-    groups = _prompt_group_indices(prompts)
+    groups = _prompt_group_indices(prompts) if rank_scope == "group" else {b"__batch__": list(range(int(entropy.size(0))))}
     n_high = 0
     n_boost = 0
     n_head_penalized = 0
@@ -501,6 +504,7 @@ def _run_fepo_lowtail_adv_phase(
         else float("nan"),
         "fepo/suffix_mode_sentence": 1.0 if suffix_mode == "sentence" else 0.0,
         "fepo/suffix_mode_fixed_window": 1.0 if suffix_mode == "fixed_window" else 0.0,
+        "fepo/rank_scope_batch": 1.0 if rank_scope == "batch" else 0.0,
         "fepo/sentence_min_suffix_tokens": float(max(sentence_min_suffix_tokens, 1)),
         "fepo/sentence_num_threads": float(max(sentence_num_threads, 1)),
         "fepo/sentence_only_high_entropy": 1.0 if sentence_only_high_entropy else 0.0,
