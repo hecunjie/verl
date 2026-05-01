@@ -17,6 +17,38 @@ import torch
 from verl import DataProto
 
 
+_SUFFIX_LEN_DEBIAS_STATE: dict[str, Any] = {
+    "bins": {},  # bin_id -> {"count": int, "mean": float, "m2": float}
+    "global": {"count": 0, "mean": 0.0, "m2": 0.0},
+}
+
+
+def _welford_update(state: dict[str, float], x: float) -> None:
+    c = int(state.get("count", 0)) + 1
+    mean = float(state.get("mean", 0.0))
+    m2 = float(state.get("m2", 0.0))
+    delta = x - mean
+    mean = mean + delta / float(c)
+    delta2 = x - mean
+    m2 = m2 + delta * delta2
+    state["count"] = c
+    state["mean"] = mean
+    state["m2"] = m2
+
+
+def _welford_var(state: dict[str, float]) -> float:
+    c = int(state.get("count", 0))
+    if c <= 1:
+        return 0.0
+    return float(state.get("m2", 0.0)) / float(c - 1)
+
+
+def _suffix_len_bin_id(length: int, bin_width: int) -> int:
+    bw = max(int(bin_width), 1)
+    l = max(int(length), 1)
+    return (l - 1) // bw
+
+
 def _prompt_group_indices(prompts: torch.Tensor) -> dict[bytes, list[int]]:
     """Group batch rows by identical prompt token ids."""
     p = prompts.detach().cpu().contiguous()
@@ -299,6 +331,90 @@ def _suffix_entropy_rate_fixed_window(
     return out, keep, int(n_filtered_short)
 
 
+def _compute_suffix_len_full_mode(response_mask: torch.Tensor) -> torch.Tensor:
+    """Exclusive future suffix length for full mode: L_t = (#valid after t)."""
+    B, T = response_mask.shape
+    out = torch.zeros((B, T), dtype=torch.int32, device=response_mask.device)
+    m_cpu = response_mask.detach().cpu().bool()
+    out_cpu = out.detach().cpu()
+    for b in range(B):
+        n = int(m_cpu[b].sum().item())
+        if n <= 1:
+            continue
+        vals = torch.arange(n - 1, -1, -1, dtype=torch.int32)  # n-t-1
+        out_cpu[b, :n] = vals
+    return out_cpu.to(device=response_mask.device)
+
+
+def _build_suffix_len_debiased_score(
+    *,
+    raw_f_rate: torch.Tensor,
+    high_mask: torch.Tensor,
+    suffix_len: torch.Tensor,
+    enable: bool,
+    bin_width: int,
+    min_count: int,
+    z_clip: float,
+    eps: float = 1e-6,
+) -> tuple[torch.Tensor, int, int]:
+    """Length-binned z-score using previous-step stats; then update stats with current batch."""
+    rank_score = raw_f_rate.float().clone()
+    if not enable:
+        return rank_score, 0, 0
+
+    valid = high_mask & torch.isfinite(raw_f_rate) & (suffix_len > 0)
+    idx = torch.nonzero(valid, as_tuple=False)
+    if idx.numel() == 0:
+        return rank_score, 0, 0
+
+    state = _SUFFIX_LEN_DEBIAS_STATE
+    bins_state: dict[int, dict[str, float]] = state["bins"]
+    g_state: dict[str, float] = state["global"]
+    g_count = int(g_state.get("count", 0))
+    g_mean = float(g_state.get("mean", 0.0))
+    g_var = _welford_var(g_state)
+
+    n_bin_fallback = 0
+    n_global_fallback = 0
+    for p in idx.tolist():
+        b, t = int(p[0]), int(p[1])
+        l = int(suffix_len[b, t].item())
+        bid = _suffix_len_bin_id(l, bin_width)
+        x = float(raw_f_rate[b, t].item())
+        b_state = bins_state.get(bid)
+        use_bin = b_state is not None and int(b_state.get("count", 0)) >= int(min_count)
+        if use_bin:
+            mu = float(b_state.get("mean", 0.0))
+            var = _welford_var(b_state)
+        elif g_count >= int(min_count):
+            mu = g_mean
+            var = g_var
+            n_global_fallback += 1
+        else:
+            mu = 0.0
+            var = -1.0  # mark unavailable
+            n_bin_fallback += 1
+
+        if var >= 0.0:
+            z = (x - mu) / float(np.sqrt(var + eps))
+            if z_clip > 0:
+                z = float(np.clip(z, -z_clip, z_clip))
+            rank_score[b, t] = z
+
+    # Update stats AFTER scoring current batch (avoid self-leakage).
+    for p in idx.tolist():
+        b, t = int(p[0]), int(p[1])
+        l = int(suffix_len[b, t].item())
+        bid = _suffix_len_bin_id(l, bin_width)
+        x = float(raw_f_rate[b, t].item())
+        if bid not in bins_state:
+            bins_state[bid] = {"count": 0, "mean": 0.0, "m2": 0.0}
+        _welford_update(bins_state[bid], x)
+        _welford_update(g_state, x)
+
+    return rank_score, int(n_bin_fallback), int(n_global_fallback)
+
+
 def _run_fepo_lowtail_adv_phase(
     batch: DataProto,
     tokenizer: Any,
@@ -331,6 +447,12 @@ def _run_fepo_lowtail_adv_phase(
     rank_scope = str(fepo_cfg.get("rank_scope", "group")).strip().lower()
     if rank_scope not in {"group", "batch"}:
         rank_scope = "group"
+    low_tail_pos_adv_only = bool(fepo_cfg.get("low_tail_pos_adv_only", False))
+    high_head_neg_adv_only = bool(fepo_cfg.get("high_head_neg_adv_only", False))
+    suffix_len_debias_enable = bool(fepo_cfg.get("suffix_len_debias_enable", False))
+    suffix_len_bin_width = int(fepo_cfg.get("suffix_len_bin_width", 2))
+    suffix_len_min_count = int(fepo_cfg.get("suffix_len_min_count", 100))
+    suffix_len_z_clip = float(fepo_cfg.get("suffix_len_z_clip", 3.0))
     alpha = max(alpha, 0.0)
     high_head_penalty = max(high_head_penalty, 0.0)
     beta = float(np.clip(beta, 0.0, 1.0))
@@ -395,6 +517,19 @@ def _run_fepo_lowtail_adv_phase(
         f_rate = _suffix_entropy_rate_exclusive(entropy, response_mask)
         n_filtered_short_sentence = 0
     high_mask = pre_high_mask & torch.isfinite(f_rate) & eligible_cap_mask
+    if suffix_mode in {"sentence", "fixed_window"}:
+        suffix_len = keep_k
+    else:
+        suffix_len = _compute_suffix_len_full_mode(response_mask)
+    rank_score, n_len_bin_fallback, n_len_global_fallback = _build_suffix_len_debiased_score(
+        raw_f_rate=f_rate,
+        high_mask=high_mask,
+        suffix_len=suffix_len,
+        enable=suffix_len_debias_enable,
+        bin_width=suffix_len_bin_width,
+        min_count=suffix_len_min_count,
+        z_clip=suffix_len_z_clip,
+    )
     low_mask = (entropy < h_threshold) & response_mask
     m = torch.ones_like(advantages)
     q = torch.full_like(advantages, float("nan"))
@@ -403,13 +538,15 @@ def _run_fepo_lowtail_adv_phase(
     n_high = 0
     n_boost = 0
     n_head_penalized = 0
+    n_low_tail_gate_blocked = 0
+    n_high_head_gate_blocked = 0
 
     for idxs in groups.values():
         positions: list[tuple[int, int, float]] = []
         for b in idxs:
             ts = torch.where(high_mask[b])[0].tolist()
             for t in ts:
-                positions.append((int(b), int(t), float(f_rate[b, t].item())))
+                positions.append((int(b), int(t), float(rank_score[b, t].item())))
         if not positions:
             continue
         positions_sorted = sorted(positions, key=lambda x: x[2])  # low-tail first
@@ -418,13 +555,20 @@ def _run_fepo_lowtail_adv_phase(
         for rank, (b, t, _f) in enumerate(positions_sorted):
             qi = (float(rank) / float(k - 1)) if k > 1 else 0.0
             q[b, t] = qi
+            adv_t = float(advantages[b, t].item())
             if qi <= beta:
-                m[b, t] = 1.0 + alpha
-                n_boost += 1
+                if (not low_tail_pos_adv_only) or (adv_t > 0.0):
+                    m[b, t] = 1.0 + alpha
+                    n_boost += 1
+                else:
+                    n_low_tail_gate_blocked += 1
             elif high_head_penalty > 0.0 and qi >= (1.0 - beta):
                 # high-head penalty: downweight very high-q positions.
-                m[b, t] = max(0.0, 1.0 - high_head_penalty)
-                n_head_penalized += 1
+                if (not high_head_neg_adv_only) or (adv_t < 0.0):
+                    m[b, t] = max(0.0, 1.0 - high_head_penalty)
+                    n_head_penalized += 1
+                else:
+                    n_high_head_gate_blocked += 1
 
     # Effective split masks on selected high-entropy points.
     q_finite_mask = torch.isfinite(q)
@@ -471,8 +615,18 @@ def _run_fepo_lowtail_adv_phase(
         "fepo/alpha": float(alpha),
         "fepo/beta": float(beta),
         "fepo/high_head_penalty": float(high_head_penalty),
+        "fepo/suffix_len_debias_enable": 1.0 if suffix_len_debias_enable else 0.0,
+        "fepo/suffix_len_bin_width": float(max(suffix_len_bin_width, 1)),
+        "fepo/suffix_len_min_count": float(max(suffix_len_min_count, 1)),
+        "fepo/suffix_len_z_clip": float(max(suffix_len_z_clip, 0.0)),
+        "fepo/suffix_len_debias_bin_fallback": float(n_len_bin_fallback),
+        "fepo/suffix_len_debias_global_fallback": float(n_len_global_fallback),
+        "fepo/low_tail_pos_adv_only": 1.0 if low_tail_pos_adv_only else 0.0,
+        "fepo/high_head_neg_adv_only": 1.0 if high_head_neg_adv_only else 0.0,
         "fepo/n_boosted": float(n_boost),
         "fepo/n_head_penalized": float(n_head_penalized),
+        "fepo/n_low_tail_gate_blocked": float(n_low_tail_gate_blocked),
+        "fepo/n_high_head_gate_blocked": float(n_high_head_gate_blocked),
         "fepo/n_low_tail_effective": float(n_low_tail),
         "fepo/n_high_head_effective": float(n_high_head),
         "fepo/boost_hit_rate": (float(n_boost) / float(n_high)) if n_high > 0 else 0.0,
@@ -539,7 +693,10 @@ def _run_fepo_lowtail_adv_phase(
                         "response_t": int(t),
                         "h_t": float(entropy[b, t].item()),
                         "f_suffix_rate": float(f_rate[b, t].item()),
-                        "suffix_tokens_used": int(keep_k[b, t].item()) if suffix_mode == "sentence" else None,
+                        "f_rank_score": float(rank_score[b, t].item()),
+                        "suffix_tokens_used": int(keep_k[b, t].item())
+                        if suffix_mode in {"sentence", "fixed_window"}
+                        else None,
                         "q": float(q[b, t].item()),
                         "m": float(m[b, t].item()),
                         "adv_before": float(advantages[b, t].item()),

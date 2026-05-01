@@ -75,6 +75,8 @@ FEPO_H_THRESHOLD="${FEPO_H_THRESHOLD:-2.0}"
 FEPO_ALPHA="${FEPO_ALPHA:-0.2}"
 FEPO_BETA="${FEPO_BETA:-0.2}"
 FEPO_HIGH_HEAD_PENALTY="${FEPO_HIGH_HEAD_PENALTY:-0.2}"
+FEPO_LOW_TAIL_POS_ADV_ONLY="${FEPO_LOW_TAIL_POS_ADV_ONLY:-false}"
+FEPO_HIGH_HEAD_NEG_ADV_ONLY="${FEPO_HIGH_HEAD_NEG_ADV_ONLY:-false}"
 
 # Suffix entropy mode
 FEPO_SUFFIX_MODE="${FEPO_SUFFIX_MODE:-sentence}"                  # sentence / full / fixed_window
@@ -85,6 +87,10 @@ FEPO_SENTENCE_HIGH_ENTROPY_RATIO="${FEPO_SENTENCE_HIGH_ENTROPY_RATIO:-0.01}"   #
 FEPO_SENTENCE_MAX_SCAN_TOKENS="${FEPO_SENTENCE_MAX_SCAN_TOKENS:-256}"           # per-point scan cap
 FEPO_SENTENCE_NUM_THREADS="${FEPO_SENTENCE_NUM_THREADS:-64}"
 FEPO_FIXED_WINDOW_TOKENS="${FEPO_FIXED_WINDOW_TOKENS:-16}"       # used when FEPO_SUFFIX_MODE=fixed_window
+FEPO_SUFFIX_LEN_DEBIAS_ENABLE="${FEPO_SUFFIX_LEN_DEBIAS_ENABLE:-false}"
+FEPO_SUFFIX_LEN_BIN_WIDTH="${FEPO_SUFFIX_LEN_BIN_WIDTH:-2}"
+FEPO_SUFFIX_LEN_MIN_COUNT="${FEPO_SUFFIX_LEN_MIN_COUNT:-100}"
+FEPO_SUFFIX_LEN_Z_CLIP="${FEPO_SUFFIX_LEN_Z_CLIP:-3.0}"
 
 # Entropy estimator in FEPO path
 FEPO_ENTROPY_TOP_P="${FEPO_ENTROPY_TOP_P:-0.95}"                 # 1.0 => full-vocab entropy
@@ -123,6 +129,8 @@ python3 -m verl.trainer.main_ppo \
   +algorithm.fepo.alpha="${FEPO_ALPHA}" \
   +algorithm.fepo.beta="${FEPO_BETA}" \
   +algorithm.fepo.high_head_penalty="${FEPO_HIGH_HEAD_PENALTY}" \
+  +algorithm.fepo.low_tail_pos_adv_only="${FEPO_LOW_TAIL_POS_ADV_ONLY}" \
+  +algorithm.fepo.high_head_neg_adv_only="${FEPO_HIGH_HEAD_NEG_ADV_ONLY}" \
   +algorithm.fepo.suffix_mode="${FEPO_SUFFIX_MODE}" \
   +algorithm.fepo.f_sentence_stop="${FEPO_F_SENTENCE_STOP}" \
   +algorithm.fepo.sentence_min_suffix_tokens="${FEPO_SENTENCE_MIN_SUFFIX_TOKENS}" \
@@ -131,6 +139,10 @@ python3 -m verl.trainer.main_ppo \
   +algorithm.fepo.sentence_max_scan_tokens="${FEPO_SENTENCE_MAX_SCAN_TOKENS}" \
   +algorithm.fepo.sentence_num_threads="${FEPO_SENTENCE_NUM_THREADS}" \
   +algorithm.fepo.fixed_window_tokens="${FEPO_FIXED_WINDOW_TOKENS}" \
+  +algorithm.fepo.suffix_len_debias_enable="${FEPO_SUFFIX_LEN_DEBIAS_ENABLE}" \
+  +algorithm.fepo.suffix_len_bin_width="${FEPO_SUFFIX_LEN_BIN_WIDTH}" \
+  +algorithm.fepo.suffix_len_min_count="${FEPO_SUFFIX_LEN_MIN_COUNT}" \
+  +algorithm.fepo.suffix_len_z_clip="${FEPO_SUFFIX_LEN_Z_CLIP}" \
   +algorithm.fepo.entropy_top_p="${FEPO_ENTROPY_TOP_P}" \
   data.train_files="${TRAIN_FILES}" \
   data.val_files="['${MATH500_VAL}','${AIME24_VAL}']" \
