@@ -1,4 +1,4 @@
-## 采样测试 mc128 vs 随机topk
+## 高熵分支点 top-k 对照：min/max/mid/random
 MAX_SAMPLES=300 \
 MAX_NEW_TOKENS=8192 \
 F_CONTINUATION_MODE=first_sentence \
@@ -12,7 +12,68 @@ CANDIDATE_MAX_K=5 \
 MC_M_SAMPLES=128 \
 ENTROPY_THRESHOLD=1.0 \
 MAX_BRANCH_STEPS=64 \
-OUTPUT_DIR=/mnt/tidal-alsh01/dataset/zeus/hecunjie/entropy_check/infer_topk_f_mc_compare \
+SELECTION_F_MODE=mc \
+OUTPUT_DIR=/mnt/tidal-alsh01/dataset/zeus/hecunjie/entropy_check/infer_topk_f_mc_compare_minf_mc_k5 \
+PROGRESS_ALL_RANKS=0 \
+PROGRESS_NESTED=1 \
+PROGRESS_ECHO=1 \
+bash verl/examples/entropy_ce/run_infer_topk_f_mc_compare_vllm_sharded.sh
+
+MAX_SAMPLES=300 \
+MAX_NEW_TOKENS=8192 \
+F_CONTINUATION_MODE=first_sentence \
+F_SENTENCE_MAX_NEW_TOKENS=256 \
+BIAS_METRICS_MODE=length_normalized \
+MODEL_PATH=/mnt/tidal-alsh01/dataset/zeus/hecunjie/models/Qwen/Qwen3-4B-base \
+INPUT_DATA=/mnt/ali-sh-1/dataset/zeus/hecunjie/rl_data/grpo/dapo_math_17k_processed_train.parquet \
+NPROC_PER_NODE=8 \
+CANDIDATE_TOP_P=0.95 \
+CANDIDATE_MAX_K=5 \
+MC_M_SAMPLES=128 \
+ENTROPY_THRESHOLD=1.0 \
+MAX_BRANCH_STEPS=64 \
+SELECTION_F_MODE=mc_max \
+OUTPUT_DIR=/mnt/tidal-alsh01/dataset/zeus/hecunjie/entropy_check/infer_topk_f_mc_compare_maxf_mc_k5 \
+PROGRESS_ALL_RANKS=0 \
+PROGRESS_NESTED=1 \
+PROGRESS_ECHO=1 \
+bash verl/examples/entropy_ce/run_infer_topk_f_mc_compare_vllm_sharded.sh
+
+MAX_SAMPLES=300 \
+MAX_NEW_TOKENS=8192 \
+F_CONTINUATION_MODE=first_sentence \
+F_SENTENCE_MAX_NEW_TOKENS=256 \
+BIAS_METRICS_MODE=length_normalized \
+MODEL_PATH=/mnt/tidal-alsh01/dataset/zeus/hecunjie/models/Qwen/Qwen3-4B-base \
+INPUT_DATA=/mnt/ali-sh-1/dataset/zeus/hecunjie/rl_data/grpo/dapo_math_17k_processed_train.parquet \
+NPROC_PER_NODE=8 \
+CANDIDATE_TOP_P=0.95 \
+CANDIDATE_MAX_K=5 \
+MC_M_SAMPLES=128 \
+ENTROPY_THRESHOLD=1.0 \
+MAX_BRANCH_STEPS=64 \
+SELECTION_F_MODE=mc_mid \
+OUTPUT_DIR=/mnt/tidal-alsh01/dataset/zeus/hecunjie/entropy_check/infer_topk_f_mc_compare_midf_mc_k5 \
+PROGRESS_ALL_RANKS=0 \
+PROGRESS_NESTED=1 \
+PROGRESS_ECHO=1 \
+bash verl/examples/entropy_ce/run_infer_topk_f_mc_compare_vllm_sharded.sh
+
+MAX_SAMPLES=300 \
+MAX_NEW_TOKENS=8192 \
+F_CONTINUATION_MODE=first_sentence \
+F_SENTENCE_MAX_NEW_TOKENS=256 \
+BIAS_METRICS_MODE=length_normalized \
+MODEL_PATH=/mnt/tidal-alsh01/dataset/zeus/hecunjie/models/Qwen/Qwen3-4B-base \
+INPUT_DATA=/mnt/ali-sh-1/dataset/zeus/hecunjie/rl_data/grpo/dapo_math_17k_processed_train.parquet \
+NPROC_PER_NODE=8 \
+CANDIDATE_TOP_P=0.95 \
+CANDIDATE_MAX_K=5 \
+MC_M_SAMPLES=128 \
+ENTROPY_THRESHOLD=1.0 \
+MAX_BRANCH_STEPS=64 \
+SELECTION_F_MODE=random_topk \
+OUTPUT_DIR=/mnt/tidal-alsh01/dataset/zeus/hecunjie/entropy_check/infer_topk_f_mc_compare_random_topk_k5 \
 PROGRESS_ALL_RANKS=0 \
 PROGRESS_NESTED=1 \
 PROGRESS_ECHO=1 \
@@ -613,27 +674,27 @@ MAX_NEW_TOKENS=8192 \
 MATH_EVAL_BACKEND=math_verify \
 bash /mnt/ali-sh-1/dataset/zeus/hecunjie/gitlab-source/verl/examples/entropy_ce/run_infer_passk_by_mode_vllm_sharded.sh
 
-MODE=min_f_mc \
-MINF_NONBRANCH_MODE=greedy \
+MODE=max_f_mc \
+MINF_NONBRANCH_MODE=sampling \
 NUM_SAMPLES_PER_PROMPT=32 \
 PASS_K_SMALL=4 \
 PASS_K_LARGE=32 \
 SAMPLING_TEMPERATURE=1.0 \
 SAMPLING_TOP_P=0.95 \
 SELECTION_F_MODE=mc \
-MC_M_SAMPLES=10 \
+MC_M_SAMPLES=32 \
 MC_TEMPERATURE=1 \
 MC_TOP_P=0.95 \
 VLLM_REQUEST_BATCH_CHUNK_MC=256 \
 MODEL_PATH=/mnt/tidal-alsh01/dataset/zeus/hecunjie/models/Qwen/Qwen3-4B \
 INPUT_DATA=/mnt/ali-sh-1/dataset/zeus/hecunjie/rl_data/grpo/aime2024_test.parquet \
-OUTPUT_DIR=/mnt/tidal-alsh01/dataset/zeus/hecunjie/entropy_check/qwen3-4b_passk_32/minfmc_nonbranch_greedy_aime24_batch_mc10_entropy1.0_maxk10 \
+OUTPUT_DIR=/mnt/tidal-alsh01/dataset/zeus/hecunjie/entropy_check/qwen3-4b_passk_32/maxfmc_nonbranch_sampling_aime24_batch_mc32_entropy1.0_maxk5 \
 NPROC_PER_NODE=8 \
 MAX_SAMPLES=500 \
 MAX_NEW_TOKENS=8192 \
 ENTROPY_THRESHOLD=1 \
 CANDIDATE_TOP_P=0.95 \
-CANDIDATE_MAX_K=10 \
+CANDIDATE_MAX_K=5 \
 MAX_BRANCH_STEPS=64 \
 F_CONTINUATION_MODE=first_sentence \
 F_SENTENCE_MAX_NEW_TOKENS=128 \
@@ -643,7 +704,7 @@ bash /mnt/ali-sh-1/dataset/zeus/hecunjie/gitlab-source/verl/examples/entropy_ce/
   --minf_sample_parallel_batch 32
 
 MODE=max_f_mc \
-MINF_NONBRANCH_MODE=greedy \
+MINF_NONBRANCH_MODE=sampling \
 NUM_SAMPLES_PER_PROMPT=32 \
 PASS_K_SMALL=4 \
 PASS_K_LARGE=32 \
@@ -656,7 +717,7 @@ MC_TOP_P=0.95 \
 VLLM_REQUEST_BATCH_CHUNK_MC=256 \
 MODEL_PATH=/mnt/tidal-alsh01/dataset/zeus/hecunjie/models/Qwen/Qwen3-4B \
 INPUT_DATA=/mnt/ali-sh-1/dataset/zeus/hecunjie/rl_data/grpo/aime2025_test.parquet \
-OUTPUT_DIR=/mnt/tidal-alsh01/dataset/zeus/hecunjie/entropy_check/qwen3-4b_passk_32/maxfmc_nonbranch_greedy_aime25_batch_mc32_entropy1.0_maxk5 \
+OUTPUT_DIR=/mnt/tidal-alsh01/dataset/zeus/hecunjie/entropy_check/qwen3-4b_passk_32/maxfmc_nonbranch_sampling_aime25_batch_mc32_entropy1.0_maxk5 \
 NPROC_PER_NODE=8 \
 MAX_SAMPLES=500 \
 MAX_NEW_TOKENS=8192 \
