@@ -215,9 +215,16 @@ def normalize_final_answer(final_answer: str) -> str:
     final_answer = re.sub(r"(sqrt)([^{])", "sqrt{\\2}", final_answer)
     final_answer = final_answer.replace("$", "")
 
-    # Normalize numbers
-    if final_answer.replace(",", "").isdigit():
-        final_answer = final_answer.replace(",", "")
+    # Normalize plain integers:
+    # - remove thousands separators
+    # - normalize leading zeros so "024" and "24" are treated as equal
+    int_like = final_answer.replace(",", "")
+    if re.fullmatch(r"[+-]?\d+", int_like):
+        sign = ""
+        if int_like.startswith(("+", "-")):
+            sign, int_like = int_like[0], int_like[1:]
+        int_like = int_like.lstrip("0") or "0"
+        final_answer = f"{sign}{int_like}"
 
     return final_answer.strip()
 
