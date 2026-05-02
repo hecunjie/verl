@@ -122,6 +122,9 @@ algorithm:
   # arithmetic: inverse-H normalized by sum; geometric: Appendix C GM denominator
   grpos_negative_entropy_norm: arithmetic
 
+  # Whether to shape negative paths with entropy term (False is a conservative/stable alternative)
+  grpos_shape_negative: true
+
   # Whether to enable in-reward KL penalty
   use_kl_in_reward: False
 

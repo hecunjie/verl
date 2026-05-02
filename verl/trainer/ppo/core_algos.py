@@ -522,6 +522,8 @@ def compute_grpo_s_outcome_advantage(
 
     Use ``grpos_outcome_convention=dapo`` so :math:`r^{-}=-1` on failures (paper/DAPO); ``grpo`` uses the
     batch scalar reward (typically :math:`0` for wrong). Override with ``grpos_negative_outcome_value``.
+    For stability and strict Appendix-B-style asymptotic argument, you can disable negative entropy shaping
+    via ``grpos_shape_negative=False`` (negative path keeps only the base :math:`\\beta_1 r^{-}` term).
 
     **Advantages** — same as Eq. (1) but with :math:`\\hat{r}` replacing :math:`r` (Appendix B, Eq. (46)):
 
@@ -554,11 +556,13 @@ def compute_grpo_s_outcome_advantage(
         neg_outcome_override = None
         outcome_convention = "grpo"
         neg_entropy_norm = "arithmetic"
+        shape_negative = True
         if config is not None:
             v = config.get("grpos_negative_outcome_value", None)
             neg_outcome_override = None if v is None else float(v)
             outcome_convention = str(config.get("grpos_outcome_convention", "grpo")).lower().strip()
             neg_entropy_norm = str(config.get("grpos_negative_entropy_norm", "arithmetic")).lower().strip()
+            shape_negative = bool(config.get("grpos_shape_negative", True))
         if outcome_convention not in {"grpo", "dapo"}:
             outcome_convention = "dapo"
         if neg_entropy_norm not in {"arithmetic", "geometric"}:
@@ -610,7 +614,9 @@ def compute_grpo_s_outcome_advantage(
                     neg_scores = torch.full_like(scores[neg_rows], -1.0)
                 else:
                     neg_scores = scores[neg_rows]
-                if neg_entropy_norm == "geometric":
+                if not shape_negative:
+                    shaped[neg_rows] = beta1 * neg_scores
+                elif neg_entropy_norm == "geometric":
                     # Appendix C: (1/H_j) / (prod_k 1/H_k)^(1/m)
                     log_inv = torch.log(inv.clamp(min=epsilon))
                     gm_inv = torch.exp(torch.mean(log_inv))

@@ -601,6 +601,9 @@ class AlgoConfig(BaseConfig):
         grpos_negative_entropy_norm (str): ``arithmetic`` (default): negative entropy term uses
             :math:`\\beta_2\\,m\\,(1/\\bar{H}_j)/\\sum_{k\\in -}1/\\bar{H}_k` (arithmetic parallel to Eq. (40)).
             ``geometric``: Appendix C sequence-level form with :math:`(1/\\bar{H}_j)/(\\prod_k 1/\\bar{H}_k)^{1/m}`.
+        grpos_shape_negative (bool): Whether to apply entropy-shaping on negative paths. Setting False
+            keeps only base :math:`\\beta_1 r^{-}` for negatives, which is closer to the Appendix-B
+            asymptotic argument where wrong answers with ``r=0`` do not receive extra entropy term.
         use_kl_in_reward (bool): Whether to enable in-reward KL penalty.
         kl_penalty (str): How to estimate KL divergence: "kl", "abs", "mse", "low_var_kl", or "full".
         kl_ctrl (KLControlConfig): KL control configuration.
@@ -643,6 +646,7 @@ class AlgoConfig(BaseConfig):
     grpos_negative_outcome_value: Optional[float] = None
     grpos_outcome_convention: str = "grpo"
     grpos_negative_entropy_norm: str = "arithmetic"
+    grpos_shape_negative: bool = True
     use_kl_in_reward: bool = False
     kl_penalty: str = "kl"
     kl_ctrl: KLControlConfig = field(default_factory=KLControlConfig)

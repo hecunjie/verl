@@ -76,6 +76,8 @@ VAL_TOP_P="${VAL_TOP_P:-1.0}"
 # - 默认 dapo + geometric：对齐论文附录 C（失败样本 r=-1 + 几何负项）
 # - 若要回退到 VERL 常见 0/1 标量奖励语义，可设：
 #   GRPOS_OUTCOME_CONVENTION=grpo  GRPOS_NEGATIVE_ENTROPY_NORM=arithmetic
+# - 若训练不稳定，建议先关闭负样本熵 shaping：
+#   GRPOS_SHAPE_NEGATIVE=false
 # -----------------------------
 GRPOS_BETA1="${GRPOS_BETA1:-1.0}"
 GRPOS_BETA2="${GRPOS_BETA2:-0.1}"
@@ -84,6 +86,7 @@ GRPOS_ENTROPY_CLIP_HIGH="${GRPOS_ENTROPY_CLIP_HIGH:-0.28}"
 GRPOS_SUCCESS_THRESHOLD="${GRPOS_SUCCESS_THRESHOLD:-0.0}"
 GRPOS_OUTCOME_CONVENTION="${GRPOS_OUTCOME_CONVENTION:-dapo}"
 GRPOS_NEGATIVE_ENTROPY_NORM="${GRPOS_NEGATIVE_ENTROPY_NORM:-geometric}"
+GRPOS_SHAPE_NEGATIVE="${GRPOS_SHAPE_NEGATIVE:-false}"
 
 # -----------------------------
 # Logging / dump（与 FEPO 脚本一致的可选目录）
@@ -113,6 +116,7 @@ python3 -m verl.trainer.main_ppo \
   algorithm.grpos_success_reward_threshold="${GRPOS_SUCCESS_THRESHOLD}" \
   algorithm.grpos_outcome_convention="${GRPOS_OUTCOME_CONVENTION}" \
   algorithm.grpos_negative_entropy_norm="${GRPOS_NEGATIVE_ENTROPY_NORM}" \
+  algorithm.grpos_shape_negative="${GRPOS_SHAPE_NEGATIVE}" \
   algorithm.use_kl_in_reward=False \
   data.train_files="${TRAIN_FILES}" \
   data.val_files="['${MATH500_VAL}','${AIME24_VAL}']" \
