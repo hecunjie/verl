@@ -28,6 +28,9 @@
       --metrics "m1,m2,m3,m4" --out-dir ./plots_compare \\
       --max-step 500
 
+  # 横轴从约 30 step 起画，且刻度只标 100 的倍数（不出现 30）：
+  #   --min-step 30 --x-tick-multiple 100
+
   # 具名方法 FEPO / GRPO / GTPO 使用脚本内固定配色（粉 / 蓝 / 黄），其它方法仍走默认调色盘。
 
 依赖: pip install wandb matplotlib pandas
@@ -36,6 +39,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import re
 import sys
@@ -45,6 +49,7 @@ import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from matplotlib.ticker import NullLocator
 
 # Okabe–Ito 色盲友好调色（高对比；未命中具名方法时使用）
 _PALETTE = [
@@ -109,13 +114,41 @@ def short_metric_ylabel(metric: str) -> str:
     return core
 
 
-def _apply_max_step_mask(
-    df: pd.DataFrame, x_col: str, max_step: int | None
+def _apply_step_range_mask(
+    df: pd.DataFrame,
+    x_col: str,
+    min_step: int | None,
+    max_step: int | None,
 ) -> pd.DataFrame:
-    if max_step is None or max_step <= 0:
-        return df
+    """按横轴列裁剪：可选最小 step（含）与最大 step（含）。"""
     xs = pd.to_numeric(df[x_col], errors="coerce")
-    return df.loc[xs <= float(max_step)].copy()
+    mask = pd.Series(True, index=df.index)
+    if min_step is not None and min_step > 0:
+        mask &= xs >= float(min_step)
+    if max_step is not None and max_step > 0:
+        mask &= xs <= float(max_step)
+    return df.loc[mask].copy()
+
+
+def _set_xticks_multiple_of(
+    ax,
+    x_min: float,
+    x_max: float,
+    base: float,
+) -> None:
+    """
+    横轴主刻度仅为 base 的倍数（落在数据范围内）；不强制出现小于 base 的刻度（例如起点 30 时不会出现 30）。
+    base<=0 时不修改刻度（交给 matplotlib 默认）。
+    """
+    if base <= 0 or not (math.isfinite(x_min) and math.isfinite(x_max)):
+        return
+    lo, hi = min(x_min, x_max), max(x_min, x_max)
+    first = math.ceil(lo / base) * base
+    last = math.floor(hi / base) * base
+    if first <= last:
+        ticks = np.arange(first, last + base * 0.5, base)
+        ax.set_xticks(ticks)
+    ax.xaxis.set_minor_locator(NullLocator())
 
 
 def _strip_internal_columns(df: pd.DataFrame) -> list[str]:
@@ -192,14 +225,16 @@ def plot_subplots(
     x_col: str,
     outfile: str,
     x_label: str = "step",
+    min_step: int | None = None,
     max_step: int | None = None,
+    x_tick_multiple: float = 0.0,
 ) -> None:
     n = len(metrics)
     fig_h = min(3.2 * n, 36)
     fig, axes = plt.subplots(n, 1, figsize=(11, fig_h), sharex=True, constrained_layout=True)
     if n == 1:
         axes = [axes]
-    dfp = _apply_max_step_mask(df, x_col, max_step)
+    dfp = _apply_step_range_mask(df, x_col, min_step, max_step)
     xs = pd.to_numeric(dfp[x_col], errors="coerce").to_numpy()
     for ax, m, color in zip(axes, metrics, _PALETTE * (1 + n // len(_PALETTE))):
         ys = pd.to_numeric(dfp[m], errors="coerce")
@@ -210,6 +245,9 @@ def plot_subplots(
         ax.spines["top"].set_visible(False)
         ax.spines["right"].set_visible(False)
     axes[-1].set_xlabel(x_label)
+    if x_tick_multiple > 0 and xs.size:
+        x_lo, x_hi = float(np.nanmin(xs)), float(np.nanmax(xs))
+        _set_xticks_multiple_of(axes[-1], x_lo, x_hi, x_tick_multiple)
     fig.savefig(outfile, bbox_inches="tight")
     plt.close(fig)
 
@@ -224,22 +262,28 @@ def plot_multi_run_one_metric(
     x_col: str,
     outfile: str,
     *,
+    min_step: int | None,
     max_step: int | None,
     x_label: str = "step",
     line_width: float = 1.15,
+    x_tick_multiple: float = 0.0,
 ) -> None:
     """同一指标、多条曲线；run_frames 为 (method 名, df)，图例为方法名；每条曲线同色系画最大值水平参考线。"""
     fig, ax = plt.subplots(figsize=(11, 6.2), constrained_layout=True)
     ax.grid(False)
     any_line = False
     y_label = short_metric_ylabel(metric)
+    x_lo, x_hi = float("inf"), float("-inf")
     for i, (method_label, df) in enumerate(run_frames):
         if metric not in df.columns:
             print(f"warn: metric {metric!r} missing for method {method_label!r}, skip", file=sys.stderr)
             continue
-        dfp = _apply_max_step_mask(df, x_col, max_step)
+        dfp = _apply_step_range_mask(df, x_col, min_step, max_step)
         xs = pd.to_numeric(dfp[x_col], errors="coerce").to_numpy()
         ys = pd.to_numeric(dfp[metric], errors="coerce").to_numpy()
+        if xs.size:
+            x_lo = min(x_lo, float(np.nanmin(xs)))
+            x_hi = max(x_hi, float(np.nanmax(xs)))
         color = _color_for_method(method_label, i)
         ax.plot(xs, ys, color=color, label=method_label, solid_capstyle="round", linewidth=line_width)
         finite = ys[np.isfinite(ys)]
@@ -262,6 +306,8 @@ def plot_multi_run_one_metric(
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
     ax.legend(loc="best", framealpha=0.95, edgecolor="#CCCCCC")
+    if x_tick_multiple > 0 and math.isfinite(x_lo) and math.isfinite(x_hi):
+        _set_xticks_multiple_of(ax, x_lo, x_hi, x_tick_multiple)
     fig.savefig(outfile, bbox_inches="tight")
     plt.close(fig)
 
@@ -272,11 +318,13 @@ def plot_overlay(
     x_col: str,
     outfile: str,
     x_label: str = "step",
+    min_step: int | None = None,
     max_step: int | None = None,
+    x_tick_multiple: float = 0.0,
 ) -> None:
     fig, ax = plt.subplots(figsize=(11, 6), constrained_layout=True)
     ax.grid(False)
-    dfp = _apply_max_step_mask(df, x_col, max_step)
+    dfp = _apply_step_range_mask(df, x_col, min_step, max_step)
     xs = pd.to_numeric(dfp[x_col], errors="coerce").to_numpy()
     for i, m in enumerate(metrics):
         color = _PALETTE[i % len(_PALETTE)]
@@ -287,6 +335,8 @@ def plot_overlay(
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
     ax.legend(loc="best", framealpha=0.92, edgecolor="#CCCCCC")
+    if x_tick_multiple > 0 and xs.size:
+        _set_xticks_multiple_of(ax, float(np.nanmin(xs)), float(np.nanmax(xs)), x_tick_multiple)
     fig.savefig(outfile, bbox_inches="tight")
     plt.close(fig)
 
@@ -341,6 +391,18 @@ def main() -> int:
         default=0,
         help="仅绘制横轴 step 不大于此值的点（截断）；0 表示不限制",
     )
+    parser.add_argument(
+        "--min-step",
+        type=int,
+        default=0,
+        help="仅绘制横轴 step 不小于该值的点（左侧截断，如 30）；0 表示从数据起点",
+    )
+    parser.add_argument(
+        "--x-tick-multiple",
+        type=float,
+        default=0.0,
+        help="横轴刻度仅为该数的倍数（如 100，则只显示 100,200,...，不会出现 30）；0 表示用 matplotlib 默认刻度",
+    )
     parser.add_argument("--samples", type=int, default=0, help="Max rows from API (0 = full scan_history)")
     parser.add_argument(
         "--smooth",
@@ -362,6 +424,8 @@ def main() -> int:
     x_col = args.x_axis
     x_label = args.x_label
     max_step = args.max_step if args.max_step > 0 else None
+    min_step = args.min_step if args.min_step > 0 else None
+    x_tick_multiple = float(args.x_tick_multiple) if args.x_tick_multiple and args.x_tick_multiple > 0 else 0.0
     samples = args.samples if args.samples and args.samples > 0 else None
 
     # ----- 多 run 对比 -----
@@ -423,8 +487,10 @@ def main() -> int:
                     metric,
                     x_col,
                     out_png,
+                    min_step=min_step,
                     max_step=max_step,
                     x_label=x_label,
+                    x_tick_multiple=x_tick_multiple,
                 )
                 print(f"saved figure: {out_png}")
             except ValueError as e:
@@ -474,9 +540,27 @@ def main() -> int:
 
     out = args.output or f"wandb_plot_{project}_{run_id}.png"
     if args.layout == "multi":
-        plot_subplots(df, metrics, x_col, out, x_label=x_label, max_step=max_step)
+        plot_subplots(
+            df,
+            metrics,
+            x_col,
+            out,
+            x_label=x_label,
+            min_step=min_step,
+            max_step=max_step,
+            x_tick_multiple=x_tick_multiple,
+        )
     else:
-        plot_overlay(df, metrics, x_col, out, x_label=x_label, max_step=max_step)
+        plot_overlay(
+            df,
+            metrics,
+            x_col,
+            out,
+            x_label=x_label,
+            min_step=min_step,
+            max_step=max_step,
+            x_tick_multiple=x_tick_multiple,
+        )
     print(f"saved figure: {out}")
     return 0
 
