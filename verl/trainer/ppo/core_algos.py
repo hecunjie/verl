@@ -107,6 +107,7 @@ class AdvantageEstimator(str, Enum):
     GRPO_VECTORIZED = "grpo_vectorized"
     GRPO_GTPO = "grpo_gtpo"
     GTPO = "gtpo"
+    GRPO_S = "grpo_s"
     OPTIMAL_TOKEN_BASELINE = "optimal_token_baseline"
     TIR_OPTIMAL_TOKEN_BASELINE = "tir_optimal_token_baseline"
 
@@ -488,6 +489,92 @@ def compute_gtpo_outcome_advantage(
 
         multiplier = (alpha1 + alpha2 * bonus) * mask_f
         advantages = scalars.unsqueeze(-1) * multiplier
+        return advantages, advantages
+
+
+@register_adv_est(AdvantageEstimator.GRPO_S)  # or simply: @register_adv_est("grpo_s")
+def compute_grpo_s_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    token_entropy: torch.Tensor,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Optional[AlgoConfig] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sequence-level GRPO-S (arXiv:2508.04349).
+
+    Per-sequence **shaped** outcome rewards, then the same group-relative advantage as GRPO
+    (mean/std within each prompt group), broadcast uniformly over valid response tokens.
+
+    Positive paths (sequence score > threshold), matching Appendix (40) with :math:`r_i` the outcome score:
+
+        :math:`\\hat{r}^{+}_i = \\beta_1 r_i + \\beta_2 \\, n_{+} \\, \\frac{\\bar{H}_i}{\\sum_{k \\in +} \\bar{H}_k}`
+
+    where :math:`\\bar{H}_i` is the mean clipped policy entropy over valid response tokens.
+
+    Negative paths use the paper's dual intuition (confident wrong answers penalized more): inverse
+    mean-entropy weights among negatives only:
+
+        :math:`\\hat{r}^{-}_j = \\beta_1 r_j - \\beta_2 \\, n_{-} \\, \\frac{1/\\bar{H}_j}{\\sum_{k \\in -} 1/\\bar{H}_k}`
+
+    If a group has only positives or only negatives, the missing branch is skipped (no division by zero).
+    """
+    with torch.no_grad():
+        scores = token_level_rewards.sum(dim=-1)
+        g = as_torch_index(index, device=scores.device)
+        mask_f = response_mask.float()
+
+        beta1 = 1.0 if config is None else float(config.get("grpos_beta1", 1.0))
+        beta2 = 0.1 if config is None else float(config.get("grpos_beta2", 0.1))
+        ec_low = 0.2 if config is None else float(config.get("grpos_entropy_clip_low", 0.2))
+        ec_high = 0.28 if config is None else float(config.get("grpos_entropy_clip_high", 0.28))
+        thr = 0.0
+        if config is not None:
+            thr = float(
+                config.get(
+                    "grpos_success_reward_threshold",
+                    config.get("gtpo_success_reward_threshold", 0.0),
+                )
+            )
+
+        H_raw = token_entropy.float()
+        H_clipped = torch.clamp(H_raw, min=ec_low, max=ec_high)
+        H = torch.where(mask_f > 0, H_clipped, torch.zeros_like(H_clipped))
+        len_i = mask_f.sum(dim=-1).clamp(min=1.0)
+        Hbar = (H * mask_f).sum(dim=-1) / len_i
+
+        shaped = torch.zeros_like(scores)
+        is_pos = scores > thr
+        is_neg = ~is_pos
+
+        unique_groups = torch.unique(g)
+        for gid in unique_groups:
+            rows = torch.nonzero(g == gid, as_tuple=True)[0]
+            if rows.numel() == 0:
+                continue
+            pos_rows = rows[is_pos[rows]]
+            neg_rows = rows[is_neg[rows]]
+            n_pos = pos_rows.numel()
+            n_neg = neg_rows.numel()
+
+            if n_pos > 0:
+                Hp = Hbar[pos_rows]
+                denom = Hp.sum().clamp(min=epsilon)
+                shaped[pos_rows] = beta1 * scores[pos_rows] + beta2 * n_pos * (Hp / denom)
+
+            if n_neg > 0:
+                Hn = Hbar[neg_rows].clamp(min=epsilon)
+                inv = 1.0 / Hn
+                denom_inv = inv.sum().clamp(min=epsilon)
+                shaped[neg_rows] = beta1 * scores[neg_rows] - beta2 * n_neg * (inv / denom_inv)
+
+        mean_g, std_g, _ = group_mean_std(shaped, g, eps=epsilon, device=scores.device)
+        if norm_adv_by_std_in_grpo:
+            scalars = (shaped - mean_g[g]) / (std_g[g] + epsilon)
+        else:
+            scalars = shaped - mean_g[g]
+        advantages = scalars.unsqueeze(-1) * mask_f
         return advantages, advantages
 
 

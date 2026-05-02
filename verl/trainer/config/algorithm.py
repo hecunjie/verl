@@ -575,7 +575,7 @@ class AlgoConfig(BaseConfig):
         lam (float): Trade-off between bias and variance in the GAE estimator.
         adv_estimator (str): Advantage estimator type: "gae", "grpo", "grpo_gtpo" (legacy
             entropy-weighted advantage), "gtpo" (paper-inspired asymmetric positive/negative
-            credit assignment), "reinforce_plus_plus", etc.
+            credit assignment), "grpo_s" (sequence-level GRPO-S, arXiv:2508.04349), "reinforce_plus_plus", etc.
         norm_adv_by_std_in_grpo (bool): Whether to normalize advantages by std (specific to GRPO).
         gtpo_scale_advantage_by_seq_len (bool): GTPO only. If True (default), multiply entropy
             weights by the number of valid response tokens so ``sum_t A_t = n * \\hat{A}_i``, matching
@@ -587,6 +587,12 @@ class AlgoConfig(BaseConfig):
         gtpo_entropy_clip_high (float): Upper clip bound for token entropy in GTPO.
         gtpo_success_reward_threshold (float): Sequence score threshold to split positive/negative
             paths in GTPO. Scores > threshold are treated as positive, otherwise negative.
+        grpos_beta1 (float): GRPO-S base coefficient on outcome score (paper ``\\beta_1``).
+        grpos_beta2 (float): GRPO-S entropy shaping strength (paper ``\\beta_2``).
+        grpos_entropy_clip_low (float): Lower clip on per-token entropy before averaging for GRPO-S.
+        grpos_entropy_clip_high (float): Upper clip on per-token entropy before averaging for GRPO-S.
+        grpos_success_reward_threshold (float): Path split for GRPO-S; if unset in DictConfig, falls back to
+            ``gtpo_success_reward_threshold``.
         use_kl_in_reward (bool): Whether to enable in-reward KL penalty.
         kl_penalty (str): How to estimate KL divergence: "kl", "abs", "mse", "low_var_kl", or "full".
         kl_ctrl (KLControlConfig): KL control configuration.
@@ -621,6 +627,11 @@ class AlgoConfig(BaseConfig):
     gtpo_entropy_clip_low: float = 0.2
     gtpo_entropy_clip_high: float = 0.28
     gtpo_success_reward_threshold: float = 0.0
+    grpos_beta1: float = 1.0
+    grpos_beta2: float = 0.1
+    grpos_entropy_clip_low: float = 0.2
+    grpos_entropy_clip_high: float = 0.28
+    grpos_success_reward_threshold: float = 0.0
     use_kl_in_reward: bool = False
     kl_penalty: str = "kl"
     kl_ctrl: KLControlConfig = field(default_factory=KLControlConfig)

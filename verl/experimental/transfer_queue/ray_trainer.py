@@ -263,9 +263,22 @@ def compute_advantage(
             index=data.non_tensor_batch["uid"],
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
         )
-    elif adv_estimator in (AdvantageEstimator.GRPO_GTPO, AdvantageEstimator.GTPO):
+    elif adv_estimator in (
+        AdvantageEstimator.GRPO_GTPO,
+        AdvantageEstimator.GTPO,
+        AdvantageEstimator.GRPO_S,
+    ):
         if adv_estimator == AdvantageEstimator.GRPO_GTPO:
             advantages, returns = core_algos.compute_grpo_gtpo_outcome_advantage(
+                token_level_rewards=data.batch["token_level_rewards"],
+                response_mask=data.batch["response_mask"],
+                index=data.non_tensor_batch["uid"],
+                token_entropy=data.batch["token_entropy"],
+                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                config=config,
+            )
+        elif adv_estimator == AdvantageEstimator.GRPO_S:
+            advantages, returns = core_algos.compute_grpo_s_outcome_advantage(
                 token_level_rewards=data.batch["token_level_rewards"],
                 response_mask=data.batch["response_mask"],
                 index=data.non_tensor_batch["uid"],
@@ -1398,6 +1411,7 @@ class RayPPOTrainer:
                         if self.config.algorithm.adv_estimator in (
                             AdvantageEstimator.GRPO_GTPO,
                             AdvantageEstimator.GTPO,
+                            AdvantageEstimator.GRPO_S,
                         ):
                             token_entropy_td = TensorDict(
                                 {"token_entropy": entropys.detach().clone()}, batch_size=entropys.size(0)
@@ -1521,6 +1535,7 @@ class RayPPOTrainer:
                         elif self.config.algorithm.adv_estimator in (
                             AdvantageEstimator.GRPO_GTPO,
                             AdvantageEstimator.GTPO,
+                            AdvantageEstimator.GRPO_S,
                         ):
                             compute_advantage_fields.append("uid")
                             compute_advantage_fields.append("token_entropy")

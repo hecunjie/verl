@@ -27,6 +27,7 @@ def need_critic(config: DictConfig) -> bool:
         AdvantageEstimator.GRPO,
         AdvantageEstimator.GRPO_GTPO,
         AdvantageEstimator.GTPO,
+        AdvantageEstimator.GRPO_S,
         AdvantageEstimator.GRPO_PASSK,
         AdvantageEstimator.REINFORCE_PLUS_PLUS,
         # AdvantageEstimator.REMAX, # TODO:REMAX advantage estimator is not yet supported in one_step_off_policy
