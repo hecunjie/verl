@@ -21,10 +21,12 @@
   python plot_wandb_run.py --run-path myteam/verl/abc123 \\
       --layout overlay --metrics "train/loss,critic/loss"
 
-  # 多 run 对比：每个指标单独一张图，每条曲线一个 run（需同一 entity/project）
+  # 多 run 对比：每个指标单独一张图；图例用 --methods（与 --runs 一一对应）
   python plot_wandb_run.py --entity myteam --project verl \\
       --runs abc111 def222 ghi333 jkl444 \\
-      --metrics "m1,m2,m3,m4" --out-dir ./plots_compare
+      --methods FEPO GRPO DAPO GTPO \\
+      --metrics "m1,m2,m3,m4" --out-dir ./plots_compare \\
+      --max-step 500
 
 依赖: pip install wandb matplotlib pandas
 """
@@ -39,6 +41,7 @@ from typing import Iterable
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 
 # Okabe–Ito 色盲友好调色（高对比）
@@ -65,17 +68,38 @@ def _setup_matplotlib_style() -> None:
             "legend.fontsize": 10,
             "xtick.labelsize": 10,
             "ytick.labelsize": 10,
-            "axes.grid": True,
-            "grid.alpha": 0.35,
-            "grid.linestyle": "--",
+            "axes.grid": False,
             "axes.facecolor": "#FAFAFA",
             "figure.facecolor": "white",
             "axes.edgecolor": "#333333",
             "axes.linewidth": 1.0,
-            "lines.linewidth": 2.0,
-            "lines.markersize": 4,
+            "lines.linewidth": 1.15,
+            "lines.markersize": 3,
         }
     )
+
+
+def short_metric_ylabel(metric: str) -> str:
+    """
+    将完整 wandb key 压成短纵轴标签，例如 mean@4、major@4。
+    """
+    parts = metric.rstrip("/").split("/")
+    if len(parts) >= 2 and parts[-1] == "mean" and "@" in parts[-2]:
+        core = parts[-2]
+    else:
+        core = parts[-1]
+    if core.startswith("maj@"):
+        return "major" + core[3:]
+    return core
+
+
+def _apply_max_step_mask(
+    df: pd.DataFrame, x_col: str, max_step: int | None
+) -> pd.DataFrame:
+    if max_step is None or max_step <= 0:
+        return df
+    xs = pd.to_numeric(df[x_col], errors="coerce")
+    return df.loc[xs <= float(max_step)].copy()
 
 
 def _strip_internal_columns(df: pd.DataFrame) -> list[str]:
@@ -146,22 +170,30 @@ def fetch_history(
     return df
 
 
-def plot_subplots(df: pd.DataFrame, metrics: list[str], x_col: str, outfile: str, title: str) -> None:
+def plot_subplots(
+    df: pd.DataFrame,
+    metrics: list[str],
+    x_col: str,
+    outfile: str,
+    x_label: str = "step",
+    max_step: int | None = None,
+) -> None:
     n = len(metrics)
     fig_h = min(3.2 * n, 36)
     fig, axes = plt.subplots(n, 1, figsize=(11, fig_h), sharex=True, constrained_layout=True)
     if n == 1:
         axes = [axes]
-    xs = df[x_col].to_numpy()
+    dfp = _apply_max_step_mask(df, x_col, max_step)
+    xs = pd.to_numeric(dfp[x_col], errors="coerce").to_numpy()
     for ax, m, color in zip(axes, metrics, _PALETTE * (1 + n // len(_PALETTE))):
-        ys = pd.to_numeric(df[m], errors="coerce")
-        ax.plot(xs, ys, color=color, label=m, solid_capstyle="round")
-        ax.set_ylabel(m, color=color, fontweight="medium")
+        ys = pd.to_numeric(dfp[m], errors="coerce")
+        ax.plot(xs, ys, color=color, label=m, solid_capstyle="round", linewidth=1.15)
+        ax.set_ylabel(short_metric_ylabel(m), color=color, fontweight="medium")
         ax.tick_params(axis="y", labelcolor=color)
+        ax.grid(False)
         ax.spines["top"].set_visible(False)
         ax.spines["right"].set_visible(False)
-    axes[-1].set_xlabel(x_col)
-    fig.suptitle(title, fontsize=14, fontweight="bold", y=1.01)
+    axes[-1].set_xlabel(x_label)
     fig.savefig(outfile, bbox_inches="tight")
     plt.close(fig)
 
@@ -175,46 +207,70 @@ def plot_multi_run_one_metric(
     metric: str,
     x_col: str,
     outfile: str,
-    title: str,
+    *,
+    max_step: int | None,
+    x_label: str = "step",
+    line_width: float = 1.15,
 ) -> None:
-    """同一指标、多条 run 曲线（不同颜色）。"""
+    """同一指标、多条曲线；run_frames 为 (method 名, df)，图例为方法名；每条曲线同色系画最大值水平参考线。"""
     fig, ax = plt.subplots(figsize=(11, 6.2), constrained_layout=True)
+    ax.grid(False)
     any_line = False
-    for i, (label, df) in enumerate(run_frames):
+    y_label = short_metric_ylabel(metric)
+    for i, (method_label, df) in enumerate(run_frames):
         if metric not in df.columns:
-            print(f"warn: metric {metric!r} missing in run {label}, skip", file=sys.stderr)
+            print(f"warn: metric {metric!r} missing for method {method_label!r}, skip", file=sys.stderr)
             continue
+        dfp = _apply_max_step_mask(df, x_col, max_step)
+        xs = pd.to_numeric(dfp[x_col], errors="coerce").to_numpy()
+        ys = pd.to_numeric(dfp[metric], errors="coerce").to_numpy()
         color = _PALETTE[i % len(_PALETTE)]
-        xs = pd.to_numeric(df[x_col], errors="coerce")
-        ys = pd.to_numeric(df[metric], errors="coerce")
-        ax.plot(xs, ys, color=color, label=label, solid_capstyle="round")
+        ax.plot(xs, ys, color=color, label=method_label, solid_capstyle="round", linewidth=line_width)
+        finite = ys[np.isfinite(ys)]
+        if finite.size > 0:
+            ymax = float(np.nanmax(finite))
+            ax.axhline(
+                ymax,
+                color=color,
+                linestyle="--",
+                linewidth=line_width * 0.85,
+                alpha=0.92,
+                zorder=3,
+            )
         any_line = True
     if not any_line:
         plt.close(fig)
         raise ValueError(f"no data plotted for metric {metric!r}")
-    ax.set_xlabel(x_col)
-    ax.set_ylabel(metric, fontweight="medium")
+    ax.set_xlabel(x_label)
+    ax.set_ylabel(y_label, fontweight="medium")
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
-    ax.legend(loc="best", framealpha=0.95, edgecolor="#CCCCCC", title="run id")
-    ax.set_title(title, fontsize=14, fontweight="bold")
+    ax.legend(loc="best", framealpha=0.95, edgecolor="#CCCCCC")
     fig.savefig(outfile, bbox_inches="tight")
     plt.close(fig)
 
 
-def plot_overlay(df: pd.DataFrame, metrics: list[str], x_col: str, outfile: str, title: str) -> None:
+def plot_overlay(
+    df: pd.DataFrame,
+    metrics: list[str],
+    x_col: str,
+    outfile: str,
+    x_label: str = "step",
+    max_step: int | None = None,
+) -> None:
     fig, ax = plt.subplots(figsize=(11, 6), constrained_layout=True)
-    xs = df[x_col].to_numpy()
+    ax.grid(False)
+    dfp = _apply_max_step_mask(df, x_col, max_step)
+    xs = pd.to_numeric(dfp[x_col], errors="coerce").to_numpy()
     for i, m in enumerate(metrics):
         color = _PALETTE[i % len(_PALETTE)]
-        ys = pd.to_numeric(df[m], errors="coerce")
-        ax.plot(xs, ys, color=color, label=m, solid_capstyle="round")
-    ax.set_xlabel(x_col)
+        ys = pd.to_numeric(dfp[m], errors="coerce")
+        ax.plot(xs, ys, color=color, label=short_metric_ylabel(m), solid_capstyle="round", linewidth=1.15)
+    ax.set_xlabel(x_label)
     ax.set_ylabel("value")
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
     ax.legend(loc="best", framealpha=0.92, edgecolor="#CCCCCC")
-    ax.set_title(title, fontsize=14, fontweight="bold")
     fig.savefig(outfile, bbox_inches="tight")
     plt.close(fig)
 
@@ -233,6 +289,13 @@ def main() -> int:
         help="多个 run id：与 --entity --project 联用，每个 --metrics 中的指标各输出一张对比图",
     )
     parser.add_argument(
+        "--methods",
+        nargs="+",
+        default=None,
+        metavar="METHOD",
+        help="与 --runs 一一对应的方法名（仅多 run 模式必填，用作图例，不写 run id）",
+    )
+    parser.add_argument(
         "--metrics",
         type=str,
         default="",
@@ -248,7 +311,19 @@ def main() -> int:
         "--x-axis",
         type=str,
         default="_step",
-        help="Column for x-axis (default _step; try _runtime for wall time)",
+        help="数据列名作为横轴（默认 _step；与 --x-label 显示文字无关）",
+    )
+    parser.add_argument(
+        "--x-label",
+        type=str,
+        default="step",
+        help="横轴显示标签（默认 step）",
+    )
+    parser.add_argument(
+        "--max-step",
+        type=int,
+        default=0,
+        help="仅绘制横轴 step 不大于此值的点（截断）；0 表示不限制",
     )
     parser.add_argument("--samples", type=int, default=0, help="Max rows from API (0 = full scan_history)")
     parser.add_argument(
@@ -269,6 +344,8 @@ def main() -> int:
 
     _setup_matplotlib_style()
     x_col = args.x_axis
+    x_label = args.x_label
+    max_step = args.max_step if args.max_step > 0 else None
     samples = args.samples if args.samples and args.samples > 0 else None
 
     # ----- 多 run 对比 -----
@@ -279,6 +356,15 @@ def main() -> int:
         if args.run_path or args.run_id:
             print("error: 多 run 模式下不要同时使用 --run-path 或 --run-id", file=sys.stderr)
             return 2
+        if not args.methods:
+            print("error: 多 run 模式必须提供 --methods，且与 --runs 数量一致", file=sys.stderr)
+            return 2
+        if len(args.methods) != len(args.runs):
+            print(
+                f"error: --methods 数量 ({len(args.methods)}) 与 --runs ({len(args.runs)}) 不一致",
+                file=sys.stderr,
+            )
+            return 2
         metric_list = [m.strip() for m in args.metrics.split(",") if m.strip()]
         if not metric_list:
             print("error: --runs 模式下必须提供 --metrics（逗号分隔，每个指标输出一张图）", file=sys.stderr)
@@ -286,10 +372,10 @@ def main() -> int:
         entity, project = args.entity, args.project
         keys = list({*metric_list, x_col, "_step", "_runtime", "_timestamp"})
         run_frames: list[tuple[str, pd.DataFrame]] = []
-        for rid in args.runs:
+        for rid, method in zip(args.runs, args.methods):
             df = fetch_history(entity, project, rid, keys=keys, samples=samples, x_col=x_col)
             if df.empty:
-                print(f"warn: empty history for run {rid}, skip", file=sys.stderr)
+                print(f"warn: empty history for run {rid} ({method}), skip", file=sys.stderr)
                 continue
             if args.smooth and args.smooth > 1:
                 df = df.copy()
@@ -300,7 +386,7 @@ def main() -> int:
                             .rolling(window=args.smooth, min_periods=1)
                             .mean()
                         )
-            run_frames.append((rid, df))
+            run_frames.append((method, df))
 
         if not run_frames:
             print("error: no valid runs loaded", file=sys.stderr)
@@ -314,12 +400,16 @@ def main() -> int:
         os.makedirs(out_dir, exist_ok=True)
 
         for metric in metric_list:
-            title = f"{entity}/{project}\n{metric}"
-            if args.smooth and args.smooth > 1:
-                title += f" (rolling mean, window={args.smooth})"
             out_png = os.path.join(out_dir, f"compare_{_safe_filename(metric)}.png")
             try:
-                plot_multi_run_one_metric(run_frames, metric, x_col, out_png, title)
+                plot_multi_run_one_metric(
+                    run_frames,
+                    metric,
+                    x_col,
+                    out_png,
+                    max_step=max_step,
+                    x_label=x_label,
+                )
                 print(f"saved figure: {out_png}")
             except ValueError as e:
                 print(f"error: {e}", file=sys.stderr)
@@ -366,14 +456,11 @@ def main() -> int:
         for m in metrics:
             df[m] = pd.to_numeric(df[m], errors="coerce").rolling(window=args.smooth, min_periods=1).mean()
 
-    title = f"{entity}/{project} — {run_id}"
-    if args.smooth and args.smooth > 1:
-        title += f" (rolling mean, window={args.smooth})"
     out = args.output or f"wandb_plot_{project}_{run_id}.png"
     if args.layout == "multi":
-        plot_subplots(df, metrics, x_col, out, title)
+        plot_subplots(df, metrics, x_col, out, x_label=x_label, max_step=max_step)
     else:
-        plot_overlay(df, metrics, x_col, out, title)
+        plot_overlay(df, metrics, x_col, out, x_label=x_label, max_step=max_step)
     print(f"saved figure: {out}")
     return 0
 
