@@ -73,12 +73,17 @@ VAL_TOP_P="${VAL_TOP_P:-1.0}"
 
 # -----------------------------
 # GRPO-S（论文 β1/β2 与熵 clip；与 GTPO 主实验一致）
+# - 默认 grpo + arithmetic：与 VERL 常见 0/1 标量奖励一致（失败样本 r=0）
+# - 若要对齐论文附录 C（DAPO 失败 r=-1）与几何负项：设
+#   GRPOS_OUTCOME_CONVENTION=dapo  GRPOS_NEGATIVE_ENTROPY_NORM=geometric
 # -----------------------------
 GRPOS_BETA1="${GRPOS_BETA1:-1.0}"
 GRPOS_BETA2="${GRPOS_BETA2:-0.1}"
 GRPOS_ENTROPY_CLIP_LOW="${GRPOS_ENTROPY_CLIP_LOW:-0.2}"
 GRPOS_ENTROPY_CLIP_HIGH="${GRPOS_ENTROPY_CLIP_HIGH:-0.28}"
 GRPOS_SUCCESS_THRESHOLD="${GRPOS_SUCCESS_THRESHOLD:-0.0}"
+GRPOS_OUTCOME_CONVENTION="${GRPOS_OUTCOME_CONVENTION:-grpo}"
+GRPOS_NEGATIVE_ENTROPY_NORM="${GRPOS_NEGATIVE_ENTROPY_NORM:-arithmetic}"
 
 # -----------------------------
 # Logging / dump（与 FEPO 脚本一致的可选目录）
@@ -106,6 +111,8 @@ python3 -m verl.trainer.main_ppo \
   algorithm.grpos_entropy_clip_low="${GRPOS_ENTROPY_CLIP_LOW}" \
   algorithm.grpos_entropy_clip_high="${GRPOS_ENTROPY_CLIP_HIGH}" \
   algorithm.grpos_success_reward_threshold="${GRPOS_SUCCESS_THRESHOLD}" \
+  algorithm.grpos_outcome_convention="${GRPOS_OUTCOME_CONVENTION}" \
+  algorithm.grpos_negative_entropy_norm="${GRPOS_NEGATIVE_ENTROPY_NORM}" \
   algorithm.use_kl_in_reward=False \
   data.train_files="${TRAIN_FILES}" \
   data.val_files="['${MATH500_VAL}','${AIME24_VAL}']" \

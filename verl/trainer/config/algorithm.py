@@ -593,6 +593,14 @@ class AlgoConfig(BaseConfig):
         grpos_entropy_clip_high (float): Upper clip on per-token entropy before averaging for GRPO-S.
         grpos_success_reward_threshold (float): Path split for GRPO-S; if unset in DictConfig, falls back to
             ``gtpo_success_reward_threshold``.
+        grpos_negative_outcome_value (Optional[float]): Manual override for the negative-path base
+            :math:`\\beta_1 r^{-}` (terminal outcome). If ``None``, see ``grpos_outcome_convention``.
+        grpos_outcome_convention (str): ``grpo`` (default): use batch ``score`` on both paths (typically
+            0/1). ``dapo``: failed sequences use :math:`r^{-}=-1` in the :math:`\\beta_1` term (Appendix C /
+            DAPO alignment), matching the paper's negative sequence formula.
+        grpos_negative_entropy_norm (str): ``arithmetic`` (default): negative entropy term uses
+            :math:`\\beta_2\\,m\\,(1/\\bar{H}_j)/\\sum_{k\\in -}1/\\bar{H}_k` (arithmetic parallel to Eq. (40)).
+            ``geometric``: Appendix C sequence-level form with :math:`(1/\\bar{H}_j)/(\\prod_k 1/\\bar{H}_k)^{1/m}`.
         use_kl_in_reward (bool): Whether to enable in-reward KL penalty.
         kl_penalty (str): How to estimate KL divergence: "kl", "abs", "mse", "low_var_kl", or "full".
         kl_ctrl (KLControlConfig): KL control configuration.
@@ -632,6 +640,9 @@ class AlgoConfig(BaseConfig):
     grpos_entropy_clip_low: float = 0.2
     grpos_entropy_clip_high: float = 0.28
     grpos_success_reward_threshold: float = 0.0
+    grpos_negative_outcome_value: Optional[float] = None
+    grpos_outcome_convention: str = "grpo"
+    grpos_negative_entropy_norm: str = "arithmetic"
     use_kl_in_reward: bool = False
     kl_penalty: str = "kl"
     kl_ctrl: KLControlConfig = field(default_factory=KLControlConfig)

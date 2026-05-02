@@ -504,24 +504,37 @@ def compute_grpo_s_outcome_advantage(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Sequence-level GRPO-S (arXiv:2508.04349).
 
-    Per-sequence **shaped** outcome rewards, then the same group-relative advantage as GRPO
-    (mean/std within each prompt group), broadcast uniformly over valid response tokens.
+    **Positive paths** (terminal score above threshold), **Appendix B Eq. (40)** (arithmetic
+    mean entropy over successes; :math:`n` = number of successes in the group):
 
-    Positive paths (sequence score > threshold), matching Appendix (40) with :math:`r_i` the outcome score:
+        :math:`\\hat{r}^{+}_{i}=\\beta_{1}r_{i}+\\beta_{2}\\frac{\\hat{H}_{i}}{\\sum_{k=1}^{n}\\hat{H}_{k}}\\cdot n`
 
-        :math:`\\hat{r}^{+}_i = \\beta_1 r_i + \\beta_2 \\, n_{+} \\, \\frac{\\bar{H}_i}{\\sum_{k \\in +} \\bar{H}_k}`
+    :math:`\\hat{H}_i` is the mean per-token policy entropy on the response (masked), after the same
+    :math:`[\\epsilon_{low},\\epsilon_{high}]` clipping as in the paper (§3.1 implementation details).
 
-    where :math:`\\bar{H}_i` is the mean clipped policy entropy over valid response tokens.
+    **Negative paths** — the PDF **Appendix C** states the sequence-level form (DAPO failure
+    :math:`r=-1`) with a **geometric** mean in the denominator; we support:
 
-    Negative paths use the paper's dual intuition (confident wrong answers penalized more): inverse
-    mean-entropy weights among negatives only:
+    - ``grpos_negative_entropy_norm=arithmetic`` (default): parallel to Eq. (40), among failures only,
+      :math:`\\hat{r}^{-}_{j}=\\beta_{1}r^{-}_{j}-\\beta_{2}\\,m\\,(1/\\hat{H}_{j})/\\sum_{k\\in -}1/\\hat{H}_{k}`.
+    - ``grpos_negative_entropy_norm=geometric``: Appendix C,
+      :math:`\\hat{r}^{-}_{j}=\\beta_{1}r^{-}_{j}-\\beta_{2}\\,(1/\\hat{H}_{j})/(\\prod_{k=1}^{m}1/\\hat{H}_{k})^{1/m}`.
 
-        :math:`\\hat{r}^{-}_j = \\beta_1 r_j - \\beta_2 \\, n_{-} \\, \\frac{1/\\bar{H}_j}{\\sum_{k \\in -} 1/\\bar{H}_k}`
+    Use ``grpos_outcome_convention=dapo`` so :math:`r^{-}=-1` on failures (paper/DAPO); ``grpo`` uses the
+    batch scalar reward (typically :math:`0` for wrong). Override with ``grpos_negative_outcome_value``.
 
-    If a group has only positives or only negatives, the missing branch is skipped (no division by zero).
+    **Advantages** — same as Eq. (1) but with :math:`\\hat{r}` replacing :math:`r` (Appendix B, Eq. (46)):
+
+        :math:`\\hat{A}_i=(\\hat{r}_i-\\hat{\\mu})/\\hat{\\sigma}` over all :math:`G` sequences in the group.
+
+    Broadcast uniformly to tokens (standard GRPO outcome broadcast in VERL). The paper's PPO objective
+    also uses sequence importance weights :math:`\\hat{w}_i`; VERL's usual policy loss does not multiply
+    by those weights unless you use a matching loss mode elsewhere.
+
+    Degenerate sums (empty entropy) fall back to uniform weights; NaNs in entropy are sanitized.
     """
     with torch.no_grad():
-        scores = token_level_rewards.sum(dim=-1)
+        scores = token_level_rewards.sum(dim=-1).float()
         g = as_torch_index(index, device=scores.device)
         mask_f = response_mask.float()
 
@@ -537,12 +550,26 @@ def compute_grpo_s_outcome_advantage(
                     config.get("gtpo_success_reward_threshold", 0.0),
                 )
             )
+        # 负样本 β1·r^-：显式覆盖 > convention（dapo → r^-=-1；grpo → 使用 batch score，多为 0）
+        neg_outcome_override = None
+        outcome_convention = "grpo"
+        neg_entropy_norm = "arithmetic"
+        if config is not None:
+            v = config.get("grpos_negative_outcome_value", None)
+            neg_outcome_override = None if v is None else float(v)
+            outcome_convention = str(config.get("grpos_outcome_convention", "grpo")).lower().strip()
+            neg_entropy_norm = str(config.get("grpos_negative_entropy_norm", "arithmetic")).lower().strip()
 
-        H_raw = token_entropy.float()
+        # 熵在 bf16 / vLLM 代理上可能出现 nan/inf，不处理会直接把 advantage 打成 nan 导致训练崩溃
+        H_raw = torch.nan_to_num(token_entropy.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        H_raw = H_raw.clamp(min=0.0, max=64.0)
         H_clipped = torch.clamp(H_raw, min=ec_low, max=ec_high)
         H = torch.where(mask_f > 0, H_clipped, torch.zeros_like(H_clipped))
-        len_i = mask_f.sum(dim=-1).clamp(min=1.0)
-        Hbar = (H * mask_f).sum(dim=-1) / len_i
+        valid_len = mask_f.sum(dim=-1)
+        H_sum = (H * mask_f).sum(dim=-1)
+        neutral_h = (ec_low + ec_high) * 0.5
+        Hbar = H_sum / torch.clamp(valid_len, min=1.0)
+        Hbar = torch.where(valid_len > 0, Hbar, torch.full_like(Hbar, neutral_h))
 
         shaped = torch.zeros_like(scores)
         is_pos = scores > thr
@@ -560,20 +587,42 @@ def compute_grpo_s_outcome_advantage(
 
             if n_pos > 0:
                 Hp = Hbar[pos_rows]
-                denom = Hp.sum().clamp(min=epsilon)
-                shaped[pos_rows] = beta1 * scores[pos_rows] + beta2 * n_pos * (Hp / denom)
+                sum_hp = Hp.sum()
+                # sum_hp≈0 时避免 Hp/sum 数值病态；退化为均匀份额 1/n_pos，使每条正轨迹 +beta2（与全相等 H̄ 时一致）
+                uniform_share = torch.full_like(Hp, 1.0 / float(max(n_pos, 1)))
+                ratio = torch.where(
+                    sum_hp < epsilon,
+                    uniform_share,
+                    Hp / sum_hp.clamp(min=epsilon),
+                )
+                shaped[pos_rows] = beta1 * scores[pos_rows] + beta2 * n_pos * ratio
 
             if n_neg > 0:
                 Hn = Hbar[neg_rows].clamp(min=epsilon)
                 inv = 1.0 / Hn
-                denom_inv = inv.sum().clamp(min=epsilon)
-                shaped[neg_rows] = beta1 * scores[neg_rows] - beta2 * n_neg * (inv / denom_inv)
+                if neg_outcome_override is not None:
+                    neg_scores = torch.full_like(scores[neg_rows], float(neg_outcome_override))
+                elif outcome_convention == "dapo":
+                    neg_scores = torch.full_like(scores[neg_rows], -1.0)
+                else:
+                    neg_scores = scores[neg_rows]
+                if neg_entropy_norm == "geometric":
+                    # Appendix C: (1/H_j) / (prod_k 1/H_k)^(1/m)
+                    log_inv = torch.log(inv.clamp(min=epsilon))
+                    gm_inv = torch.exp(torch.mean(log_inv))
+                    ratio = inv / gm_inv.clamp(min=epsilon)
+                    shaped[neg_rows] = beta1 * neg_scores - beta2 * ratio
+                else:
+                    denom_inv = inv.sum().clamp(min=epsilon)
+                    shaped[neg_rows] = beta1 * neg_scores - beta2 * n_neg * (inv / denom_inv)
 
+        shaped = torch.nan_to_num(shaped, nan=0.0, posinf=0.0, neginf=0.0)
         mean_g, std_g, _ = group_mean_std(shaped, g, eps=epsilon, device=scores.device)
         if norm_adv_by_std_in_grpo:
             scalars = (shaped - mean_g[g]) / (std_g[g] + epsilon)
         else:
             scalars = shaped - mean_g[g]
+        scalars = torch.nan_to_num(scalars, nan=0.0, posinf=0.0, neginf=0.0)
         advantages = scalars.unsqueeze(-1) * mask_f
         return advantages, advantages
 

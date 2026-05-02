@@ -113,6 +113,15 @@ algorithm:
 
   grpos_success_reward_threshold: 0.0
 
+  # Optional: override negative-path r^- for beta1 term; null uses grpos_outcome_convention
+  grpos_negative_outcome_value: null
+
+  # grpo: use batch score (0/1); dapo: r^-=-1 on failures (Appendix C / paper experiments vs DAPO)
+  grpos_outcome_convention: grpo
+
+  # arithmetic: inverse-H normalized by sum; geometric: Appendix C GM denominator
+  grpos_negative_entropy_norm: arithmetic
+
   # Whether to enable in-reward KL penalty
   use_kl_in_reward: False
 
