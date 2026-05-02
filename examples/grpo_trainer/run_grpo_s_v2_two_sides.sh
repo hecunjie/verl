@@ -73,17 +73,17 @@ VAL_TOP_P="${VAL_TOP_P:-1.0}"
 
 # -----------------------------
 # GRPO-S（论文 β1/β2 与熵 clip；与 GTPO 主实验一致）
-# - 默认 grpo + arithmetic：与 VERL 常见 0/1 标量奖励一致（失败样本 r=0）
-# - 若要对齐论文附录 C（DAPO 失败 r=-1）与几何负项：设
-#   GRPOS_OUTCOME_CONVENTION=dapo  GRPOS_NEGATIVE_ENTROPY_NORM=geometric
+# - 默认 dapo + geometric：对齐论文附录 C（失败样本 r=-1 + 几何负项）
+# - 若要回退到 VERL 常见 0/1 标量奖励语义，可设：
+#   GRPOS_OUTCOME_CONVENTION=grpo  GRPOS_NEGATIVE_ENTROPY_NORM=arithmetic
 # -----------------------------
 GRPOS_BETA1="${GRPOS_BETA1:-1.0}"
 GRPOS_BETA2="${GRPOS_BETA2:-0.1}"
 GRPOS_ENTROPY_CLIP_LOW="${GRPOS_ENTROPY_CLIP_LOW:-0.2}"
 GRPOS_ENTROPY_CLIP_HIGH="${GRPOS_ENTROPY_CLIP_HIGH:-0.28}"
 GRPOS_SUCCESS_THRESHOLD="${GRPOS_SUCCESS_THRESHOLD:-0.0}"
-GRPOS_OUTCOME_CONVENTION="${GRPOS_OUTCOME_CONVENTION:-grpo}"
-GRPOS_NEGATIVE_ENTROPY_NORM="${GRPOS_NEGATIVE_ENTROPY_NORM:-arithmetic}"
+GRPOS_OUTCOME_CONVENTION="${GRPOS_OUTCOME_CONVENTION:-dapo}"
+GRPOS_NEGATIVE_ENTROPY_NORM="${GRPOS_NEGATIVE_ENTROPY_NORM:-geometric}"
 
 # -----------------------------
 # Logging / dump（与 FEPO 脚本一致的可选目录）

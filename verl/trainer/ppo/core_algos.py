@@ -559,6 +559,10 @@ def compute_grpo_s_outcome_advantage(
             neg_outcome_override = None if v is None else float(v)
             outcome_convention = str(config.get("grpos_outcome_convention", "grpo")).lower().strip()
             neg_entropy_norm = str(config.get("grpos_negative_entropy_norm", "arithmetic")).lower().strip()
+        if outcome_convention not in {"grpo", "dapo"}:
+            outcome_convention = "dapo"
+        if neg_entropy_norm not in {"arithmetic", "geometric"}:
+            neg_entropy_norm = "geometric"
 
         # 熵在 bf16 / vLLM 代理上可能出现 nan/inf，不处理会直接把 advantage 打成 nan 导致训练崩溃
         H_raw = torch.nan_to_num(token_entropy.float(), nan=0.0, posinf=0.0, neginf=0.0)
