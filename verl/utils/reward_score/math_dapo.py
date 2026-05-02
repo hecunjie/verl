@@ -298,6 +298,8 @@ def verify(
     Returns:
         True if the solution is correct, False otherwise
     """
+    answer = str(answer) if answer is not None else ""
+
     if strict_box_verify:
         correct, pred = is_correct_strict_box(solution_str, answer, pause_tokens_index)
         return correct == 1, pred, pred is not None
