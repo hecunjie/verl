@@ -28,6 +28,8 @@
       --metrics "m1,m2,m3,m4" --out-dir ./plots_compare \\
       --max-step 500
 
+  # 具名方法 FEPO / GRPO / GTPO 使用脚本内固定配色（粉 / 蓝 / 黄），其它方法仍走默认调色盘。
+
 依赖: pip install wandb matplotlib pandas
 """
 
@@ -44,7 +46,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-# Okabe–Ito 色盲友好调色（高对比）
+# Okabe–Ito 色盲友好调色（高对比；未命中具名方法时使用）
 _PALETTE = [
     "#E69F00",  # orange
     "#56B4E9",  # sky blue
@@ -55,6 +57,20 @@ _PALETTE = [
     "#CC79A7",  # reddish purple
     "#000000",  # black
 ]
+
+# 多 run 对比：具名方法固定色（不区分大小写；键为方法名去掉首尾空格后的小写）
+_METHOD_COLORS: dict[str, str] = {
+    "fepo": "#E4527F",  # 玫瑰粉，偏珊瑚，白底上清晰不刺眼
+    "grpo": "#1E88E5",  # 明亮蓝（Material Blue 600 系）
+    "gtpo": "#E8B339",  # 暖金黄，避免纯黄发飘
+}
+
+
+def _color_for_method(method_label: str, fallback_index: int) -> str:
+    key = method_label.strip().lower()
+    if key in _METHOD_COLORS:
+        return _METHOD_COLORS[key]
+    return _PALETTE[fallback_index % len(_PALETTE)]
 
 
 def _setup_matplotlib_style() -> None:
@@ -224,7 +240,7 @@ def plot_multi_run_one_metric(
         dfp = _apply_max_step_mask(df, x_col, max_step)
         xs = pd.to_numeric(dfp[x_col], errors="coerce").to_numpy()
         ys = pd.to_numeric(dfp[metric], errors="coerce").to_numpy()
-        color = _PALETTE[i % len(_PALETTE)]
+        color = _color_for_method(method_label, i)
         ax.plot(xs, ys, color=color, label=method_label, solid_capstyle="round", linewidth=line_width)
         finite = ys[np.isfinite(ys)]
         if finite.size > 0:
