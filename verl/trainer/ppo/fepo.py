@@ -449,6 +449,7 @@ def _run_fepo_lowtail_adv_phase(
         rank_scope = "group"
     low_tail_pos_adv_only = bool(fepo_cfg.get("low_tail_pos_adv_only", False))
     high_head_neg_adv_only = bool(fepo_cfg.get("high_head_neg_adv_only", False))
+    high_head_pos_adv_only = bool(fepo_cfg.get("high_head_pos_adv_only", False))
     suffix_len_debias_enable = bool(fepo_cfg.get("suffix_len_debias_enable", False))
     suffix_len_bin_width = int(fepo_cfg.get("suffix_len_bin_width", 2))
     suffix_len_min_count = int(fepo_cfg.get("suffix_len_min_count", 100))
@@ -564,7 +565,14 @@ def _run_fepo_lowtail_adv_phase(
                     n_low_tail_gate_blocked += 1
             elif high_head_penalty > 0.0 and qi >= (1.0 - beta):
                 # high-head penalty: downweight very high-q positions.
-                if (not high_head_neg_adv_only) or (adv_t < 0.0):
+                # When both switches are enabled, positive-only takes precedence.
+                if high_head_pos_adv_only:
+                    allow_high_head = adv_t > 0.0
+                elif high_head_neg_adv_only:
+                    allow_high_head = adv_t < 0.0
+                else:
+                    allow_high_head = True
+                if allow_high_head:
                     m[b, t] = max(0.0, 1.0 - high_head_penalty)
                     n_head_penalized += 1
                 else:
@@ -623,6 +631,7 @@ def _run_fepo_lowtail_adv_phase(
         "fepo/suffix_len_debias_global_fallback": float(n_len_global_fallback),
         "fepo/low_tail_pos_adv_only": 1.0 if low_tail_pos_adv_only else 0.0,
         "fepo/high_head_neg_adv_only": 1.0 if high_head_neg_adv_only else 0.0,
+        "fepo/high_head_pos_adv_only": 1.0 if high_head_pos_adv_only else 0.0,
         "fepo/n_boosted": float(n_boost),
         "fepo/n_head_penalized": float(n_head_penalized),
         "fepo/n_low_tail_gate_blocked": float(n_low_tail_gate_blocked),

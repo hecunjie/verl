@@ -77,6 +77,7 @@ FEPO_BETA="${FEPO_BETA:-0.2}"
 FEPO_HIGH_HEAD_PENALTY="${FEPO_HIGH_HEAD_PENALTY:-0.2}"
 FEPO_LOW_TAIL_POS_ADV_ONLY="${FEPO_LOW_TAIL_POS_ADV_ONLY:-false}"
 FEPO_HIGH_HEAD_NEG_ADV_ONLY="${FEPO_HIGH_HEAD_NEG_ADV_ONLY:-false}"
+FEPO_HIGH_HEAD_POS_ADV_ONLY="${FEPO_HIGH_HEAD_POS_ADV_ONLY:-false}"
 
 # Suffix entropy mode
 FEPO_SUFFIX_MODE="${FEPO_SUFFIX_MODE:-sentence}"                  # sentence / full / fixed_window
@@ -131,6 +132,7 @@ python3 -m verl.trainer.main_ppo \
   +algorithm.fepo.high_head_penalty="${FEPO_HIGH_HEAD_PENALTY}" \
   +algorithm.fepo.low_tail_pos_adv_only="${FEPO_LOW_TAIL_POS_ADV_ONLY}" \
   +algorithm.fepo.high_head_neg_adv_only="${FEPO_HIGH_HEAD_NEG_ADV_ONLY}" \
+  +algorithm.fepo.high_head_pos_adv_only="${FEPO_HIGH_HEAD_POS_ADV_ONLY}" \
   +algorithm.fepo.suffix_mode="${FEPO_SUFFIX_MODE}" \
   +algorithm.fepo.f_sentence_stop="${FEPO_F_SENTENCE_STOP}" \
   +algorithm.fepo.sentence_min_suffix_tokens="${FEPO_SENTENCE_MIN_SUFFIX_TOKENS}" \
