@@ -4,10 +4,11 @@
 **默认训练集**：[`open-r1/DAPO-Math-17k-Processed`](https://huggingface.co/datasets/open-r1/DAPO-Math-17k-Processed)
 （约 1.7 万条，与 DAPO 论文规模一致）。训练样本会统一为 DAPO prompt 指引格式（末行要求 ``Answer: \\boxed{...}``），并将 ``label`` 写入 ``reward_model.ground_truth``。
 
-**测试集**：MATH-500、AIME 2024、AIME 2025、GPQA-D（diamond）。
-其中前两者题干用与上述数据集 **相同** 的 user 文案模板包裹（含 ``\\boxed`` 与末尾 ``Remember to put...``）；
+**测试集**：MATH-500、AIME 2024、AIME 2025、AMC 2023（``math-ai/amc23``）、OlympiadBench（``math-ai/olympiadbench``）、
+Minerva-Math（``svc-huggingface/minerva-math``）、GPQA-D（diamond）。
+其中数学类题干用与上述数据集 **相同** 的 user 文案模板包裹（含 ``\\boxed`` 与末尾 ``Remember to put...``）；
 GPQA-D 会转为四选一格式（末行 ``Answer: X``，X∈{A,B,C,D}）。
-另外新增常见数学测试集：GSM8K（test）、MATH-lighteval（test），同样统一为 DAPO 风格 prompt。
+另外可选：GSM8K（test）、MATH-lighteval（test），同样统一为 DAPO 风格 prompt。
 并支持从 MATH-lighteval 筛出 ``math_hard``（默认 ``level>=5``）单独保存。
 
 若需使用字节版百万级数据，加 ``--train_source byted``。
@@ -22,6 +23,9 @@ GPQA-D 会转为四选一格式（末行 ``Answer: X``，X∈{A,B,C,D}）。
   - math500_test.parquet
   - aime2024_test.parquet
   - aime2025_test.parquet
+  - amc23_test.parquet
+  - olympiadbench_test.parquet
+  - minerva_math_test.parquet
   - gsm8k_test.parquet
   - math_lighteval_test.parquet
   - math_hard_test.parquet
@@ -295,6 +299,82 @@ def iter_aime25_test():
             _gt(a),
             "aime2025",
             extra_info={"index": idx, "split": "aime2025", "source_id": str(ex.get("id", str(idx)))},
+        )
+
+
+def iter_amc23_test():
+    """AMC 2023 竞赛题（40 条），见 `math-ai/amc23`。"""
+    raw = load_dataset("math-ai/amc23")
+    ds = _pick_split(raw) if isinstance(raw, DatasetDict) else raw
+    for idx in range(len(ds)):
+        ex = ds[idx]
+        p = ex.get("question")
+        a = ex.get("answer")
+        if p is None or a is None:
+            raise KeyError(f"AMC23 idx={idx} keys={list(ex.keys())}")
+        yield _row(
+            _user_content_dapo_processed(str(p).strip()),
+            _gt(a),
+            "math-ai/amc23",
+            extra_info={
+                "index": idx,
+                "split": "test",
+                "source_id": str(ex.get("id", str(idx))),
+                "url": ex.get("url"),
+            },
+        )
+
+
+def iter_olympiadbench_test():
+    """OlympiadBench 文本题测试集，见 `math-ai/olympiadbench`（test）。"""
+    raw = load_dataset("math-ai/olympiadbench")
+    ds = _pick_split(raw) if isinstance(raw, DatasetDict) else raw
+    for idx in range(len(ds)):
+        ex = ds[idx]
+        p = ex.get("question")
+        a = ex.get("final_answer")
+        if p is None or a is None:
+            raise KeyError(f"OlympiadBench idx={idx} keys={list(ex.keys())}")
+        yield _row(
+            _user_content_dapo_processed(str(p).strip()),
+            _gt(a),
+            "math-ai/olympiadbench",
+            extra_info={
+                "index": idx,
+                "split": "test",
+                "source_id": str(ex.get("id", str(idx))),
+                "modality": ex.get("modality"),
+                "difficulty": ex.get("difficulty"),
+                "language": ex.get("language"),
+                "subject": ex.get("subject"),
+            },
+        )
+
+
+def iter_minerva_math_test(dataset_id: str = "svc-huggingface/minerva-math"):
+    """Minerva-Math（大学/研究生难度 STEM 数学题），标准答案从 `solution` 中最后一个 ``\\boxed{}`` 抽取。"""
+    raw = load_dataset(dataset_id)
+    ds = _pick_split(raw) if isinstance(raw, DatasetDict) else raw
+    for idx in range(len(ds)):
+        ex = ds[idx]
+        p = ex.get("problem")
+        sol = ex.get("solution")
+        if p is None or sol is None:
+            raise KeyError(f"Minerva-Math idx={idx} keys={list(ex.keys())}")
+        gt = _extract_math_final_answer(sol)
+        if not str(gt).strip():
+            raise ValueError(f"Minerva-Math idx={idx}: could not extract ground truth from solution")
+        yield _row(
+            _user_content_dapo_processed(str(p).strip()),
+            gt,
+            "svc-huggingface/minerva-math",
+            extra_info={
+                "index": idx,
+                "split": "test",
+                "course_type": ex.get("type"),
+                "hf_dataset": dataset_id,
+                "minerva_idx": ex.get("idx"),
+            },
         )
 
 
@@ -686,6 +766,30 @@ def main():
         default=5,
         help="math_hard 过滤的最小 level（默认 5）。",
     )
+    ap.add_argument(
+        "--include_amc23",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="是否导出 AMC 2023 测试集（math-ai/amc23）。",
+    )
+    ap.add_argument(
+        "--include_olympiadbench",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="是否导出 OlympiadBench 测试集（math-ai/olympiadbench）。",
+    )
+    ap.add_argument(
+        "--include_minerva_math",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="是否导出 Minerva-Math 测试集（默认 svc-huggingface/minerva-math）。",
+    )
+    ap.add_argument(
+        "--minerva_math_dataset",
+        type=str,
+        default="svc-huggingface/minerva-math",
+        help="Minerva-Math 的 HuggingFace 数据集名（需含 problem/solution 列，与官方 Minerva-Math 一致）。",
+    )
     args = ap.parse_args()
     out = os.path.expanduser(args.output_dir)
     os.makedirs(out, exist_ok=True)
@@ -731,22 +835,54 @@ def main():
 
     val_files = [f_m500, f_aime, f_aime25]
 
+    f_amc23 = os.path.join(out, "amc23_test.parquet")
+    f_olymp = os.path.join(out, "olympiadbench_test.parquet")
+    f_minerva = os.path.join(out, "minerva_math_test.parquet")
+
+    if bool(args.include_amc23):
+        print("5/8 AMC 2023 (math-ai/amc23, test) ...")
+        n_amc = _write_parquet(f_amc23, iter_amc23_test)
+        print(f"    -> {n_amc} rows, {f_amc23}")
+        val_files.append(f_amc23)
+    else:
+        print("5/8 AMC 2023 (math-ai/amc23, test) ... skipped (--no-include_amc23)")
+
+    if bool(args.include_olympiadbench):
+        print("6/8 OlympiadBench (math-ai/olympiadbench, test) ...")
+        n_ob = _write_parquet(f_olymp, iter_olympiadbench_test)
+        print(f"    -> {n_ob} rows, {f_olymp}")
+        val_files.append(f_olymp)
+    else:
+        print("6/8 OlympiadBench (math-ai/olympiadbench, test) ... skipped (--no-include_olympiadbench)")
+
+    if bool(args.include_minerva_math):
+        print(f"7/8 Minerva-Math ({args.minerva_math_dataset}, test) ...")
+
+        def gen_minerva():
+            yield from iter_minerva_math_test(dataset_id=str(args.minerva_math_dataset).strip())
+
+        n_mv = _write_parquet(f_minerva, gen_minerva)
+        print(f"    -> {n_mv} rows, {f_minerva}")
+        val_files.append(f_minerva)
+    else:
+        print("7/8 Minerva-Math ... skipped (--no-include_minerva_math)")
+
     if bool(args.include_extra_math_tests):
-        print("4/6 GSM8K (test, 同款 prompt) ...")
+        print("8/9 GSM8K (test, 同款 prompt) ...")
         n4 = _write_parquet(f_gsm8k, iter_gsm8k_test)
         print(f"    -> {n4} rows, {f_gsm8k}")
         val_files.append(f_gsm8k)
 
-        print("5/6 MATH-lighteval (test, 同款 prompt) ...")
+        print("9/10 MATH-lighteval (test, 同款 prompt) ...")
         n5 = _write_parquet(f_math_lighteval, iter_math_lighteval_test)
         print(f"    -> {n5} rows, {f_math_lighteval}")
         val_files.append(f_math_lighteval)
     else:
-        print("4/6 GSM8K (test, 同款 prompt) ... skipped (--no-include_extra_math_tests)")
-        print("5/6 MATH-lighteval (test, 同款 prompt) ... skipped (--no-include_extra_math_tests)")
+        print("8/9 GSM8K (test, 同款 prompt) ... skipped (--no-include_extra_math_tests)")
+        print("9/10 MATH-lighteval (test, 同款 prompt) ... skipped (--no-include_extra_math_tests)")
 
     if bool(args.include_math_hard):
-        print("6/7 math_hard (MATH-lighteval level filtered) ...")
+        print("10/11 math_hard (MATH-lighteval level filtered) ...")
 
         def gen_math_hard():
             yield from iter_math_hard_test(min_level=int(args.math_hard_min_level))
@@ -755,12 +891,12 @@ def main():
         print(f"    -> {n_hard} rows, {f_math_hard}")
         val_files.append(f_math_hard)
     else:
-        print("6/7 math_hard (MATH-lighteval level filtered) ... skipped (--no-include_math_hard)")
+        print("10/11 math_hard (MATH-lighteval level filtered) ... skipped (--no-include_math_hard)")
 
     gpqa_enabled = bool(args.include_gpqa_d)
     gpqa_written = False
     if gpqa_enabled:
-        print("7/7 GPQA-D (diamond test, multiple-choice) ...")
+        print("11/11 GPQA-D (diamond test, multiple-choice) ...")
 
         try:
             # Pre-materialize to surface the real underlying exception instead of
@@ -783,7 +919,7 @@ def main():
                 raise
             print(f"    !! 跳过 GPQA-D：{_format_exception_chain(e)}")
     else:
-        print("7/7 GPQA-D (diamond test, multiple-choice) ... skipped (--no-include_gpqa_d)")
+        print("11/11 GPQA-D (diamond test, multiple-choice) ... skipped (--no-include_gpqa_d)")
 
     print("\n训练 / 验证可设为:")
     print(f'  data.train_files="{f_train}"')

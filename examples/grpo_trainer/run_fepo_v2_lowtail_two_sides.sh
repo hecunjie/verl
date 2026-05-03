@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # FEPO v2 (lowtail_adv) concise launcher
-# - Low-tail boost: m = 1 + alpha, q <= beta
+# - Low-tail boost: m = 1 + alpha when adv>0, q <= beta
+# - Low-tail weaken: m = max(0, 1 - low_tail_neg_adv_penalty) when adv<0, q <= beta（默认 0 关闭）
 # - High-head penalty: m = 1 - high_head_penalty, q >= 1 - beta
 # - Sentence suffix entropy with practical speed knobs
 
@@ -74,6 +75,7 @@ FEPO_VARIANT="${FEPO_VARIANT:-lowtail_adv}"
 FEPO_H_THRESHOLD="${FEPO_H_THRESHOLD:-2.0}"
 FEPO_ALPHA="${FEPO_ALPHA:-0.2}"
 FEPO_BETA="${FEPO_BETA:-0.2}"
+FEPO_LOW_TAIL_NEG_ADV_PENALTY="${FEPO_LOW_TAIL_NEG_ADV_PENALTY:-0.0}"
 FEPO_HIGH_HEAD_PENALTY="${FEPO_HIGH_HEAD_PENALTY:-0.2}"
 FEPO_LOW_TAIL_POS_ADV_ONLY="${FEPO_LOW_TAIL_POS_ADV_ONLY:-false}"
 FEPO_HIGH_HEAD_NEG_ADV_ONLY="${FEPO_HIGH_HEAD_NEG_ADV_ONLY:-false}"
@@ -129,6 +131,7 @@ python3 -m verl.trainer.main_ppo \
   +algorithm.fepo.h_threshold="${FEPO_H_THRESHOLD}" \
   +algorithm.fepo.alpha="${FEPO_ALPHA}" \
   +algorithm.fepo.beta="${FEPO_BETA}" \
+  +algorithm.fepo.low_tail_neg_adv_penalty="${FEPO_LOW_TAIL_NEG_ADV_PENALTY}" \
   +algorithm.fepo.high_head_penalty="${FEPO_HIGH_HEAD_PENALTY}" \
   +algorithm.fepo.low_tail_pos_adv_only="${FEPO_LOW_TAIL_POS_ADV_ONLY}" \
   +algorithm.fepo.high_head_neg_adv_only="${FEPO_HIGH_HEAD_NEG_ADV_ONLY}" \

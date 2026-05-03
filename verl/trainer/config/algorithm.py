@@ -657,4 +657,5 @@ class AlgoConfig(BaseConfig):
     # Set to None to disable, use RolloutCorrectionConfig presets (e.g., .tis(), .mis()), or pass dict
     rollout_correction: Optional[RolloutCorrectionConfig] = None
     # FEPO (Future Entropy PO): token-level sparse bonus added to advantages after GRPO (see ``verl.trainer.ppo.fepo``).
+    # lowtail_adv 相关键示例：alpha, beta, low_tail_neg_adv_penalty（对 low-tail 且 adv<0 的弱化系数）等。
     fepo: dict[str, Any] = field(default_factory=dict)

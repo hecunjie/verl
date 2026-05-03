@@ -420,7 +420,12 @@ def _run_fepo_lowtail_adv_phase(
     tokenizer: Any,
     fepo_cfg: dict[str, Any],
 ) -> tuple[DataProto, dict[str, float], list[dict[str, Any]]]:
-    """New FEPO v2: direction from A_t, strength from low-tail suffix entropy-rate quantile."""
+    """New FEPO v2: direction from A_t, strength from low-tail suffix entropy-rate quantile.
+
+    On low-tail positions (``q <= beta``): ``adv > 0`` uses ``m = 1 + alpha`` (强化);
+    ``adv < 0`` uses ``m = max(0, 1 - low_tail_neg_adv_penalty)`` when ``low_tail_neg_adv_penalty > 0``，
+    否则保持与旧版一致（可与 ``low_tail_pos_adv_only`` 组合）。
+    """
     ent_key = "fepo_token_entropy" if "fepo_token_entropy" in batch.batch else "token_entropy"
     if ent_key not in batch.batch:
         raise ValueError(
@@ -448,6 +453,8 @@ def _run_fepo_lowtail_adv_phase(
     if rank_scope not in {"group", "batch"}:
         rank_scope = "group"
     low_tail_pos_adv_only = bool(fepo_cfg.get("low_tail_pos_adv_only", False))
+    # 对 low-tail 且 adv<0 的 token：advantage 乘以 max(0, 1 - low_tail_neg_adv_penalty)。默认 0 不改变旧行为。
+    low_tail_neg_adv_penalty = float(fepo_cfg.get("low_tail_neg_adv_penalty", 0.0))
     high_head_neg_adv_only = bool(fepo_cfg.get("high_head_neg_adv_only", False))
     high_head_pos_adv_only = bool(fepo_cfg.get("high_head_pos_adv_only", False))
     suffix_len_debias_enable = bool(fepo_cfg.get("suffix_len_debias_enable", False))
@@ -457,6 +464,7 @@ def _run_fepo_lowtail_adv_phase(
     alpha = max(alpha, 0.0)
     high_head_penalty = max(high_head_penalty, 0.0)
     beta = float(np.clip(beta, 0.0, 1.0))
+    low_tail_neg_adv_penalty = float(np.clip(low_tail_neg_adv_penalty, 0.0, 1.0))
     collect_point_records = bool(fepo_cfg.get("__collect_point_records", True))
 
     # Realized suffix entropy-rate per token (exclusive future).
@@ -540,6 +548,7 @@ def _run_fepo_lowtail_adv_phase(
     n_boost = 0
     n_head_penalized = 0
     n_low_tail_gate_blocked = 0
+    n_low_tail_neg_penalized = 0
     n_high_head_gate_blocked = 0
 
     for idxs in groups.values():
@@ -558,11 +567,24 @@ def _run_fepo_lowtail_adv_phase(
             q[b, t] = qi
             adv_t = float(advantages[b, t].item())
             if qi <= beta:
-                if (not low_tail_pos_adv_only) or (adv_t > 0.0):
+                if adv_t > 0.0:
                     m[b, t] = 1.0 + alpha
                     n_boost += 1
+                elif adv_t < 0.0:
+                    if low_tail_neg_adv_penalty > 0.0:
+                        m[b, t] = max(0.0, 1.0 - low_tail_neg_adv_penalty)
+                        n_low_tail_neg_penalized += 1
+                    elif not low_tail_pos_adv_only:
+                        m[b, t] = 1.0 + alpha
+                        n_boost += 1
+                    else:
+                        n_low_tail_gate_blocked += 1
                 else:
-                    n_low_tail_gate_blocked += 1
+                    if not low_tail_pos_adv_only:
+                        m[b, t] = 1.0 + alpha
+                        n_boost += 1
+                    else:
+                        n_low_tail_gate_blocked += 1
             elif high_head_penalty > 0.0 and qi >= (1.0 - beta):
                 # high-head penalty: downweight very high-q positions.
                 # When both switches are enabled, positive-only takes precedence.
@@ -589,6 +611,8 @@ def _run_fepo_lowtail_adv_phase(
     n_adv_pos_high = int((high_mask & adv_pos_mask).sum().item())
     n_adv_neg_high = int((high_mask & adv_neg_mask).sum().item())
     n_low_tail_adv_pos = int((low_tail_mask & adv_pos_mask).sum().item())
+    adv_neg_strict_mask = advantages < 0
+    n_low_tail_adv_neg_strict = int((low_tail_mask & adv_neg_strict_mask).sum().item())
     n_high_head_adv_pos = int((high_head_mask & adv_pos_mask).sum().item())
 
     batch.batch["advantages"] = advantages * m * response_mask.float()
@@ -622,6 +646,7 @@ def _run_fepo_lowtail_adv_phase(
         "fepo/h_threshold": float(h_threshold),
         "fepo/alpha": float(alpha),
         "fepo/beta": float(beta),
+        "fepo/low_tail_neg_adv_penalty": float(low_tail_neg_adv_penalty),
         "fepo/high_head_penalty": float(high_head_penalty),
         "fepo/suffix_len_debias_enable": 1.0 if suffix_len_debias_enable else 0.0,
         "fepo/suffix_len_bin_width": float(max(suffix_len_bin_width, 1)),
@@ -635,6 +660,7 @@ def _run_fepo_lowtail_adv_phase(
         "fepo/n_boosted": float(n_boost),
         "fepo/n_head_penalized": float(n_head_penalized),
         "fepo/n_low_tail_gate_blocked": float(n_low_tail_gate_blocked),
+        "fepo/n_low_tail_neg_penalized": float(n_low_tail_neg_penalized),
         "fepo/n_high_head_gate_blocked": float(n_high_head_gate_blocked),
         "fepo/n_low_tail_effective": float(n_low_tail),
         "fepo/n_high_head_effective": float(n_high_head),
@@ -642,6 +668,9 @@ def _run_fepo_lowtail_adv_phase(
         "fepo/head_penalty_hit_rate": (float(n_head_penalized) / float(n_high)) if n_high > 0 else 0.0,
         # Adv-sign diagnostics on effective low-tail / high-head points.
         "fepo/low_tail_adv_pos_ratio": (float(n_low_tail_adv_pos) / float(n_low_tail)) if n_low_tail > 0 else float("nan"),
+        "fepo/low_tail_neg_penalized_ratio": (float(n_low_tail_neg_penalized) / float(n_low_tail_adv_neg_strict))
+        if n_low_tail_adv_neg_strict > 0
+        else float("nan"),
         "fepo/high_head_adv_pos_ratio": (float(n_high_head_adv_pos) / float(n_high_head))
         if n_high_head > 0
         else float("nan"),
@@ -696,6 +725,9 @@ def _run_fepo_lowtail_adv_phase(
         for b in range(int(entropy.size(0))):
             ts = torch.where(high_mask[b])[0].tolist()
             for t in ts:
+                q_bt = float(q[b, t].item())
+                m_bt = float(m[b, t].item())
+                adv_bt = float(advantages[b, t].item())
                 point_records.append(
                     {
                         "batch_index": int(b),
@@ -706,11 +738,14 @@ def _run_fepo_lowtail_adv_phase(
                         "suffix_tokens_used": int(keep_k[b, t].item())
                         if suffix_mode in {"sentence", "fixed_window"}
                         else None,
-                        "q": float(q[b, t].item()),
-                        "m": float(m[b, t].item()),
-                        "adv_before": float(advantages[b, t].item()),
+                        "q": q_bt,
+                        "m": m_bt,
+                        "adv_before": adv_bt,
                         "adv_after": float((advantages[b, t] * m[b, t]).item()),
-                        "boosted": bool(float(m[b, t].item()) > 1.0),
+                        "boosted": bool(m_bt > 1.0),
+                        "low_tail_neg_penalized": bool(
+                            np.isfinite(q_bt) and q_bt <= beta and adv_bt < 0.0 and m_bt < 1.0
+                        ),
                     }
                 )
     return batch, metrics, point_records
