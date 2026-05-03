@@ -45,6 +45,16 @@ ROLLOUT_TP_SIZE="${ROLLOUT_TP_SIZE:-1}"
 ROLLOUT_GPU_MEM_UTIL="${ROLLOUT_GPU_MEM_UTIL:-0.6}"
 REF_LOGPROB_MB_PER_GPU="${REF_LOGPROB_MB_PER_GPU:-4}"
 
+# FSDP actor 会把 ppo_mini_batch_size 规范化为 (ppo_mini_batch_size * rollout.n) // (DP GPU 数)，
+# 必须 >0。单卡或 ppo_mini=1 在多卡上会整除成 0 触发 assert（见 fsdp_workers.py）。
+TRAINER_N_GPUS_PER_NODE="${TRAINER_N_GPUS_PER_NODE:-8}"
+ROLLOUT_N_TRAIN="${ROLLOUT_N_TRAIN:-1}"
+# 默认 ceil(n_gpus / rollout_n)；也可显式 export PPO_MINI_BATCH_SIZE=...
+PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-$(( (TRAINER_N_GPUS_PER_NODE + ROLLOUT_N_TRAIN - 1) / ROLLOUT_N_TRAIN ))}"
+if [ "${PPO_MINI_BATCH_SIZE}" -lt 1 ]; then
+  PPO_MINI_BATCH_SIZE=1
+fi
+
 # 基座评测：避免误从 OUTPUT_DIR 下 auto resume 旧 ckpt
 RESUME_MODE="${RESUME_MODE:-disable}"
 RESUME_FROM_PATH="${RESUME_FROM_PATH:-}"
@@ -86,7 +96,7 @@ python3 -m verl.trainer.main_ppo \
   actor_rollout_ref.model.path="${MODEL_PATH}" \
   actor_rollout_ref.model.use_remove_padding=True \
   actor_rollout_ref.model.enable_gradient_checkpointing=True \
-  actor_rollout_ref.actor.ppo_mini_batch_size=1 \
+  actor_rollout_ref.actor.ppo_mini_batch_size="${PPO_MINI_BATCH_SIZE}" \
   actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
   actor_rollout_ref.actor.ppo_epochs=1 \
   actor_rollout_ref.actor.use_kl_loss=False \
@@ -95,7 +105,7 @@ python3 -m verl.trainer.main_ppo \
   actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu="${ROLLOUT_LOGPROB_MB_PER_GPU}" \
   actor_rollout_ref.rollout.tensor_model_parallel_size="${ROLLOUT_TP_SIZE}" \
   actor_rollout_ref.rollout.gpu_memory_utilization="${ROLLOUT_GPU_MEM_UTIL}" \
-  actor_rollout_ref.rollout.n=1 \
+  actor_rollout_ref.rollout.n="${ROLLOUT_N_TRAIN}" \
   actor_rollout_ref.rollout.val_kwargs.n="${VAL_N}" \
   actor_rollout_ref.rollout.val_kwargs.do_sample="${VAL_DO_SAMPLE}" \
   actor_rollout_ref.rollout.val_kwargs.temperature="${VAL_TEMPERATURE}" \
@@ -103,6 +113,7 @@ python3 -m verl.trainer.main_ppo \
   actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu="${REF_LOGPROB_MB_PER_GPU}" \
   actor_rollout_ref.ref.fsdp_config.param_offload=True \
   trainer.critic_warmup=0 \
+  trainer.n_gpus_per_node="${TRAINER_N_GPUS_PER_NODE}" \
   trainer.logger='["console"]' \
   trainer.project_name="${PROJECT_NAME}" \
   trainer.experiment_name="${EXPERIMENT_NAME}" \
