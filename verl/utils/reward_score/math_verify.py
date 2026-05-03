@@ -14,13 +14,21 @@
 
 """Math-Verify 打分。
 
-送入 ``math_metric`` 前可对长输出做**连续行去重**（缓解复读导致的超时），再取最后一个 ``\\boxed{}``。
-环境变量 ``VERL_MATH_VERIFY_DEDUPE_LINES=0`` 可关闭去重。
+送入 ``math_metric`` 前可做两步压缩（均可用环境变量关闭），再取最后一个 ``\\boxed{}``：
+
+1. **相邻重复行**：整行 ``strip()`` 后与上一行相同则丢弃（只处理有换行分隔的复读）。
+2. **单行内同一字符超长连写**：如 ``靰靰靰靰…``（模型乱码式复读），将连续相同字符压成 1 个（默认至少 20 个才压）。
+
+环境变量：
+
+- ``VERL_MATH_VERIFY_DEDUPE_LINES=0``：关闭 (1)。
+- ``VERL_MATH_VERIFY_COLLAPSE_CHAR_RUN_MIN``：触发 (2) 的最短连写长度，默认 ``20``；设为 ``0`` 关闭 (2)。
 """
 
 from __future__ import annotations
 
 import os
+import re
 
 try:
     from math_verify.errors import TimeoutException
@@ -54,11 +62,29 @@ def _dedupe_consecutive_lines(text: str) -> str:
     return "\n".join(kept)
 
 
+def _collapse_long_runs_of_same_char(text: str, min_run: int) -> str:
+    """将连续出现 ``min_run`` 次及以上的**同一字符**压成 1 个（含 CJK、换行等任意码点）。
+
+    与按行去重互补：乱码常出现在**同一行内**无换行的字符连写，行级去重无法处理。
+    """
+    if min_run < 2 or not text:
+        return text
+    # 首字符 + 其余至少 (min_run - 1) 次相同 → 总长 >= min_run
+    return re.sub(r"(.)\1{" + str(min_run - 1) + r",}", r"\1", text, flags=re.DOTALL)
+
+
 def _prepare_model_output_for_verify(model_output: str) -> str:
     """去重（可选）→ 收窄到 ``\\boxed{...}``（若有）。"""
     text = model_output
     if os.environ.get("VERL_MATH_VERIFY_DEDUPE_LINES", "1").strip().lower() not in ("0", "false", "no", ""):
         text = _dedupe_consecutive_lines(text)
+    raw_min = os.environ.get("VERL_MATH_VERIFY_COLLAPSE_CHAR_RUN_MIN", "20").strip()
+    try:
+        run_min = int(raw_min) if raw_min else 0
+    except ValueError:
+        run_min = 20
+    if run_min >= 2:
+        text = _collapse_long_runs_of_same_char(text, run_min)
     return _narrow_model_output_for_verify(text)
 
 
