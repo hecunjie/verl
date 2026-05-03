@@ -27,6 +27,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 
@@ -38,6 +39,35 @@ except ImportError:
     print("To use Math-Verify, please install it first by running `pip install math-verify`.")
 
 from verl.utils.reward_score.math_dapo import last_boxed_only_string, remove_boxed
+
+_MATH_VERIFY_LOG_CONFIGURED = False
+
+
+def _configure_math_verify_logging_once() -> None:
+    """Optionally silence noisy internal math_verify/sympy logs.
+
+    Some expressions (e.g. symbolic function forms like ``f(x)=1``) can trigger
+    ``NotImplementedError`` inside math_verify's symbolic comparator. The library
+    catches those exceptions but logs full tracebacks at ERROR level, which can
+    flood distributed worker logs. By default we quiet these internal loggers.
+    """
+    global _MATH_VERIFY_LOG_CONFIGURED
+    if _MATH_VERIFY_LOG_CONFIGURED:
+        return
+    _MATH_VERIFY_LOG_CONFIGURED = True
+
+    quiet = os.environ.get("VERL_MATH_VERIFY_QUIET_LOG", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "",
+    )
+    if not quiet:
+        return
+
+    # Keep our outer exception handling behavior unchanged; only reduce noisy internals.
+    for name in ("math_verify", "math_verify.grader", "math_verify.metric", "sympy"):
+        logging.getLogger(name).setLevel(logging.CRITICAL)
 
 
 def _dedupe_consecutive_lines(text: str) -> str:
@@ -107,6 +137,7 @@ def _narrow_model_output_for_verify(model_output: str) -> str:
 
 
 def compute_score(model_output: str, ground_truth: str, timeout_score: float = 0) -> bool:
+    _configure_math_verify_logging_once()
     verify_func = math_metric(
         gold_extraction_target=(LatexExtractionConfig(),),
         pred_extraction_target=(ExprExtractionConfig(), LatexExtractionConfig()),
@@ -134,6 +165,7 @@ def compute_score_with_pred(
     The second return of ``math_metric`` is ``(golds, preds)`` flattened string lists; we surface
     ``preds`` (joined if multiple) as the prediction text used for verification.
     """
+    _configure_math_verify_logging_once()
     verify_func = math_metric(
         gold_extraction_target=(LatexExtractionConfig(),),
         pred_extraction_target=(ExprExtractionConfig(), LatexExtractionConfig()),
