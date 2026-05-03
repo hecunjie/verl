@@ -29,18 +29,7 @@ from typing import Any
 
 import numpy as np
 
-
-def _pass_at_k_unbiased(n: int, c: int, k: int) -> float:
-    if n <= 0:
-        return float("nan")
-    kk = min(max(int(k), 1), int(n))
-    cc = min(max(int(c), 0), int(n))
-    if n - cc < kk:
-        return 1.0
-    prod = 1.0
-    for i in range(kk):
-        prod *= float(n - cc - i) / float(n - i)
-    return 1.0 - prod
+from verl.trainer.ppo.metric_utils import pass_at_k_unbiased
 
 
 def _as_correct(x: Any) -> float:
@@ -98,7 +87,7 @@ def main() -> None:
         head = corr[:kk]
         mean_at_k_list.append(float(np.mean(head)) if head else float("nan"))
         strict_pass.append(1.0 if any(x > 0.5 for x in head) else 0.0)
-        unbiased_pass.append(_pass_at_k_unbiased(n=n, c=c, k=k))
+        unbiased_pass.append(pass_at_k_unbiased(n=n, c=c, k=k))
 
     print(
         json.dumps(

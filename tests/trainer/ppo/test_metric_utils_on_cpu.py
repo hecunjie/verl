@@ -484,6 +484,34 @@ class TestProcessValidationMetrics(unittest.TestCase):
         # For bootstrap with n=2, the majority vote could be either A or B
         # depending on the random sampling, so we don't check the exact value
 
+    def test_process_validation_metrics_pass_at_32(self):
+        """pass_strict@32 / pass_unbiased@32 on 32 repeated samples (same uid)."""
+        uid = "prompt_a"
+        data_sources = ["math_dapo"] * 32
+        sample_uids = [uid] * 32
+        # 8 successes in 32 draws
+        scores = [1.0] * 8 + [0.0] * 24
+        infos_dict = {"acc": scores}
+
+        result = process_validation_metrics(data_sources, sample_uids, infos_dict, seed=0)
+
+        m = result["math_dapo"]["acc"]
+        self.assertIn("pass_strict@32", m)
+        self.assertIn("pass_unbiased@32", m)
+        self.assertAlmostEqual(m["pass_strict@32"], 1.0)
+        self.assertAlmostEqual(m["mean@32"], 8.0 / 32.0)
+        # When n=k=32, unbiased pass@32 coincides with ``any correct`` (same as strict).
+        self.assertAlmostEqual(m["pass_unbiased@32"], 1.0)
+
+        uid2 = "prompt_b"
+        data_sources2 = ["math_dapo"] * 32
+        sample_uids2 = [uid2] * 32
+        infos_dict2 = {"acc": [0.0] * 32}
+        result2 = process_validation_metrics(data_sources2, sample_uids2, infos_dict2, seed=0)
+        m2 = result2["math_dapo"]["acc"]
+        self.assertAlmostEqual(m2["pass_strict@32"], 0.0)
+        self.assertAlmostEqual(m2["pass_unbiased@32"], 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

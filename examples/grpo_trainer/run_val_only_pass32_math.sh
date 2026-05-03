@@ -2,10 +2,10 @@
 # 仅做验证集推理 + 打分（不训练）：利用 VERL 的 trainer.val_before_train + trainer.val_only。
 # 每个 prompt 重复采样 VAL_N 次（actor_rollout_ref.rollout.val_kwargs.n），用于 mean@N / pass@N 分析。
 #
-# 指标说明：
-# - 训练日志 / wandb 中的 val-core/<data_source>/acc/mean@N 等为 VERL 内置聚合（见 metric_utils.process_validation_metrics）。
-# - 论文常见的 **unbiased pass@k** 与 **严格 pass@k（任一命中）** 请对 validation_data_dir 下导出的 jsonl
-#   运行：python examples/grpo_trainer/summarize_val_jsonl_pass_mean_at_k.py --jsonl .../0.jsonl --k 32
+# 指标说明（VERL 内置，无需后处理）：
+# - mean@32：val-core/<data_source>/acc/mean@32（每题 32 次采样的平均正确率，再对题 macro 平均）
+# - pass@32：val-core/<data_source>/acc/pass_strict@32（至少一次做对的比例）
+# - 无偏 pass@32：val-core/.../acc/pass_unbiased@32（与 ``metric_utils.pass_at_k_unbiased`` 一致；当 n=k=32 时与 strict 同值）
 #
 # 用法示例（基座模型、多份 parquet 验证）::
 #   VERL_ROOT=... MODEL_PATH=Qwen/Qwen3-4B \\

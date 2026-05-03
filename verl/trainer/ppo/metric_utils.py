@@ -508,6 +508,37 @@ def calc_maj_val(data: list[dict[str, Any]], vote_key: str, val_key: str) -> flo
     return maj_val
 
 
+def val_metric_section(*, core_var: str, var_name: str, metric_name: str, n_max: int) -> str:
+    """Return ``val-core`` or ``val-aux`` for flattened validation metric keys (wandb / console)."""
+    if var_name != core_var:
+        return "val-aux"
+    if metric_name.startswith("pass_strict@") or metric_name.startswith("pass_unbiased@"):
+        return "val-core"
+    if any(metric_name.startswith(pfx) for pfx in ("mean", "maj", "best")) and (f"@{n_max}" in metric_name):
+        return "val-core"
+    return "val-aux"
+
+
+def _to_correct_01(v: Any) -> float:
+    if isinstance(v, bool | np.bool_):
+        return 1.0 if v else 0.0
+    return 1.0 if float(v) > 0.5 else 0.0
+
+
+def pass_at_k_unbiased(n: int, c: int, k: int) -> float:
+    """Unbiased pass@k estimator: ``1 - C(n-c,k) / C(n,k)`` (Clement et al. style)."""
+    if n <= 0:
+        return float("nan")
+    kk = min(max(int(k), 1), int(n))
+    cc = min(max(int(c), 0), int(n))
+    if n - cc < kk:
+        return 1.0
+    prod = 1.0
+    for i in range(kk):
+        prod *= float(n - cc - i) / float(n - i)
+    return 1.0 - prod
+
+
 def process_validation_metrics(
     data_sources: list[str], sample_uids: list[str], infos_dict: dict[str, list[Any]], seed: int = 42
 ) -> dict[str, dict[str, dict[str, float]]]:
@@ -544,6 +575,9 @@ def process_validation_metrics(
         - "worst@N/std": Standard deviation of the worst values in bootstrap samples
         - "maj@N/mean": Mean of majority voting results in bootstrap samples (if "pred" exists)
         - "maj@N/std": Standard deviation of majority voting results (if "pred" exists)
+        - "pass_strict@32": Per-prompt 1 if any of the first 32 responses is correct (then mean over prompts).
+          Only computed for ``acc`` / ``reward`` when ``N >= 32`` (uses first 32 if ``N > 32``).
+        - "pass_unbiased@32": Per-prompt unbiased pass@32 estimate from the first 32 binary scores, then mean.
 
     Example:
         >>> data_sources = ["source1", "source1", "source2"]
@@ -663,6 +697,14 @@ def process_validation_metrics(
                             )
                             metric[f"maj@{n}/mean"] = maj_n_mean
                             metric[f"maj@{n}/std"] = maj_n_std
+
+                # pass@32 (strict + unbiased): only for binary-like acc/reward with enough samples
+                if var_name in ("acc", "reward") and n_resps >= 32:
+                    first32 = var_vals[:32]
+                    corrs = [_to_correct_01(v) for v in first32]
+                    c32 = int(sum(1 for x in corrs if x > 0.5))
+                    metric["pass_strict@32"] = 1.0 if c32 > 0 else 0.0
+                    metric["pass_unbiased@32"] = pass_at_k_unbiased(32, c32, 32)
 
                 var_dict[var_name] = metric
 
