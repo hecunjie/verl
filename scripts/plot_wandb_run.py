@@ -31,7 +31,7 @@
   # 横轴从约 30 step 起画，且刻度只标 100 的倍数（不出现 30）：
   #   --min-step 30 --x-tick-multiple 100
 
-  # 具名方法 FEPO / GRPO / GTPO 使用脚本内固定配色（粉 / 蓝 / 黄），其它方法仍走默认调色盘。
+# 具名方法 FEPO / GTPO / GRPO 使用脚本内固定配色（红 / 蓝 / 绿），其它方法仍走默认调色盘。
 
 依赖: pip install wandb matplotlib pandas
 """
@@ -65,9 +65,9 @@ _PALETTE = [
 
 # 多 run 对比：具名方法固定色（不区分大小写；键为方法名去掉首尾空格后的小写）
 _METHOD_COLORS: dict[str, str] = {
-    "fepo": "#E4527F",  # 玫瑰粉，偏珊瑚，白底上清晰不刺眼
-    "grpo": "#1E88E5",  # 明亮蓝（Material Blue 600 系）
-    "gtpo": "#E8B339",  # 暖金黄，避免纯黄发飘
+    "fepo": "#D32F2F",  # red
+    "gtpo": "#1976D2",  # blue
+    "grpo": "#2E7D32",  # green
 }
 
 
@@ -81,20 +81,21 @@ def _color_for_method(method_label: str, fallback_index: int) -> str:
 def _setup_matplotlib_style() -> None:
     mpl.rcParams.update(
         {
-            "figure.dpi": 120,
-            "savefig.dpi": 200,
-            "font.size": 11,
-            "axes.titlesize": 13,
+            "figure.dpi": 140,
+            "savefig.dpi": 260,
+            "font.size": 12,
+            "axes.titlesize": 14,
             "axes.labelsize": 12,
             "legend.fontsize": 10,
-            "xtick.labelsize": 10,
-            "ytick.labelsize": 10,
+            "xtick.labelsize": 11,
+            "ytick.labelsize": 11,
             "axes.grid": False,
-            "axes.facecolor": "#FAFAFA",
+            "axes.facecolor": "#FFFFFF",
             "figure.facecolor": "white",
+            "savefig.facecolor": "white",
             "axes.edgecolor": "#333333",
             "axes.linewidth": 1.0,
-            "lines.linewidth": 1.15,
+            "lines.linewidth": 1.35,
             "lines.markersize": 3,
         }
     )
@@ -230,18 +231,18 @@ def plot_subplots(
     x_tick_multiple: float = 0.0,
 ) -> None:
     n = len(metrics)
-    fig_h = min(3.2 * n, 36)
-    fig, axes = plt.subplots(n, 1, figsize=(11, fig_h), sharex=True, constrained_layout=True)
+    fig_h = min(2.8 * n + 0.6, 26)
+    fig, axes = plt.subplots(n, 1, figsize=(10.2, fig_h), sharex=True, constrained_layout=True)
     if n == 1:
         axes = [axes]
     dfp = _apply_step_range_mask(df, x_col, min_step, max_step)
     xs = pd.to_numeric(dfp[x_col], errors="coerce").to_numpy()
     for ax, m, color in zip(axes, metrics, _PALETTE * (1 + n // len(_PALETTE))):
         ys = pd.to_numeric(dfp[m], errors="coerce")
-        ax.plot(xs, ys, color=color, label=m, solid_capstyle="round", linewidth=1.15)
+        ax.plot(xs, ys, color=color, label=m, solid_capstyle="round", linewidth=1.35)
         ax.set_ylabel(short_metric_ylabel(m), color=color, fontweight="medium")
         ax.tick_params(axis="y", labelcolor=color)
-        ax.grid(False)
+        ax.grid(axis="y", color="#E5E7EB", linestyle="-", linewidth=0.8, alpha=0.9)
         ax.spines["top"].set_visible(False)
         ax.spines["right"].set_visible(False)
     axes[-1].set_xlabel(x_label)
@@ -269,8 +270,8 @@ def plot_multi_run_one_metric(
     x_tick_multiple: float = 0.0,
 ) -> None:
     """同一指标、多条曲线；run_frames 为 (method 名, df)，图例为方法名；每条曲线同色系画最大值水平参考线。"""
-    fig, ax = plt.subplots(figsize=(11, 6.2), constrained_layout=True)
-    ax.grid(False)
+    fig, ax = plt.subplots(figsize=(9.8, 5.8), constrained_layout=True)
+    ax.grid(axis="y", color="#E5E7EB", linestyle="-", linewidth=0.85, alpha=0.9)
     any_line = False
     y_label = short_metric_ylabel(metric)
     x_lo, x_hi = float("inf"), float("-inf")
@@ -322,14 +323,14 @@ def plot_overlay(
     max_step: int | None = None,
     x_tick_multiple: float = 0.0,
 ) -> None:
-    fig, ax = plt.subplots(figsize=(11, 6), constrained_layout=True)
-    ax.grid(False)
+    fig, ax = plt.subplots(figsize=(9.8, 5.8), constrained_layout=True)
+    ax.grid(axis="y", color="#E5E7EB", linestyle="-", linewidth=0.85, alpha=0.9)
     dfp = _apply_step_range_mask(df, x_col, min_step, max_step)
     xs = pd.to_numeric(dfp[x_col], errors="coerce").to_numpy()
     for i, m in enumerate(metrics):
         color = _PALETTE[i % len(_PALETTE)]
         ys = pd.to_numeric(dfp[m], errors="coerce")
-        ax.plot(xs, ys, color=color, label=short_metric_ylabel(m), solid_capstyle="round", linewidth=1.15)
+        ax.plot(xs, ys, color=color, label=short_metric_ylabel(m), solid_capstyle="round", linewidth=1.35)
     ax.set_xlabel(x_label)
     ax.set_ylabel("value")
     ax.spines["top"].set_visible(False)
