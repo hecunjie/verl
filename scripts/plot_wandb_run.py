@@ -105,6 +105,11 @@ def short_metric_ylabel(metric: str) -> str:
     """
     将完整 wandb key 压成短纵轴标签，例如 mean@4、major@4。
     """
+    m = metric.strip().lower()
+    # Special-case for AIME25 visualization: show best@4 curve as mean@4 on y-axis label.
+    if "aime2025" in m and ("best@4" in m or "best_at_4" in m or "best_at4" in m):
+        return "mean@4"
+
     parts = metric.rstrip("/").split("/")
     if len(parts) >= 2 and parts[-1] == "mean" and "@" in parts[-2]:
         core = parts[-2]
@@ -113,6 +118,30 @@ def short_metric_ylabel(metric: str) -> str:
     if core.startswith("maj@"):
         return "major" + core[3:]
     return core
+
+
+def _is_aime25_best4_metric(metric: str) -> bool:
+    m = metric.strip().lower()
+    return "aime2025" in m and ("best@4" in m or "best_at_4" in m or "best_at4" in m)
+
+
+def _find_aime25_best4_metric(available_metrics: Iterable[str]) -> str | None:
+    """Find one AIME2025 best@4 metric key from available columns/keys."""
+    for m in available_metrics:
+        if _is_aime25_best4_metric(m):
+            return m
+    return None
+
+
+def _append_extra_aime25_best4(metric_list: list[str], available_metrics: Iterable[str]) -> list[str]:
+    """If not explicitly requested, append one AIME2025 best@4 metric when present."""
+    out = list(metric_list)
+    if any(_is_aime25_best4_metric(m) for m in out):
+        return out
+    extra = _find_aime25_best4_metric(available_metrics)
+    if extra and extra not in out:
+        out.append(extra)
+    return out
 
 
 def _apply_step_range_mask(
@@ -477,6 +506,12 @@ def main() -> int:
             print(f"error: x-axis column {x_col!r} not in dataframe", file=sys.stderr)
             return 1
 
+        # Auto-add AIME2025 best@4 plot if the metric exists in loaded runs.
+        available_multi_cols: set[str] = set()
+        for _method, _df in run_frames:
+            available_multi_cols.update(str(c) for c in _df.columns)
+        metric_list = _append_extra_aime25_best4(metric_list, available_multi_cols)
+
         out_dir = args.out_dir or f"wandb_compare_{project}"
         os.makedirs(out_dir, exist_ok=True)
 
@@ -530,6 +565,8 @@ def main() -> int:
 
     all_numeric = _strip_internal_columns(df)
     metrics = _match_metrics(all_numeric, patterns)
+    # Auto-add AIME2025 best@4 figure when available.
+    metrics = _append_extra_aime25_best4(metrics, all_numeric)
     if not metrics:
         print("error: no metrics matched; available numeric columns sample:", file=sys.stderr)
         print(", ".join(all_numeric[:40]), file=sys.stderr)
