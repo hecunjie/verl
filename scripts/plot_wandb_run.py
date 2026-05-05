@@ -144,6 +144,18 @@ def _append_extra_aime25_best4(metric_list: list[str], available_metrics: Iterab
     return out
 
 
+def _aime25_best4_key_candidates() -> list[str]:
+    """Common W&B key variants for AIME2025 best@4."""
+    return [
+        "val-core/aime2025/acc/best@4",
+        "val-core/aime2025/acc/best_at_4",
+        "val-core/aime2025/acc/best_at4",
+        "val-core/aime2025/acc/best@4/mean",
+        "val-core/aime2025/acc/best_at_4/mean",
+        "val-core/aime2025/acc/best_at4/mean",
+    ]
+
+
 def _apply_step_range_mask(
     df: pd.DataFrame,
     x_col: str,
@@ -480,7 +492,8 @@ def main() -> int:
             print("error: --runs 模式下必须提供 --metrics（逗号分隔，每个指标输出一张图）", file=sys.stderr)
             return 2
         entity, project = args.entity, args.project
-        keys = list({*metric_list, x_col, "_step", "_runtime", "_timestamp"})
+        # Also request AIME2025 best@4 candidates so auto-extra plotting can detect them.
+        keys = list({*metric_list, *_aime25_best4_key_candidates(), x_col, "_step", "_runtime", "_timestamp"})
         run_frames: list[tuple[str, pd.DataFrame]] = []
         for rid, method in zip(args.runs, args.methods):
             df = fetch_history(entity, project, rid, keys=keys, samples=samples, x_col=x_col)
