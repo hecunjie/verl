@@ -77,6 +77,7 @@ FEPO_ALPHA="${FEPO_ALPHA:-0.2}"
 FEPO_BETA="${FEPO_BETA:-0.2}"
 FEPO_LOW_TAIL_NEG_ADV_PENALTY="${FEPO_LOW_TAIL_NEG_ADV_PENALTY:-0.0}"
 FEPO_HIGH_HEAD_PENALTY="${FEPO_HIGH_HEAD_PENALTY:-0.2}"
+FEPO_HIGH_HEAD_NEG_ADV_BOOST="${FEPO_HIGH_HEAD_NEG_ADV_BOOST:-0.0}"
 FEPO_RANK_SCOPE="${FEPO_RANK_SCOPE:-batch}"                      # group / batch
 FEPO_LOW_TAIL_POS_ADV_ONLY="${FEPO_LOW_TAIL_POS_ADV_ONLY:-false}"
 FEPO_HIGH_HEAD_NEG_ADV_ONLY="${FEPO_HIGH_HEAD_NEG_ADV_ONLY:-false}"
@@ -133,6 +134,7 @@ python3 -m verl.trainer.main_ppo \
   +algorithm.fepo.beta="${FEPO_BETA}" \
   +algorithm.fepo.low_tail_neg_adv_penalty="${FEPO_LOW_TAIL_NEG_ADV_PENALTY}" \
   +algorithm.fepo.high_head_penalty="${FEPO_HIGH_HEAD_PENALTY}" \
+  +algorithm.fepo.high_head_neg_adv_boost="${FEPO_HIGH_HEAD_NEG_ADV_BOOST}" \
   +algorithm.fepo.low_tail_pos_adv_only="${FEPO_LOW_TAIL_POS_ADV_ONLY}" \
   +algorithm.fepo.high_head_neg_adv_only="${FEPO_HIGH_HEAD_NEG_ADV_ONLY}" \
   +algorithm.fepo.rank_scope="${FEPO_RANK_SCOPE}" \

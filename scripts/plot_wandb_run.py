@@ -273,6 +273,43 @@ def fetch_history(
     return df
 
 
+def fetch_history_by_metrics(
+    entity: str,
+    project: str,
+    run_id: str,
+    metrics: list[str],
+    samples: int | None,
+    x_col: str,
+) -> pd.DataFrame:
+    """Fetch one metric at a time and outer-merge by x axis.
+
+    This avoids W&B history empty-results when querying multiple sparse keys together.
+    """
+    merged: pd.DataFrame | None = None
+    for m in metrics:
+        dfi = fetch_history(entity, project, run_id, keys=[x_col, m], samples=samples, x_col=x_col)
+        if dfi.empty or m not in dfi.columns:
+            continue
+        if x_col not in dfi.columns:
+            # Defensive fallback for cases where x-axis key is missing in this query result.
+            if "_step" in dfi.columns:
+                dfi = dfi.rename(columns={"_step": x_col})
+            else:
+                continue
+        dfi = dfi[[x_col, m]].copy()
+        dfi[x_col] = pd.to_numeric(dfi[x_col], errors="coerce")
+        dfi[m] = pd.to_numeric(dfi[m], errors="coerce")
+        dfi = dfi.dropna(subset=[x_col]).drop_duplicates(subset=[x_col], keep="last")
+        if merged is None:
+            merged = dfi
+        else:
+            merged = merged.merge(dfi, on=x_col, how="outer")
+    if merged is None:
+        return pd.DataFrame()
+    merged = merged.sort_values(by=x_col).reset_index(drop=True)
+    return merged
+
+
 def plot_subplots(
     df: pd.DataFrame,
     metrics: list[str],
@@ -504,17 +541,23 @@ def main() -> int:
             print("error: --runs 模式下必须提供 --metrics（逗号分隔，每个指标输出一张图）", file=sys.stderr)
             return 2
         entity, project = args.entity, args.project
-        # Also request AIME2025 best@4 candidates so auto-extra plotting can detect them.
-        keys = list({*metric_list, *_aime25_best4_key_candidates(), x_col, "_step", "_runtime", "_timestamp"})
+        fetch_metrics = list({*metric_list, *_aime25_best4_key_candidates()})
         run_frames: list[tuple[str, pd.DataFrame]] = []
         for rid, method in zip(args.runs, args.methods):
-            df = fetch_history(entity, project, rid, keys=keys, samples=samples, x_col=x_col)
+            df = fetch_history_by_metrics(
+                entity=entity,
+                project=project,
+                run_id=rid,
+                metrics=fetch_metrics,
+                samples=samples,
+                x_col=x_col,
+            )
             if df.empty:
                 print(f"warn: empty history for run {rid} ({method}), skip", file=sys.stderr)
                 continue
             if args.smooth and args.smooth > 1:
                 df = df.copy()
-                for m in metric_list:
+                for m in fetch_metrics:
                     if m in df.columns:
                         df[m] = (
                             pd.to_numeric(df[m], errors="coerce")

@@ -441,6 +441,8 @@ def _run_fepo_lowtail_adv_phase(
     alpha = float(fepo_cfg.get("alpha", fepo_cfg.get("bonus_pos", 0.2)))
     beta = float(fepo_cfg.get("beta", 0.2))
     high_head_penalty = float(fepo_cfg.get("high_head_penalty", 0.0))
+    # 对 high-head 且 adv<0 的 token：advantage 乘以 1 + high_head_neg_adv_boost（强化）。默认 0 关闭。
+    high_head_neg_adv_boost = float(fepo_cfg.get("high_head_neg_adv_boost", 0.0))
     suffix_mode = str(fepo_cfg.get("suffix_mode", "full"))  # full / sentence
     f_sentence_stop = str(fepo_cfg.get("f_sentence_stop", "simple"))
     sentence_min_suffix_tokens = int(fepo_cfg.get("sentence_min_suffix_tokens", 5))
@@ -463,6 +465,7 @@ def _run_fepo_lowtail_adv_phase(
     suffix_len_z_clip = float(fepo_cfg.get("suffix_len_z_clip", 3.0))
     alpha = max(alpha, 0.0)
     high_head_penalty = max(high_head_penalty, 0.0)
+    high_head_neg_adv_boost = max(high_head_neg_adv_boost, 0.0)
     beta = float(np.clip(beta, 0.0, 1.0))
     low_tail_neg_adv_penalty = float(np.clip(low_tail_neg_adv_penalty, 0.0, 1.0))
     collect_point_records = bool(fepo_cfg.get("__collect_point_records", True))
@@ -550,6 +553,7 @@ def _run_fepo_lowtail_adv_phase(
     n_low_tail_gate_blocked = 0
     n_low_tail_neg_penalized = 0
     n_high_head_gate_blocked = 0
+    n_high_head_neg_boosted = 0
 
     for idxs in groups.values():
         positions: list[tuple[int, int, float]] = []
@@ -585,20 +589,27 @@ def _run_fepo_lowtail_adv_phase(
                         n_boost += 1
                     else:
                         n_low_tail_gate_blocked += 1
-            elif high_head_penalty > 0.0 and qi >= (1.0 - beta):
-                # high-head penalty: downweight very high-q positions.
-                # When both switches are enabled, positive-only takes precedence.
-                if high_head_pos_adv_only:
-                    allow_high_head = adv_t > 0.0
-                elif high_head_neg_adv_only:
-                    allow_high_head = adv_t < 0.0
-                else:
-                    allow_high_head = True
-                if allow_high_head:
-                    m[b, t] = max(0.0, 1.0 - high_head_penalty)
-                    n_head_penalized += 1
-                else:
-                    n_high_head_gate_blocked += 1
+            elif qi >= (1.0 - beta):
+                # High-head branch:
+                # 1) 可选：adv<0 时使用 high_head_neg_adv_boost 强化（m > 1）
+                # 2) 否则按原有 high_head_penalty 下调（m < 1）
+                if adv_t < 0.0 and high_head_neg_adv_boost > 0.0:
+                    m[b, t] = 1.0 + high_head_neg_adv_boost
+                    n_high_head_neg_boosted += 1
+                elif high_head_penalty > 0.0:
+                    # high-head penalty: downweight very high-q positions.
+                    # When both switches are enabled, positive-only takes precedence.
+                    if high_head_pos_adv_only:
+                        allow_high_head = adv_t > 0.0
+                    elif high_head_neg_adv_only:
+                        allow_high_head = adv_t < 0.0
+                    else:
+                        allow_high_head = True
+                    if allow_high_head:
+                        m[b, t] = max(0.0, 1.0 - high_head_penalty)
+                        n_head_penalized += 1
+                    else:
+                        n_high_head_gate_blocked += 1
 
     # Effective split masks on selected high-entropy points.
     q_finite_mask = torch.isfinite(q)
@@ -648,6 +659,7 @@ def _run_fepo_lowtail_adv_phase(
         "fepo/beta": float(beta),
         "fepo/low_tail_neg_adv_penalty": float(low_tail_neg_adv_penalty),
         "fepo/high_head_penalty": float(high_head_penalty),
+        "fepo/high_head_neg_adv_boost": float(high_head_neg_adv_boost),
         "fepo/suffix_len_debias_enable": 1.0 if suffix_len_debias_enable else 0.0,
         "fepo/suffix_len_bin_width": float(max(suffix_len_bin_width, 1)),
         "fepo/suffix_len_min_count": float(max(suffix_len_min_count, 1)),
@@ -659,6 +671,7 @@ def _run_fepo_lowtail_adv_phase(
         "fepo/high_head_pos_adv_only": 1.0 if high_head_pos_adv_only else 0.0,
         "fepo/n_boosted": float(n_boost),
         "fepo/n_head_penalized": float(n_head_penalized),
+        "fepo/n_high_head_neg_boosted": float(n_high_head_neg_boosted),
         "fepo/n_low_tail_gate_blocked": float(n_low_tail_gate_blocked),
         "fepo/n_low_tail_neg_penalized": float(n_low_tail_neg_penalized),
         "fepo/n_high_head_gate_blocked": float(n_high_head_gate_blocked),
@@ -666,6 +679,7 @@ def _run_fepo_lowtail_adv_phase(
         "fepo/n_high_head_effective": float(n_high_head),
         "fepo/boost_hit_rate": (float(n_boost) / float(n_high)) if n_high > 0 else 0.0,
         "fepo/head_penalty_hit_rate": (float(n_head_penalized) / float(n_high)) if n_high > 0 else 0.0,
+        "fepo/high_head_neg_boost_hit_rate": (float(n_high_head_neg_boosted) / float(n_high)) if n_high > 0 else 0.0,
         # Adv-sign diagnostics on effective low-tail / high-head points.
         "fepo/low_tail_adv_pos_ratio": (float(n_low_tail_adv_pos) / float(n_low_tail)) if n_low_tail > 0 else float("nan"),
         "fepo/low_tail_neg_penalized_ratio": (float(n_low_tail_neg_penalized) / float(n_low_tail_adv_neg_strict))
