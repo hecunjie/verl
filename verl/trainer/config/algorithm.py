@@ -610,6 +610,7 @@ class AlgoConfig(BaseConfig):
         use_pf_ppo (bool): Whether to enable preference feedback PPO.
         pf_ppo (dict[str, Any]): Preference feedback PPO settings.
         filter_groups (Optional[FilterGroupsConfig]): Filter groups configuration, used in DAPO and Entropy
+        etr (dict[str, Any]): Entropy Trend Reward (arXiv:2604.05355); see ``verl.trainer.ppo.etr_reward``.
         rollout_correction (Optional[RolloutCorrectionConfig]): Rollout Correction configuration.
             Addresses off-policy issues from policy mismatch, model staleness, and general distribution shifts.
 
@@ -659,3 +660,6 @@ class AlgoConfig(BaseConfig):
     # FEPO (Future Entropy PO): token-level sparse bonus added to advantages after GRPO (see ``verl.trainer.ppo.fepo``).
     # lowtail_adv 相关键示例：alpha, beta, low_tail_neg_adv_penalty（对 low-tail 且 adv<0 的弱化系数）等。
     fepo: dict[str, Any] = field(default_factory=dict)
+    # ETR (Entropy Trend Reward, arXiv:2604.05355): scalar outcome reward shaping on correct trajectories before GRPO.
+    # Keys: enable, gamma, lambda_coef, segment_mode (chunk|newline), chunk_tokens, clip_r_entropy, etc.
+    etr: dict[str, Any] = field(default_factory=dict)

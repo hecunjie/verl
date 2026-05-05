@@ -1634,6 +1634,7 @@ class RayPPOTrainer:
                     rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
                     bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
                     fepo_enable = bool(self.config.algorithm.get("fepo", {}).get("enable", False))
+                    etr_enable = bool(self.config.algorithm.get("etr", {}).get("enable", False))
                     if bypass_recomputing_logprobs:  # Use `rollout_log_probs`
                         from verl.trainer.ppo.rollout_corr_helper import apply_bypass_mode
 
@@ -1661,6 +1662,15 @@ class RayPPOTrainer:
                             batch.batch["token_entropy"] = (-batch.batch["rollout_log_probs"].float()).clamp(
                                 min=0.0
                             )
+                        if etr_enable and "token_entropy" not in batch.batch:
+                            if "rollout_log_probs" not in batch.batch:
+                                raise ValueError(
+                                    "ETR with rollout_correction bypass_mode requires rollout_log_probs on batch "
+                                    "to build a per-token entropy proxy (-log pi_rollout), or disable bypass."
+                                )
+                            batch.batch["token_entropy"] = (-batch.batch["rollout_log_probs"].float()).clamp(
+                                min=0.0
+                            )
                     else:  # Recompute old_log_probs
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
                             old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
@@ -1682,7 +1692,7 @@ class RayPPOTrainer:
                                 AdvantageEstimator.GRPO_GTPO,
                                 AdvantageEstimator.GTPO,
                                 AdvantageEstimator.GRPO_S,
-                            ):
+                            ) or etr_enable:
                                 batch.batch["token_entropy"] = entropys.detach().clone()
                             if fepo_enable:
                                 batch.batch["fepo_token_entropy"] = entropys.detach().clone()
@@ -1729,6 +1739,17 @@ class RayPPOTrainer:
 
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+
+                        if etr_enable:
+                            from verl.trainer.ppo.etr_reward import apply_etr_shaping_to_token_scores
+
+                            _etr_cfg = self.config.algorithm.get("etr", {}) or {}
+                            etr_container = OmegaConf.to_container(_etr_cfg, resolve=True)
+                            etr_dict = dict(etr_container) if isinstance(etr_container, dict) else {}
+                            etr_metrics = apply_etr_shaping_to_token_scores(
+                                batch, self.tokenizer, etr_dict
+                            )
+                            metrics.update(etr_metrics)
 
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:

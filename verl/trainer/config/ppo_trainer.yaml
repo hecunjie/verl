@@ -125,6 +125,26 @@ algorithm:
   # Whether to shape negative paths with entropy term (False is a conservative/stable alternative)
   grpos_shape_negative: true
 
+  # ETR (Entropy Trend Reward, arXiv:2604.05355): replaces terminal outcome reward with -1 (wrong) or
+  # 1 + lambda_coef * R_entropy (right). Requires batch token_entropy (see ray_trainer ETR hook).
+  etr:
+
+    enable: False
+
+    gamma: 0.9
+
+    lambda_coef: 0.1
+
+    segment_mode: chunk
+
+    chunk_tokens: 32
+
+    clip_r_entropy: null
+
+    correct_base_reward: 1.0
+
+    incorrect_reward: -1.0
+
   # Whether to enable in-reward KL penalty
   use_kl_in_reward: False
 
