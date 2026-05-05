@@ -251,13 +251,25 @@ def fetch_history(
         extra = {x_col, "_step", "_runtime", "_timestamp"}
         key_list = sorted(set(key_list) | {k for k in extra if k})
 
-    if samples is not None and samples > 0:
-        # 注意：history 默认曾长期为 500 行；显式 samples 用于「最近 N 条」等场景
-        df = run.history(samples=samples, keys=key_list, pandas=True)
-    else:
-        # 全量：scan_history（大数据 run 会慢、占内存）
-        rows = list(run.scan_history(keys=key_list))
-        df = pd.DataFrame(rows) if rows else pd.DataFrame()
+    try:
+        if samples is not None and samples > 0:
+            # 注意：history 默认曾长期为 500 行；显式 samples 用于「最近 N 条」等场景
+            df = run.history(samples=samples, keys=key_list, pandas=True)
+        else:
+            # 全量：scan_history（大数据 run 会慢、占内存）
+            rows = list(run.scan_history(keys=key_list))
+            df = pd.DataFrame(rows) if rows else pd.DataFrame()
+    except Exception as e:
+        # 某些 run 在传 keys（尤其包含不存在列）时可能报错；回退到全量拉取后本地筛选，避免整次绘图中断。
+        print(
+            f"warn: fetch with explicit keys failed for {path}: {type(e).__name__}: {e}; fallback to full history",
+            file=sys.stderr,
+        )
+        if samples is not None and samples > 0:
+            df = run.history(samples=samples, keys=None, pandas=True)
+        else:
+            rows = list(run.scan_history(keys=None))
+            df = pd.DataFrame(rows) if rows else pd.DataFrame()
     return df
 
 
