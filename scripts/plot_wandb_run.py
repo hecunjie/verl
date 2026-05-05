@@ -147,10 +147,10 @@ def _append_extra_aime25_best4(metric_list: list[str], available_metrics: Iterab
 def _aime25_best4_key_candidates() -> list[str]:
     """Common W&B key variants for AIME2025 best@4."""
     return [
+        "val-core/aime2025/acc/best@4/mean",
         "val-core/aime2025/acc/best@4",
         "val-core/aime2025/acc/best_at_4",
         "val-core/aime2025/acc/best_at4",
-        "val-core/aime2025/acc/best@4/mean",
         "val-core/aime2025/acc/best_at_4/mean",
         "val-core/aime2025/acc/best_at4/mean",
     ]
