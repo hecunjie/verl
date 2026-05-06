@@ -24,6 +24,37 @@ _SUFFIX_LEN_DEBIAS_STATE: dict[str, Any] = {
 }
 
 
+def _rankdata_average(x: np.ndarray) -> np.ndarray:
+    """Average-tie rankdata (1-based), scipy-free."""
+    n = int(x.shape[0])
+    order = np.argsort(x, kind="mergesort")
+    ranks = np.empty(n, dtype=np.float64)
+    i = 0
+    while i < n:
+        j = i + 1
+        xi = x[order[i]]
+        while j < n and x[order[j]] == xi:
+            j += 1
+        # average rank in [i+1, j]
+        avg_rank = 0.5 * ((i + 1) + j)
+        ranks[order[i:j]] = avg_rank
+        i = j
+    return ranks
+
+
+def _spearmanr_safe(x: np.ndarray, y: np.ndarray) -> float:
+    """Spearman correlation with tie-aware ranks; returns nan when undefined."""
+    if x.size < 3 or y.size < 3:
+        return float("nan")
+    rx = _rankdata_average(x)
+    ry = _rankdata_average(y)
+    sx = np.std(rx)
+    sy = np.std(ry)
+    if sx <= 0.0 or sy <= 0.0:
+        return float("nan")
+    return float(np.corrcoef(rx, ry)[0, 1])
+
+
 def _welford_update(state: dict[str, float], x: float) -> None:
     c = int(state.get("count", 0)) + 1
     mean = float(state.get("mean", 0.0))
@@ -494,6 +525,7 @@ def _run_fepo_lowtail_adv_phase(
     beta = float(np.clip(beta, 0.0, 1.0))
     low_tail_neg_adv_penalty = float(np.clip(low_tail_neg_adv_penalty, 0.0, 1.0))
     collect_point_records = bool(fepo_cfg.get("__collect_point_records", True))
+    offpolicy_diag_enable = bool(fepo_cfg.get("offpolicy_diag_enable", True))
 
     high_entropy_select_mode = str(fepo_cfg.get("high_entropy_select_mode", "threshold")).strip().lower()
     if high_entropy_select_mode not in {"threshold", "top_ratio"}:
@@ -691,6 +723,98 @@ def _run_fepo_lowtail_adv_phase(
             return float("nan")
         return float(torch.quantile(x, qv).item())
 
+    # ------------------------------
+    # Off-policy diagnostics:
+    # (1) ratio distribution between old_log_probs and rollout_log_probs
+    # (2) rank-stability proxy: Spearman between old-policy and rollout-policy
+    #     suffix-rate ranks inside the selected high-entropy set
+    # ------------------------------
+    off_ratio_mean = float("nan")
+    off_ratio_p10 = float("nan")
+    off_ratio_p50 = float("nan")
+    off_ratio_p90 = float("nan")
+    off_log_ratio_abs_mean = float("nan")
+    off_spearman_mean = float("nan")
+    off_spearman_p10 = float("nan")
+    off_spearman_p50 = float("nan")
+    off_spearman_p90 = float("nan")
+    off_spearman_n_prompts = 0.0
+
+    if offpolicy_diag_enable and ("old_log_probs" in batch.batch) and ("rollout_log_probs" in batch.batch):
+        old_lp = batch.batch["old_log_probs"].float()
+        roll_lp = batch.batch["rollout_log_probs"].float()
+        ratio_mask = response_mask & torch.isfinite(old_lp) & torch.isfinite(roll_lp)
+        if ratio_mask.any():
+            log_r = (old_lp - roll_lp)[ratio_mask]
+            r = torch.exp(log_r)
+            off_ratio_mean = float(torch.mean(r).item())
+            off_ratio_p10 = _pct(r, 0.10)
+            off_ratio_p50 = _pct(r, 0.50)
+            off_ratio_p90 = _pct(r, 0.90)
+            off_log_ratio_abs_mean = float(torch.mean(torch.abs(log_r)).item())
+
+        # Build rollout-policy entropy proxy from rollout log-prob.
+        # This is a policy-mismatch proxy: π_old vs π_anchor(old_log_prob policy).
+        roll_ent = (-roll_lp).clamp(min=0.0)
+        if suffix_mode == "sentence":
+            responses = batch.batch["responses"]
+            eligible_mask = eligible_cap_mask if sentence_only_high_entropy else None
+            if str(f_sentence_stop) == "simple":
+                f_rate_roll, _keep_roll, _ = _suffix_entropy_rate_to_sentence_end_simple_fast(
+                    roll_ent,
+                    responses,
+                    response_mask,
+                    tokenizer=tokenizer,
+                    min_suffix_tokens=sentence_min_suffix_tokens,
+                    num_threads=sentence_num_threads,
+                    eligible_mask=eligible_mask,
+                    max_scan_tokens=sentence_max_scan_tokens,
+                )
+            else:
+                stop_check = _make_sentence_stop_check(f_sentence_stop)
+                f_rate_roll, _keep_roll, _ = _suffix_entropy_rate_to_sentence_end(
+                    roll_ent,
+                    responses,
+                    response_mask,
+                    tokenizer=tokenizer,
+                    sentence_stop_check=stop_check,
+                    min_suffix_tokens=sentence_min_suffix_tokens,
+                )
+        elif suffix_mode == "fixed_window":
+            eligible_mask = eligible_cap_mask if sentence_only_high_entropy else None
+            f_rate_roll, _keep_roll, _ = _suffix_entropy_rate_fixed_window(
+                roll_ent,
+                response_mask,
+                window_tokens=fixed_window_tokens,
+                min_suffix_tokens=sentence_min_suffix_tokens,
+                eligible_mask=eligible_mask,
+            )
+        else:
+            f_rate_roll = _suffix_entropy_rate_exclusive(roll_ent, response_mask)
+
+        spearman_vals: list[float] = []
+        groups_for_diag = _prompt_group_indices(prompts)
+        for idxs in groups_for_diag.values():
+            xs: list[float] = []
+            ys: list[float] = []
+            for b in idxs:
+                mask_bt = high_mask[b] & torch.isfinite(f_rate[b]) & torch.isfinite(f_rate_roll[b])
+                ts = torch.where(mask_bt)[0].tolist()
+                for t in ts:
+                    xs.append(float(f_rate[b, t].item()))
+                    ys.append(float(f_rate_roll[b, t].item()))
+            if len(xs) >= 3:
+                rho = _spearmanr_safe(np.asarray(xs, dtype=np.float64), np.asarray(ys, dtype=np.float64))
+                if np.isfinite(rho):
+                    spearman_vals.append(float(rho))
+        if len(spearman_vals) > 0:
+            sp = np.asarray(spearman_vals, dtype=np.float64)
+            off_spearman_mean = float(np.mean(sp))
+            off_spearman_p10 = float(np.quantile(sp, 0.10))
+            off_spearman_p50 = float(np.quantile(sp, 0.50))
+            off_spearman_p90 = float(np.quantile(sp, 0.90))
+            off_spearman_n_prompts = float(sp.shape[0])
+
     metrics: dict[str, float] = {
         "fepo/n_selected": float(n_high),
         "fepo/lowtail_mode": 1.0,
@@ -776,6 +900,17 @@ def _run_fepo_lowtail_adv_phase(
         "fepo/sentence_suffix_len_p10": _pct(len_valid, 0.10),
         "fepo/sentence_suffix_len_p50": _pct(len_valid, 0.50),
         "fepo/sentence_suffix_len_p90": _pct(len_valid, 0.90),
+        "fepo/offpolicy_diag_enable": 1.0 if offpolicy_diag_enable else 0.0,
+        "fepo/offpolicy_ratio_mean": off_ratio_mean,
+        "fepo/offpolicy_ratio_p10": off_ratio_p10,
+        "fepo/offpolicy_ratio_p50": off_ratio_p50,
+        "fepo/offpolicy_ratio_p90": off_ratio_p90,
+        "fepo/offpolicy_abs_log_ratio_mean": off_log_ratio_abs_mean,
+        "fepo/offpolicy_spearman_mean": off_spearman_mean,
+        "fepo/offpolicy_spearman_p10": off_spearman_p10,
+        "fepo/offpolicy_spearman_p50": off_spearman_p50,
+        "fepo/offpolicy_spearman_p90": off_spearman_p90,
+        "fepo/offpolicy_spearman_n_prompts": off_spearman_n_prompts,
     }
 
     point_records: list[dict[str, Any]] = []
