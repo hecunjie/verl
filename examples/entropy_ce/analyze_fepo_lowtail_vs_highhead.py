@@ -773,24 +773,51 @@ def main() -> None:
             x_top = np.array([r["step"] for r in top_suffix_rows], dtype=np.float64)
             x_tail = np.array([r["step"] for r in tail_suffix_rows], dtype=np.float64)
             fig10, (ax14, ax15) = plt.subplots(2, 1, figsize=(11, 8), sharex=True)
-            for tl in top_suffix_levels:
+            cmap = plt.cm.get_cmap("tab10")
+            for i, tl in enumerate(top_suffix_levels):
                 tname = f"{tl:.1f}"
-                pct = int(tl * 100)
+                color = cmap(i % 10)
                 p_top = np.array([r[f"p_pos_top{tname}"] for r in top_suffix_rows], dtype=np.float64)
                 e_top = np.array([r[f"e_adv_top{tname}"] for r in top_suffix_rows], dtype=np.float64)
                 p_tail = np.array([r[f"p_pos_tail{tname}"] for r in tail_suffix_rows], dtype=np.float64)
                 e_tail = np.array([r[f"e_adv_tail{tname}"] for r in tail_suffix_rows], dtype=np.float64)
-                ax14.plot(x_top, p_top, linewidth=2.0, linestyle="-", label=f"top {pct}%")
-                ax14.plot(x_tail, p_tail, linewidth=1.8, linestyle="--", label=f"tail {pct}%")
-                ax15.plot(x_top, e_top, linewidth=2.0, linestyle="-", label=f"top {pct}%")
-                ax15.plot(x_tail, e_tail, linewidth=1.8, linestyle="--", label=f"tail {pct}%")
-            ax14.set_ylabel("P(adv>0 | adv!=0)")
-            ax14.set_title("Top vs Tail suffix-entropy levels: positive-adv probability")
+                ax14.plot(
+                    x_top,
+                    p_top,
+                    linewidth=2.0,
+                    linestyle="-",
+                    color=color,
+                    label=rf"$q_{{\mathrm{{high}}}}$, $p={tl:.2f}$",
+                )
+                ax14.plot(
+                    x_tail,
+                    p_tail,
+                    linewidth=1.8,
+                    linestyle="--",
+                    color=color,
+                    label=rf"$q_{{\mathrm{{low}}}}$, $p={tl:.2f}$",
+                )
+                ax15.plot(
+                    x_top,
+                    e_top,
+                    linewidth=2.0,
+                    linestyle="-",
+                    color=color,
+                    label=rf"$q_{{\mathrm{{high}}}}$, $p={tl:.2f}$",
+                )
+                ax15.plot(
+                    x_tail,
+                    e_tail,
+                    linewidth=1.8,
+                    linestyle="--",
+                    color=color,
+                    label=rf"$q_{{\mathrm{{low}}}}$, $p={tl:.2f}$",
+                )
+            ax14.set_ylabel(r"$P(\mathrm{adv}>0 \mid q)$")
             ax14.grid(True, alpha=0.3)
             ax14.legend(ncol=3, fontsize=9)
             ax15.set_xlabel("step")
-            ax15.set_ylabel("E[adv]")
-            ax15.set_title("Top vs Tail suffix-entropy levels: expected advantage")
+            ax15.set_ylabel(r"$E[\mathrm{adv} \mid q]$")
             ax15.grid(True, alpha=0.3)
             ax15.legend(ncol=3, fontsize=9)
             fig10.tight_layout()
