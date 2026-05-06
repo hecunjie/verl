@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import math
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Optional
@@ -47,6 +48,30 @@ def _suffix_len_bin_id(length: int, bin_width: int) -> int:
     bw = max(int(bin_width), 1)
     l = max(int(length), 1)
     return (l - 1) // bw
+
+
+def _pre_high_mask_top_entropy_ratio(
+    entropy: torch.Tensor,
+    response_mask: torch.Tensor,
+    top_ratio: float,
+) -> torch.Tensor:
+    """Per sequence, mark the top ``ceil(n_valid * top_ratio)`` highest-entropy response tokens."""
+    r = float(np.clip(top_ratio, 0.0, 1.0))
+    out = torch.zeros_like(response_mask, dtype=torch.bool)
+    B = int(entropy.size(0))
+    for b in range(B):
+        mask_b = response_mask[b].bool()
+        valid_idx = torch.where(mask_b)[0]
+        n = int(valid_idx.numel())
+        if n == 0:
+            continue
+        k = max(1, int(math.ceil(n * r)))
+        k = min(k, n)
+        vals = entropy[b, valid_idx].float()
+        _, sub_i = torch.topk(vals, k=k, largest=True)
+        chosen = valid_idx[sub_i]
+        out[b, chosen] = True
+    return out
 
 
 def _prompt_group_indices(prompts: torch.Tensor) -> dict[bytes, list[int]]:
@@ -470,26 +495,38 @@ def _run_fepo_lowtail_adv_phase(
     low_tail_neg_adv_penalty = float(np.clip(low_tail_neg_adv_penalty, 0.0, 1.0))
     collect_point_records = bool(fepo_cfg.get("__collect_point_records", True))
 
+    high_entropy_select_mode = str(fepo_cfg.get("high_entropy_select_mode", "threshold")).strip().lower()
+    if high_entropy_select_mode not in {"threshold", "top_ratio"}:
+        high_entropy_select_mode = "threshold"
+    high_entropy_top_ratio = float(fepo_cfg.get("high_entropy_top_ratio", 0.1))
+
     # Realized suffix entropy-rate per token (exclusive future).
-    pre_high_mask = (entropy >= h_threshold) & response_mask
-    eligible_cap_mask = torch.zeros_like(response_mask, dtype=torch.bool)
-    ratio = max(float(sentence_high_entropy_ratio), 0.0)
-    for b in range(int(entropy.size(0))):
-        high_ts = torch.where(pre_high_mask[b])[0]
-        if high_ts.numel() == 0:
-            continue
-        resp_len = int(response_mask[b].sum().item())
-        if ratio > 0.0:
-            k_cap = max(1, int(resp_len * ratio))
-            k = min(int(high_ts.numel()), k_cap)
-        else:
-            k = int(high_ts.numel())
-        if k <= 0:
-            continue
-        vals = entropy[b, high_ts].float()
-        _, top_idx = torch.topk(vals, k=k, largest=True)
-        chosen = high_ts[top_idx]
-        eligible_cap_mask[b, chosen] = True
+    # threshold: keep tokens with entropy >= h_threshold, then cap per-seq by sentence_high_entropy_ratio.
+    # top_ratio: no fixed entropy cutoff; per sequence take top ceil(n_valid * ratio) tokens by entropy.
+    if high_entropy_select_mode == "top_ratio":
+        high_entropy_top_ratio = float(np.clip(high_entropy_top_ratio, 1e-6, 1.0))
+        pre_high_mask = _pre_high_mask_top_entropy_ratio(entropy, response_mask, high_entropy_top_ratio)
+        eligible_cap_mask = pre_high_mask.clone()
+    else:
+        pre_high_mask = (entropy >= h_threshold) & response_mask
+        eligible_cap_mask = torch.zeros_like(response_mask, dtype=torch.bool)
+        ratio = max(float(sentence_high_entropy_ratio), 0.0)
+        for b in range(int(entropy.size(0))):
+            high_ts = torch.where(pre_high_mask[b])[0]
+            if high_ts.numel() == 0:
+                continue
+            resp_len = int(response_mask[b].sum().item())
+            if ratio > 0.0:
+                k_cap = max(1, int(resp_len * ratio))
+                k = min(int(high_ts.numel()), k_cap)
+            else:
+                k = int(high_ts.numel())
+            if k <= 0:
+                continue
+            vals = entropy[b, high_ts].float()
+            _, top_idx = torch.topk(vals, k=k, largest=True)
+            chosen = high_ts[top_idx]
+            eligible_cap_mask[b, chosen] = True
 
     keep_k = torch.zeros_like(advantages, dtype=torch.int32)
     if suffix_mode == "sentence":
@@ -542,7 +579,10 @@ def _run_fepo_lowtail_adv_phase(
         min_count=suffix_len_min_count,
         z_clip=suffix_len_z_clip,
     )
-    low_mask = (entropy < h_threshold) & response_mask
+    if high_entropy_select_mode == "top_ratio":
+        low_mask = response_mask & ~pre_high_mask
+    else:
+        low_mask = (entropy < h_threshold) & response_mask
     m = torch.ones_like(advantages)
     q = torch.full_like(advantages, float("nan"))
 
@@ -655,6 +695,10 @@ def _run_fepo_lowtail_adv_phase(
         "fepo/n_selected": float(n_high),
         "fepo/lowtail_mode": 1.0,
         "fepo/h_threshold": float(h_threshold),
+        "fepo/high_entropy_top_ratio_mode": 1.0 if high_entropy_select_mode == "top_ratio" else 0.0,
+        "fepo/high_entropy_top_ratio": float(high_entropy_top_ratio)
+        if high_entropy_select_mode == "top_ratio"
+        else float("nan"),
         "fepo/alpha": float(alpha),
         "fepo/beta": float(beta),
         "fepo/low_tail_neg_adv_penalty": float(low_tail_neg_adv_penalty),

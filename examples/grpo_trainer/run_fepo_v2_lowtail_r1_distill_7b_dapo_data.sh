@@ -63,7 +63,10 @@ FEPO_DATA_DIR="${FEPO_DATA_DIR:-${OUTPUT_DIR}/fepo_data}"
 # FEPO v2 配置（核心）
 FEPO_ENABLE="${FEPO_ENABLE:-true}"
 FEPO_VARIANT="${FEPO_VARIANT:-lowtail_adv}"  # lowtail_adv / legacy_mc_bonus
-FEPO_H_THRESHOLD="${FEPO_H_THRESHOLD:-2.0}"  # 复用现有熵阈值参数
+FEPO_H_THRESHOLD="${FEPO_H_THRESHOLD:-2.0}"  # high_entropy_select_mode=threshold 时生效
+# 对比实验：按序列内熵 top 比例选高熵点（不设固定阈值）。设为 top_ratio 时忽略 FEPO_H_THRESHOLD 对选点的作用。
+FEPO_HIGH_ENTROPY_SELECT_MODE="${FEPO_HIGH_ENTROPY_SELECT_MODE:-threshold}"  # threshold | top_ratio
+FEPO_HIGH_ENTROPY_TOP_RATIO="${FEPO_HIGH_ENTROPY_TOP_RATIO:-0.1}"             # 如 0.1 = 每条约 top10%
 FEPO_ALPHA="${FEPO_ALPHA:-0.2}"              # m = 1 + alpha * I(q<=beta)
 FEPO_BETA="${FEPO_BETA:-0.2}"                # low-tail 分位阈值
 FEPO_HIGH_HEAD_PENALTY="${FEPO_HIGH_HEAD_PENALTY:-0.0}"  # m = 1 - penalty * I(q>=1-beta)
@@ -102,6 +105,8 @@ python3 -m verl.trainer.main_ppo \
   +algorithm.fepo.enable="${FEPO_ENABLE}" \
   +algorithm.fepo.variant="${FEPO_VARIANT}" \
   +algorithm.fepo.h_threshold="${FEPO_H_THRESHOLD}" \
+  +algorithm.fepo.high_entropy_select_mode="${FEPO_HIGH_ENTROPY_SELECT_MODE}" \
+  +algorithm.fepo.high_entropy_top_ratio="${FEPO_HIGH_ENTROPY_TOP_RATIO}" \
   +algorithm.fepo.alpha="${FEPO_ALPHA}" \
   +algorithm.fepo.beta="${FEPO_BETA}" \
   +algorithm.fepo.high_head_penalty="${FEPO_HIGH_HEAD_PENALTY}" \
