@@ -106,6 +106,8 @@ def short_metric_ylabel(metric: str) -> str:
     将完整 wandb key 压成短纵轴标签，例如 mean@4、major@4。
     """
     m = metric.strip().lower()
+    if m == "fepo/f_suffix_rate_mean_high":
+        return "suffix entropy rate mean"
     # Special-case for AIME25 visualization: show best@4 curve as mean@4 on y-axis label.
     if "aime2025" in m and ("best@4" in m or "best_at_4" in m or "best_at4" in m):
         return "mean@4"

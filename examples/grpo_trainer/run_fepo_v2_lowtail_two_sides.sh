@@ -7,16 +7,42 @@
 
 set -euo pipefail
 
-VERL_ROOT="${VERL_ROOT:-/Users/hecunjie/Documents/python_lianxi/github_source/verl}"
+VERL_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "${VERL_ROOT}"
 
 # -----------------------------
 # Core experiment identity
 # -----------------------------
-MODEL_PATH="${MODEL_PATH:-/mnt/tidal-alsh01/dataset/zeus/hecunjie/models/Qwen/Qwen3-4B}"
+# MODEL_PATH="${MODEL_PATH:-/mnt/tidal-alsh01/dataset/zeus/hecunjie/models/Qwen/Qwen3-8B}"
+# MODEL_PATH="${MODEL_PATH:-/mnt/tidal-alsh01/dataset/zeus/hecunjie/models/Qwen/DeepSeek-R1-Distill-Qwen-7B}"
+MODEL_PATH="${MODEL_PATH:-/mnt/tidal-alsh01/dataset/zeus/hecunjie/models/Qwen/Qwen3-4B-base}"
+# MODEL_PATH="${MODEL_PATH:-/mnt/tidal-alsh01/dataset/zeus/hecunjie/models/Qwen/Qwen3-8B-base}"
+
 PROJECT_NAME="${PROJECT_NAME:-verl}"
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-fepo_v2_lowtail_fast_qwen3_4b}"
-OUTPUT_DIR="${OUTPUT_DIR:-/mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/qwen3-4b-fepo-v2-lowtail-fast}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-fepo_v2_qwen3-4B-two-sides-0.01-rollout8val4}"
+# OUTPUT_DIR="${OUTPUT_DIR:-/mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/qwen3-8b-fepo-v2-lowtail-tow_sides}"
+# OUTPUT_DIR="${OUTPUT_DIR:-/mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/ds-r1-7b-fepo-v2-lowtail-tow_sides}"
+# OUTPUT_DIR="${OUTPUT_DIR:-/mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/qwen3-8b-fepo-v2-lowtail-tow_sides_0.05_max_chosen_samples}"
+# OUTPUT_DIR="${OUTPUT_DIR:-/mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/ds-r1-7b-fepo-v2-lowtail-tow_sides_0.02_max_chosen_samples}"
+# OUTPUT_DIR="${OUTPUT_DIR:-/mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/ds-r1-7b-fepo-v2-lowtail-tow_sides_0.01_max_chosen_samples}"
+# OUTPUT_DIR="${OUTPUT_DIR:-/mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/qwen3-4B-fepo-v2-lowtail-tow_sides_0.01_cap_roll8val4_7epoch}"
+# OUTPUT_DIR="${OUTPUT_DIR:-/mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/qwen3-8B-fepo-v2-lowtail-tow_sides_0.02_cap_roll8val4}"
+# OUTPUT_DIR="${OUTPUT_DIR:-/mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/qwen3-8B-fepo-v2-high-head_0.05_cap_roll8val4_5epoch}"
+# OUTPUT_DIR="${OUTPUT_DIR:-/mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/qwen3-4B-base-fepo-v2-low_0.01_cap_roll8val4_7epoch_grouprank}"
+# OUTPUT_DIR="${OUTPUT_DIR:-/mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/qwen3-4B-base-fepo-v2-0.05-lowtail_cap_roll8val4_5epoch_batchrank_lenbias}"
+# OUTPUT_DIR="${OUTPUT_DIR:-/mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/qwen3-4B-base-fepo-v2-0.05-lowtail_cap_roll8val4_5epoch_batchrank_lenbias_two_sides_only_pos}"
+# OUTPUT_DIR="${OUTPUT_DIR:-/mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/qwen3-8B-base-fepo-v2-0.05-lowtail_cap_roll8val4_5epoch_batchrank_lenbias_low-tail_only_pos}"
+# OUTPUT_DIR="${OUTPUT_DIR:-/mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/qwen3-4B-base-fepo-v2-0.05-lowtail_cap_roll8val4_5epoch_batchrank_lenbias_lowtail_pos_reward_neg_pen}"
+# OUTPUT_DIR="${OUTPUT_DIR:-/mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/qwen3-8B-base-fepo-v2-0.05-lowtail_cap_roll8val4_5epoch_batchrank_lenbias_lowtail_pos_reward_neg_pen}"
+# OUTPUT_DIR="${OUTPUT_DIR:-/mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/r17b-base-fepo-v2-0.05-lowtail_cap_roll8val4_5epoch_batchrank_lenbias_lowtail_pos_reward_neg_pen}"
+# OUTPUT_DIR="${OUTPUT_DIR:-/mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/qwen3-8b-base-fepo-v2-0.1-lowtail_cap_roll8val4_5epoch_batchrank_lenbias_lowtail_pos_reward_neg_pen}"
+# OUTPUT_DIR="${OUTPUT_DIR:-/mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/qwen3-8b-base-fepo-v2-0.02_cap_roll8val4_5epoch_batchrank_lenbias_lowtail_pos_reward_neg_pen}"
+# OUTPUT_DIR="${OUTPUT_DIR:-/mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/qwen3-8b-base-fepo-v2-0.05-lowtail_cap_0.1q_roll8val4_5epoch_batchrank_lenbias_lowtail_0.5_pos_reward_0.2_neg_pen}"
+# OUTPUT_DIR="${OUTPUT_DIR:-/mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/qwen3-8b-base-fepo-v2-0.05-lowtail_cap_0.2q_roll8val4_5epoch_batchrank_lenbias_lowtail_0.4_pos_reward_0.2_neg_pen}"
+# OUTPUT_DIR="${OUTPUT_DIR:-/mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/qwen3-4b-base-fepo-v2-0.05-lowtail_cap_0.2q_roll8val4_5epoch_batchrank_lenbias_lowtail_0.2_pos_reward_0.2_neg_pen_0.1_high-head_boost}"
+# OUTPUT_DIR="${OUTPUT_DIR:-/mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/qwen3-4b-base-fepo-v2-0.05-lowtail_cap_0.2q_roll8val4_5epoch_batchrank_lenbias_lowtail_0.2_pos_reward_0.1_neg_pen}"
+OUTPUT_DIR="${OUTPUT_DIR:-/mnt/tidal-alsh01/dataset/zeus/hecunjie/train_outputs/qwen3-4b-base-fepo-v2-0.05-lowtail_cap_0.2q_roll8val4_5epoch_batchrank_lenbias_lowtail_0.2_pos_reward_top_ratio}"
+
 mkdir -p "${OUTPUT_DIR}"
 
 # -----------------------------
@@ -25,7 +51,9 @@ mkdir -p "${OUTPUT_DIR}"
 TRAIN_FILES="${TRAIN_FILES:-/mnt/ali-sh-1/dataset/zeus/hecunjie/rl_data/grpo/dapo_math_17k_processed_train.parquet}"
 MATH500_VAL="${MATH500_VAL:-/mnt/ali-sh-1/dataset/zeus/hecunjie/rl_data/grpo/math500_test.parquet}"
 AIME24_VAL="${AIME24_VAL:-/mnt/ali-sh-1/dataset/zeus/hecunjie/rl_data/grpo/aime2024_test.parquet}"
-USE_MATH_VERIFY_VAL="${USE_MATH_VERIFY_VAL:-1}"
+AIME25_VAL="${AIME25_VAL:-/mnt/ali-sh-1/dataset/zeus/hecunjie/rl_data/grpo/aime2025_test.parquet}"
+
+USE_MATH_VERIFY_VAL="${USE_MATH_VERIFY_VAL:-0}"
 CUSTOM_REWARD_FUNCTION_PATH="${CUSTOM_REWARD_FUNCTION_PATH:-${VERL_ROOT}/examples/grpo_trainer/math_verify_val_reward.py}"
 
 CUSTOM_REWARD_ARGS=()
@@ -41,28 +69,28 @@ TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-128}"
 GEN_BATCH_SIZE="${GEN_BATCH_SIZE:-128}"
 VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-128}"
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-2048}"
-MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-8192}"
+MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-4096}"
 TOTAL_EPOCHS="${TOTAL_EPOCHS:-5}"
 
 # -----------------------------
 # PPO / rollout
 # -----------------------------
 ACTOR_LR="${ACTOR_LR:-1e-6}"
-WARM_UP_RATIO="${WARM_UP_RATIO:-0.05}"
+WARM_UP_RATIO="${WARM_UP_RATIO:-0.1}"
 PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-64}"
 PPO_MICRO_BATCH_SIZE_PER_GPU="${PPO_MICRO_BATCH_SIZE_PER_GPU:-4}"
 PPO_EPOCHS="${PPO_EPOCHS:-1}"
 ROLLOUT_LOGPROB_MB_PER_GPU="${ROLLOUT_LOGPROB_MB_PER_GPU:-16}"
 ROLLOUT_TP_SIZE="${ROLLOUT_TP_SIZE:-2}"
 ROLLOUT_GPU_MEM_UTIL="${ROLLOUT_GPU_MEM_UTIL:-0.6}"
-ROLLOUT_N="${ROLLOUT_N:-16}"
+ROLLOUT_N="${ROLLOUT_N:-8}"
 ROLLOUT_TEMPERATURE="${ROLLOUT_TEMPERATURE:-1.0}"
 REF_LOGPROB_MB_PER_GPU="${REF_LOGPROB_MB_PER_GPU:-4}"
 
 # -----------------------------
 # Validation generation
 # -----------------------------
-VAL_N="${VAL_N:-1}"
+VAL_N="${VAL_N:-4}"
 VAL_DO_SAMPLE="${VAL_DO_SAMPLE:-true}"
 VAL_TEMPERATURE="${VAL_TEMPERATURE:-1.0}"
 VAL_TOP_P="${VAL_TOP_P:-0.95}"
@@ -72,11 +100,11 @@ VAL_TOP_P="${VAL_TOP_P:-0.95}"
 # -----------------------------
 FEPO_ENABLE="${FEPO_ENABLE:-true}"
 FEPO_VARIANT="${FEPO_VARIANT:-lowtail_adv}"
-FEPO_H_THRESHOLD="${FEPO_H_THRESHOLD:-2.0}"
+FEPO_H_THRESHOLD="${FEPO_H_THRESHOLD:-1.0}"
 FEPO_ALPHA="${FEPO_ALPHA:-0.2}"
 FEPO_BETA="${FEPO_BETA:-0.2}"
-FEPO_LOW_TAIL_NEG_ADV_PENALTY="${FEPO_LOW_TAIL_NEG_ADV_PENALTY:-0.0}"
-FEPO_HIGH_HEAD_PENALTY="${FEPO_HIGH_HEAD_PENALTY:-0.2}"
+FEPO_LOW_TAIL_NEG_ADV_PENALTY="${FEPO_LOW_TAIL_NEG_ADV_PENALTY:-0.1}"
+FEPO_HIGH_HEAD_PENALTY="${FEPO_HIGH_HEAD_PENALTY:-0.0}"
 FEPO_HIGH_HEAD_NEG_ADV_BOOST="${FEPO_HIGH_HEAD_NEG_ADV_BOOST:-0.0}"
 FEPO_LOW_TAIL_POS_ADV_ONLY="${FEPO_LOW_TAIL_POS_ADV_ONLY:-false}"
 FEPO_HIGH_HEAD_NEG_ADV_ONLY="${FEPO_HIGH_HEAD_NEG_ADV_ONLY:-false}"
@@ -87,22 +115,23 @@ FEPO_SUFFIX_MODE="${FEPO_SUFFIX_MODE:-sentence}"                  # sentence / f
 FEPO_F_SENTENCE_STOP="${FEPO_F_SENTENCE_STOP:-simple}"           # simple / pysbd
 FEPO_SENTENCE_MIN_SUFFIX_TOKENS="${FEPO_SENTENCE_MIN_SUFFIX_TOKENS:-5}"
 FEPO_SENTENCE_ONLY_HIGH_ENTROPY="${FEPO_SENTENCE_ONLY_HIGH_ENTROPY:-true}"
-FEPO_SENTENCE_HIGH_ENTROPY_RATIO="${FEPO_SENTENCE_HIGH_ENTROPY_RATIO:-0.01}"   # per-response cap
-FEPO_SENTENCE_MAX_SCAN_TOKENS="${FEPO_SENTENCE_MAX_SCAN_TOKENS:-256}"           # per-point scan cap
+FEPO_SENTENCE_HIGH_ENTROPY_RATIO="${FEPO_SENTENCE_HIGH_ENTROPY_RATIO:-0.05}"   # per-response cap
+FEPO_SENTENCE_MAX_SCAN_TOKENS="${FEPO_SENTENCE_MAX_SCAN_TOKENS:-64}"           # per-point scan cap
 FEPO_SENTENCE_NUM_THREADS="${FEPO_SENTENCE_NUM_THREADS:-64}"
 FEPO_FIXED_WINDOW_TOKENS="${FEPO_FIXED_WINDOW_TOKENS:-16}"       # used when FEPO_SUFFIX_MODE=fixed_window
-FEPO_SUFFIX_LEN_DEBIAS_ENABLE="${FEPO_SUFFIX_LEN_DEBIAS_ENABLE:-false}"
-FEPO_SUFFIX_LEN_BIN_WIDTH="${FEPO_SUFFIX_LEN_BIN_WIDTH:-2}"
+
+FEPO_SUFFIX_LEN_DEBIAS_ENABLE="${FEPO_SUFFIX_LEN_DEBIAS_ENABLE:-true}"
+FEPO_SUFFIX_LEN_BIN_WIDTH="${FEPO_SUFFIX_LEN_BIN_WIDTH:-3}"
 FEPO_SUFFIX_LEN_MIN_COUNT="${FEPO_SUFFIX_LEN_MIN_COUNT:-100}"
 FEPO_SUFFIX_LEN_Z_CLIP="${FEPO_SUFFIX_LEN_Z_CLIP:-3.0}"
 
 # Entropy estimator in FEPO path
-FEPO_ENTROPY_TOP_P="${FEPO_ENTROPY_TOP_P:-0.95}"                 # 1.0 => full-vocab entropy
+FEPO_ENTROPY_TOP_P="${FEPO_ENTROPY_TOP_P:-1.0}"                 # 1.0 => full-vocab entropy
 
 # -----------------------------
 # Logging / dump
 # -----------------------------
-SAVE_FREQ="${SAVE_FREQ:-50}"
+SAVE_FREQ="${SAVE_FREQ:-20}"
 TEST_FREQ="${TEST_FREQ:-10}"
 FEPO_DUMP_FREQ="${FEPO_DUMP_FREQ:-50}"
 ROLLOUT_DATA_DIR="${ROLLOUT_DATA_DIR:-${OUTPUT_DIR}/rollout_data}"
@@ -151,10 +180,11 @@ python3 -m verl.trainer.main_ppo \
   +algorithm.fepo.suffix_len_min_count="${FEPO_SUFFIX_LEN_MIN_COUNT}" \
   +algorithm.fepo.suffix_len_z_clip="${FEPO_SUFFIX_LEN_Z_CLIP}" \
   +algorithm.fepo.entropy_top_p="${FEPO_ENTROPY_TOP_P}" \
+  +algorithm.fepo.high_entropy_select_mode=top_ratio \
+  +algorithm.fepo.high_entropy_top_ratio=0.1 \
   data.train_files="${TRAIN_FILES}" \
-  data.val_files="['${MATH500_VAL}','${AIME24_VAL}']" \
+  data.val_files="['${AIME25_VAL}','${AIME24_VAL}']" \
   data.train_batch_size="${TRAIN_BATCH_SIZE}" \
-  data.gen_batch_size="${GEN_BATCH_SIZE}" \
   data.val_batch_size="${VAL_BATCH_SIZE}" \
   data.max_prompt_length="${MAX_PROMPT_LENGTH}" \
   data.max_response_length="${MAX_RESPONSE_LENGTH}" \

@@ -772,47 +772,53 @@ def main() -> None:
         if top_suffix_rows and tail_suffix_rows:
             x_top = np.array([r["step"] for r in top_suffix_rows], dtype=np.float64)
             x_tail = np.array([r["step"] for r in tail_suffix_rows], dtype=np.float64)
+
+            def _plot_top_tail_suffix_level_curves(ax_p, ax_e) -> None:
+                cmap = plt.cm.get_cmap("tab10")
+                for i, tl in enumerate(top_suffix_levels):
+                    tname = f"{tl:.1f}"
+                    color = cmap(i % 10)
+                    p_top = np.array([r[f"p_pos_top{tname}"] for r in top_suffix_rows], dtype=np.float64)
+                    e_top = np.array([r[f"e_adv_top{tname}"] for r in top_suffix_rows], dtype=np.float64)
+                    p_tail = np.array([r[f"p_pos_tail{tname}"] for r in tail_suffix_rows], dtype=np.float64)
+                    e_tail = np.array([r[f"e_adv_tail{tname}"] for r in tail_suffix_rows], dtype=np.float64)
+                    if ax_p is not None:
+                        ax_p.plot(
+                            x_top,
+                            p_top,
+                            linewidth=2.0,
+                            linestyle="-",
+                            color=color,
+                            label=rf"$q_{{\mathrm{{high}}}}$, $p={tl:.2f}$",
+                        )
+                        ax_p.plot(
+                            x_tail,
+                            p_tail,
+                            linewidth=1.8,
+                            linestyle="--",
+                            color=color,
+                            label=rf"$q_{{\mathrm{{low}}}}$, $p={tl:.2f}$",
+                        )
+                    if ax_e is not None:
+                        ax_e.plot(
+                            x_top,
+                            e_top,
+                            linewidth=2.0,
+                            linestyle="-",
+                            color=color,
+                            label=rf"$q_{{\mathrm{{high}}}}$, $p={tl:.2f}$",
+                        )
+                        ax_e.plot(
+                            x_tail,
+                            e_tail,
+                            linewidth=1.8,
+                            linestyle="--",
+                            color=color,
+                            label=rf"$q_{{\mathrm{{low}}}}$, $p={tl:.2f}$",
+                        )
+
             fig10, (ax14, ax15) = plt.subplots(2, 1, figsize=(11, 8), sharex=True)
-            cmap = plt.cm.get_cmap("tab10")
-            for i, tl in enumerate(top_suffix_levels):
-                tname = f"{tl:.1f}"
-                color = cmap(i % 10)
-                p_top = np.array([r[f"p_pos_top{tname}"] for r in top_suffix_rows], dtype=np.float64)
-                e_top = np.array([r[f"e_adv_top{tname}"] for r in top_suffix_rows], dtype=np.float64)
-                p_tail = np.array([r[f"p_pos_tail{tname}"] for r in tail_suffix_rows], dtype=np.float64)
-                e_tail = np.array([r[f"e_adv_tail{tname}"] for r in tail_suffix_rows], dtype=np.float64)
-                ax14.plot(
-                    x_top,
-                    p_top,
-                    linewidth=2.0,
-                    linestyle="-",
-                    color=color,
-                    label=rf"$q_{{\mathrm{{high}}}}$, $p={tl:.2f}$",
-                )
-                ax14.plot(
-                    x_tail,
-                    p_tail,
-                    linewidth=1.8,
-                    linestyle="--",
-                    color=color,
-                    label=rf"$q_{{\mathrm{{low}}}}$, $p={tl:.2f}$",
-                )
-                ax15.plot(
-                    x_top,
-                    e_top,
-                    linewidth=2.0,
-                    linestyle="-",
-                    color=color,
-                    label=rf"$q_{{\mathrm{{high}}}}$, $p={tl:.2f}$",
-                )
-                ax15.plot(
-                    x_tail,
-                    e_tail,
-                    linewidth=1.8,
-                    linestyle="--",
-                    color=color,
-                    label=rf"$q_{{\mathrm{{low}}}}$, $p={tl:.2f}$",
-                )
+            _plot_top_tail_suffix_level_curves(ax14, ax15)
             ax14.set_ylabel(r"$P(\mathrm{adv}>0 \mid q)$")
             ax14.grid(True, alpha=0.3)
             ax14.legend(ncol=3, fontsize=9)
@@ -823,6 +829,26 @@ def main() -> None:
             fig10.tight_layout()
             fig10.savefig(output_dir / "top_tail_suffix_levels_adv_stats.png", dpi=160)
             plt.close(fig10)
+
+            fig_p, ax_ponly = plt.subplots(1, 1, figsize=(11, 4.6))
+            _plot_top_tail_suffix_level_curves(ax_ponly, None)
+            ax_ponly.set_xlabel("step")
+            ax_ponly.set_ylabel(r"$P(\mathrm{adv}>0 \mid q)$")
+            ax_ponly.grid(True, alpha=0.3)
+            ax_ponly.legend(ncol=3, fontsize=9)
+            fig_p.tight_layout()
+            fig_p.savefig(output_dir / "top_tail_suffix_levels_p_adv_pos_only.png", dpi=160)
+            plt.close(fig_p)
+
+            fig_e, ax_eonly = plt.subplots(1, 1, figsize=(11, 4.6))
+            _plot_top_tail_suffix_level_curves(None, ax_eonly)
+            ax_eonly.set_xlabel("step")
+            ax_eonly.set_ylabel(r"$E[\mathrm{adv} \mid q]$")
+            ax_eonly.grid(True, alpha=0.3)
+            ax_eonly.legend(ncol=3, fontsize=9)
+            fig_e.tight_layout()
+            fig_e.savefig(output_dir / "top_tail_suffix_levels_e_adv_only.png", dpi=160)
+            plt.close(fig_e)
     except Exception as e:  # pragma: no cover
         print(f"[warn] 画图失败（可能未安装 matplotlib）: {e}")
 
