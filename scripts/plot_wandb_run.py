@@ -541,6 +541,11 @@ def main() -> int:
         help="多 run 对比时输出目录（默认当前目录下 wandb_compare_<project>）",
     )
     parser.add_argument("--csv", type=str, default="", help="Optional: save fetched table to CSV")
+    parser.add_argument(
+        "--no-auto-aime25-best4",
+        action="store_true",
+        help="Disable auto-appending AIME2025 best@4 metric plots.",
+    )
     args = parser.parse_args()
 
     _setup_matplotlib_style()
@@ -574,7 +579,11 @@ def main() -> int:
             print("error: --runs 模式下必须提供 --metrics（逗号分隔，每个指标输出一张图）", file=sys.stderr)
             return 2
         entity, project = args.entity, args.project
-        fetch_metrics = list({*metric_list, *_aime25_best4_key_candidates()})
+        fetch_metrics = (
+            list({*metric_list, *_aime25_best4_key_candidates()})
+            if not args.no_auto_aime25_best4
+            else list(metric_list)
+        )
         run_frames: list[tuple[str, pd.DataFrame]] = []
         for rid, method in zip(args.runs, args.methods):
             df = fetch_history_by_metrics(
@@ -613,7 +622,8 @@ def main() -> int:
         available_multi_cols: set[str] = set()
         for _method, _df in run_frames:
             available_multi_cols.update(str(c) for c in _df.columns)
-        metric_list = _append_extra_aime25_best4(metric_list, available_multi_cols)
+        if not args.no_auto_aime25_best4:
+            metric_list = _append_extra_aime25_best4(metric_list, available_multi_cols)
 
         out_dir = args.out_dir or f"wandb_compare_{project}"
         os.makedirs(out_dir, exist_ok=True)
@@ -669,7 +679,8 @@ def main() -> int:
     all_numeric = _strip_internal_columns(df)
     metrics = _match_metrics(all_numeric, patterns)
     # Auto-add AIME2025 best@4 figure when available.
-    metrics = _append_extra_aime25_best4(metrics, all_numeric)
+    if not args.no_auto_aime25_best4:
+        metrics = _append_extra_aime25_best4(metrics, all_numeric)
     if not metrics:
         print("error: no metrics matched; available numeric columns sample:", file=sys.stderr)
         print(", ".join(all_numeric[:40]), file=sys.stderr)
