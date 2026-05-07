@@ -68,6 +68,8 @@ _METHOD_COLORS: dict[str, str] = {
     "fepo": "#D32F2F",  # red
     "gtpo": "#1976D2",  # blue
     "grpo": "#2E7D32",  # green
+    "etr": "#8E24AA",  # purple
+    "grpo-s": "#EF6C00",  # orange
 }
 
 
@@ -108,6 +110,10 @@ def short_metric_ylabel(metric: str) -> str:
     m = metric.strip().lower()
     if m == "fepo/f_suffix_rate_mean_high":
         return "suffix entropy rate mean"
+    if m == "fepo/offpolicy_abs_log_ratio_mean":
+        return "log is ratio"
+    if m == "fepo/offpolicy_spearman_p10":
+        return "Spearman corr"
     # Special-case for AIME25 visualization: show best@4 curve as mean@4 on y-axis label.
     if "aime2025" in m and ("best@4" in m or "best_at_4" in m or "best_at4" in m):
         return "mean@4"
@@ -193,6 +199,21 @@ def _set_xticks_multiple_of(
         ticks = np.arange(first, last + base * 0.5, base)
         ax.set_xticks(ticks)
     ax.xaxis.set_minor_locator(NullLocator())
+
+
+def _smooth_series(
+    s: pd.Series,
+    *,
+    rolling_window: int = 0,
+    ema_alpha: float = 0.0,
+) -> pd.Series:
+    """Apply optional rolling-mean and EMA smoothing on one series."""
+    out = pd.to_numeric(s, errors="coerce")
+    if rolling_window and rolling_window > 1:
+        out = out.rolling(window=int(rolling_window), min_periods=1).mean()
+    if ema_alpha and ema_alpha > 0.0:
+        out = out.ewm(alpha=float(ema_alpha), adjust=False).mean()
+    return out
 
 
 def _strip_internal_columns(df: pd.DataFrame) -> list[str]:
@@ -503,6 +524,15 @@ def main() -> int:
         default=0,
         help="Optional rolling-mean window (steps) applied before plotting; 0 = off",
     )
+    parser.add_argument(
+        "--smooth-ema-alpha",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional EMA smoothing factor in (0,1]. "
+            "0 means off; e.g. 0.2/0.3 gives smoother validation curves."
+        ),
+    )
     parser.add_argument("--output", type=str, default="", help="Output PNG path")
     parser.add_argument(
         "--out-dir",
@@ -520,6 +550,7 @@ def main() -> int:
     min_step = args.min_step if args.min_step > 0 else None
     x_tick_multiple = float(args.x_tick_multiple) if args.x_tick_multiple and args.x_tick_multiple > 0 else 0.0
     samples = args.samples if args.samples and args.samples > 0 else None
+    ema_alpha = float(args.smooth_ema_alpha) if args.smooth_ema_alpha and args.smooth_ema_alpha > 0 else 0.0
 
     # ----- 多 run 对比 -----
     if args.runs is not None:
@@ -559,12 +590,14 @@ def main() -> int:
                 continue
             if args.smooth and args.smooth > 1:
                 df = df.copy()
+            if (args.smooth and args.smooth > 1) or ema_alpha > 0.0:
+                df = df.copy()
                 for m in fetch_metrics:
                     if m in df.columns:
-                        df[m] = (
-                            pd.to_numeric(df[m], errors="coerce")
-                            .rolling(window=args.smooth, min_periods=1)
-                            .mean()
+                        df[m] = _smooth_series(
+                            df[m],
+                            rolling_window=int(args.smooth),
+                            ema_alpha=ema_alpha,
                         )
             run_frames.append((method, df))
 
@@ -642,9 +675,13 @@ def main() -> int:
         print(", ".join(all_numeric[:40]), file=sys.stderr)
         return 1
 
-    if args.smooth and args.smooth > 1:
+    if (args.smooth and args.smooth > 1) or ema_alpha > 0.0:
         for m in metrics:
-            df[m] = pd.to_numeric(df[m], errors="coerce").rolling(window=args.smooth, min_periods=1).mean()
+            df[m] = _smooth_series(
+                df[m],
+                rolling_window=int(args.smooth),
+                ema_alpha=ema_alpha,
+            )
 
     out = args.output or f"wandb_plot_{project}_{run_id}.png"
     if args.layout == "multi":
