@@ -383,24 +383,23 @@ def main() -> int:
     random.seed(int(args.seed) + rank)
     np.random.seed(int(args.seed) + rank)
 
-    dist_snap = _snapshot_and_clear_torchrun_dist_env()
-    try:
-        from vllm import LLM
+    # Keep torchrun env stripped during the whole vLLM lifecycle so that any
+    # lazily spawned vLLM subprocesses do not accidentally join torchrun's TCPStore.
+    _snapshot_and_clear_torchrun_dist_env()
+    from vllm import LLM
 
-        llm_kwargs: dict[str, Any] = {
-            "model": args.model_path,
-            "trust_remote_code": True,
-            "dtype": "bfloat16",
-            "tensor_parallel_size": 1,
-            "gpu_memory_utilization": float(args.vllm_gpu_memory_utilization),
-            "max_model_len": int(args.vllm_max_model_len),
-            "enforce_eager": True,
-        }
-        if "seed" in inspect.signature(LLM).parameters:
-            llm_kwargs["seed"] = int(args.seed) + rank
-        llm = LLM(**llm_kwargs)
-    finally:
-        _restore_torchrun_dist_env(dist_snap)
+    llm_kwargs: dict[str, Any] = {
+        "model": args.model_path,
+        "trust_remote_code": True,
+        "dtype": "bfloat16",
+        "tensor_parallel_size": 1,
+        "gpu_memory_utilization": float(args.vllm_gpu_memory_utilization),
+        "max_model_len": int(args.vllm_max_model_len),
+        "enforce_eager": True,
+    }
+    if "seed" in inspect.signature(LLM).parameters:
+        llm_kwargs["seed"] = int(args.seed) + rank
+    llm = LLM(**llm_kwargs)
 
     out_dir = Path(args.output_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
