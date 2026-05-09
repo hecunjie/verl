@@ -202,6 +202,119 @@ def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
 
+def _compute_high_point_mc_in_batch(
+    *,
+    llm: Any,
+    tokenizer: Any,
+    prompt_ids: list[int],
+    response_ids: list[int],
+    step_lps: list[dict[int, float]],
+    entropies: list[float],
+    high_positions: list[int],
+    candidate_top_p: float,
+    candidate_max_k: int,
+    mc_m_samples: int,
+    mc_temperature: float,
+    mc_top_p: float,
+    vllm_logprobs_topk: int,
+    vllm_request_batch_chunk_mc: int,
+    f_continuation_mode: str,
+    f_sentence_max_new_tokens: int,
+    sentence_stop_check: Any | None,
+    suffix_mode: str,
+    fixed_window_tokens: int,
+    min_suffix_tokens: int,
+) -> list[dict[str, Any]]:
+    """Batch all high-point candidate prefixes for one prompt in one MC call."""
+    jobs: list[dict[str, Any]] = []
+    prefixes: list[list[int]] = []
+    for t in high_positions:
+        if t >= len(response_ids) or t >= len(step_lps):
+            continue
+        step_lp = step_lps[t]
+        cands, cand_probs = _topp_capped_from_step_logprobs(
+            step_lp,
+            top_p=float(candidate_top_p),
+            max_k=int(candidate_max_k),
+        )
+        chosen = int(response_ids[t])
+        if chosen not in cands:
+            cands = [chosen] + [int(x) for x in cands]
+            cand_probs = [0.0] + [float(x) for x in cand_probs]
+        suffix_rate, suffix_len = _suffix_rate_from_realized(
+            entropies,
+            response_ids,
+            t,
+            tokenizer=tokenizer,
+            suffix_mode=str(suffix_mode),
+            fixed_window_tokens=int(fixed_window_tokens),
+            sentence_stop_check=sentence_stop_check,
+            min_suffix_tokens=int(min_suffix_tokens),
+        )
+        job = {
+            "t": int(t),
+            "h_t": float(entropies[t]),
+            "chosen": int(chosen),
+            "cands": [int(x) for x in cands],
+            "cand_probs": [float(x) for x in cand_probs],
+            "suffix_rate": float(suffix_rate),
+            "suffix_len": int(suffix_len),
+        }
+        jobs.append(job)
+        prefixes.extend([prompt_ids + response_ids[:t] + [int(c)] for c in cands])
+    if not jobs:
+        return []
+
+    f_all = estimate_F_mc_many_prefixes_vllm(
+        llm=llm,
+        prefixes=prefixes,
+        m_samples=int(mc_m_samples),
+        max_new_tokens=max(1, int(f_sentence_max_new_tokens)),
+        temperature=float(mc_temperature),
+        top_p=float(mc_top_p),
+        logprobs_k=int(vllm_logprobs_topk),
+        batch_chunk=int(vllm_request_batch_chunk_mc),
+        f_continuation_mode=str(f_continuation_mode),
+        tokenizer=tokenizer if str(f_continuation_mode) == "first_sentence" else None,
+        f_sentence_max_new_tokens=int(f_sentence_max_new_tokens),
+        sentence_stop_check=sentence_stop_check,
+        normalize_by_continuation_length=True,
+    )
+    if len(f_all) != len(prefixes):
+        return []
+
+    out: list[dict[str, Any]] = []
+    cur = 0
+    for job in jobs:
+        k = len(job["cands"])
+        f_values = [float(x) for x in f_all[cur : cur + k]]
+        cur += k
+        if len(f_values) != k:
+            continue
+        chosen_i = int(job["cands"].index(job["chosen"]))
+        f_bar = float(sum(float(p) * float(f_values[i]) for i, p in enumerate(job["cand_probs"])))
+        f_real = float(f_values[chosen_i])
+        bias = float(f_bar - f_real)
+        out.append(
+            {
+                "response_t": int(job["t"]),
+                "h_t": float(job["h_t"]),
+                "chosen_token_id": int(job["chosen"]),
+                "chosen_token_text": tokenizer.decode([int(job["chosen"])], skip_special_tokens=True),
+                "f_bar": float(f_bar),
+                "f_real": float(f_real),
+                "bias": float(bias),
+                "bias_pos": bool(bias > 0.0),
+                "f_suffix_rate": float(job["suffix_rate"]),
+                "suffix_tokens_used": int(job["suffix_len"]),
+                "candidate_token_ids": [int(x) for x in job["cands"]],
+                "candidate_probs": [float(x) for x in job["cand_probs"]],
+                "candidate_f": [float(x) for x in f_values],
+            }
+        )
+    return out
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Collect per-high-entropy-token FEPO bias diagnostics for low-tail validation."
@@ -339,52 +452,29 @@ def main() -> int:
             ground_truth=ground_truth,
             math_eval_backend=str(args.math_eval_backend),
         )
-        for t in high_positions:
-            if t >= len(response_ids) or t >= len(step_lps):
-                continue
-            step_lp = step_lps[t]
-            cands, cand_probs = _topp_capped_from_step_logprobs(
-                step_lp,
-                top_p=float(args.candidate_top_p),
-                max_k=int(args.candidate_max_k),
-            )
-            chosen = int(response_ids[t])
-            if chosen not in cands:
-                cands = [chosen] + [int(x) for x in cands]
-                cand_probs = [0.0] + [float(x) for x in cand_probs]
-            remaining = max(1, int(args.f_sentence_max_new_tokens))
-            prefixes = [prompt_ids + response_ids[:t] + [int(c)] for c in cands]
-            f_mc = estimate_F_mc_many_prefixes_vllm(
-                llm=llm,
-                prefixes=prefixes,
-                m_samples=int(args.mc_m_samples),
-                max_new_tokens=remaining,
-                temperature=float(args.mc_temperature),
-                top_p=float(args.mc_top_p),
-                logprobs_k=int(args.vllm_logprobs_topk),
-                batch_chunk=int(args.vllm_request_batch_chunk_mc),
-                f_continuation_mode=str(args.f_continuation_mode),
-                tokenizer=tokenizer if str(args.f_continuation_mode) == "first_sentence" else None,
-                f_sentence_max_new_tokens=int(args.f_sentence_max_new_tokens),
-                sentence_stop_check=sentence_stop_check,
-                normalize_by_continuation_length=True,
-            )
-            if len(f_mc) != len(cands):
-                continue
-            f_bar = float(sum(float(p) * float(f_mc[i]) for i, p in enumerate(cand_probs)))
-            chosen_i = int(cands.index(chosen))
-            f_real = float(f_mc[chosen_i])
-            suffix_rate, suffix_len = _suffix_rate_from_realized(
-                entropies,
-                response_ids,
-                t,
-                tokenizer=tokenizer,
-                suffix_mode=str(args.suffix_mode),
-                fixed_window_tokens=int(args.fixed_window_tokens),
-                sentence_stop_check=sentence_stop_check,
-                min_suffix_tokens=int(args.min_suffix_tokens),
-            )
-            bias = float(f_bar - f_real)
+        point_stats = _compute_high_point_mc_in_batch(
+            llm=llm,
+            tokenizer=tokenizer,
+            prompt_ids=prompt_ids,
+            response_ids=response_ids,
+            step_lps=step_lps,
+            entropies=entropies,
+            high_positions=high_positions,
+            candidate_top_p=float(args.candidate_top_p),
+            candidate_max_k=int(args.candidate_max_k),
+            mc_m_samples=int(args.mc_m_samples),
+            mc_temperature=float(args.mc_temperature),
+            mc_top_p=float(args.mc_top_p),
+            vllm_logprobs_topk=int(args.vllm_logprobs_topk),
+            vllm_request_batch_chunk_mc=int(args.vllm_request_batch_chunk_mc),
+            f_continuation_mode=str(args.f_continuation_mode),
+            f_sentence_max_new_tokens=int(args.f_sentence_max_new_tokens),
+            sentence_stop_check=sentence_stop_check,
+            suffix_mode=str(args.suffix_mode),
+            fixed_window_tokens=int(args.fixed_window_tokens),
+            min_suffix_tokens=int(args.min_suffix_tokens),
+        )
+        for st in point_stats:
             point_records.append(
                 {
                     "global_index": int(global_idx),
@@ -393,20 +483,20 @@ def main() -> int:
                     "ground_truth": ground_truth,
                     "response_correct": bool(response_correct),
                     "response_eval_info": eval_info,
-                    "response_t": int(t),
+                    "response_t": int(st["response_t"]),
                     "response_len": int(len(response_ids)),
-                    "h_t": float(entropies[t]),
-                    "chosen_token_id": int(chosen),
-                    "chosen_token_text": tokenizer.decode([chosen], skip_special_tokens=True),
-                    "f_bar": float(f_bar),
-                    "f_real": float(f_real),
-                    "bias": float(bias),
-                    "bias_pos": bool(bias > 0.0),
-                    "f_suffix_rate": float(suffix_rate),
-                    "suffix_tokens_used": int(suffix_len),
-                    "candidate_token_ids": [int(x) for x in cands],
-                    "candidate_probs": [float(x) for x in cand_probs],
-                    "candidate_f": [float(x) for x in f_mc],
+                    "h_t": float(st["h_t"]),
+                    "chosen_token_id": int(st["chosen_token_id"]),
+                    "chosen_token_text": st["chosen_token_text"],
+                    "f_bar": float(st["f_bar"]),
+                    "f_real": float(st["f_real"]),
+                    "bias": float(st["bias"]),
+                    "bias_pos": bool(st["bias_pos"]),
+                    "f_suffix_rate": float(st["f_suffix_rate"]),
+                    "suffix_tokens_used": int(st["suffix_tokens_used"]),
+                    "candidate_token_ids": [int(x) for x in st["candidate_token_ids"]],
+                    "candidate_probs": [float(x) for x in st["candidate_probs"]],
+                    "candidate_f": [float(x) for x in st["candidate_f"]],
                     "prompt_text": prompt_text,
                     "response_text": response_text,
                 }
