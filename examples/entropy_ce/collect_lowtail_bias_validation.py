@@ -287,7 +287,9 @@ def main() -> int:
 
     rows = load_data(args.input_data, int(args.max_samples), int(args.seed))
     local_rows = [row for idx, row in enumerate(rows) if idx % world_size == rank]
-    sentence_stop_check = None
+    from sentence_stop_utils import completion_should_stop_after_first_sentence_simple
+
+    sentence_stop_check = completion_should_stop_after_first_sentence_simple
     if args.f_sentence_stop == "pysbd":
         from sentence_stop_utils import make_pysbd_first_sentence_stop_check
 
