@@ -20,8 +20,10 @@ from entropy_credit_experiment import (
     _snapshot_and_clear_torchrun_dist_env,
     build_prompt_text,
     clamp_vllm_logprobs_topk,
+    configure_cuda_visible_one_gpu_per_rank_for_vllm,
     entropy_from_logprobs_topk,
     estimate_F_mc_many_prefixes_vllm,
+    evaluate_solution_acc,
     file_sync,
     init_dist,
     load_data,
@@ -234,6 +236,12 @@ def main() -> int:
     parser.add_argument("--vllm_max_model_len", type=int, default=32768)
     parser.add_argument("--vllm_shard_rank", type=int, default=None)
     parser.add_argument("--vllm_shard_world_size", type=int, default=None)
+    parser.add_argument(
+        "--math_eval_backend",
+        choices=["auto", "math_dapo", "math_verify"],
+        default="math_verify",
+        help="Correctness backend for math-like data. Default math_verify.",
+    )
     parser.add_argument("--no_progress", action="store_true")
     args = parser.parse_args()
 
@@ -242,6 +250,10 @@ def main() -> int:
         raise SystemExit("Pass both --vllm_shard_rank and --vllm_shard_world_size, or neither.")
     if vllm_standalone:
         purge_all_torchrun_like_env_for_vllm_standalone()
+    else:
+        # torchrun 单机多卡时，让每个进程只看到一张 GPU，避免多个 vLLM 实例抢同一张卡。
+        if "LOCAL_RANK" in os.environ:
+            configure_cuda_visible_one_gpu_per_rank_for_vllm()
 
     _configure_vllm_multiprocessing_spawn()
     _configure_vllm_ipc_for_single_node()
@@ -318,6 +330,15 @@ def main() -> int:
             threshold=float(args.entropy_threshold),
             top_ratio=float(args.high_entropy_top_ratio),
         )
+        response_text = tokenizer.decode(response_ids, skip_special_tokens=True)
+        data_source = str(row.get("data_source", "math_dapo"))
+        ground_truth = _ground_truth_from_row(row)
+        response_correct, eval_info = evaluate_solution_acc(
+            data_source=data_source,
+            solution_str=response_text,
+            ground_truth=ground_truth,
+            math_eval_backend=str(args.math_eval_backend),
+        )
         for t in high_positions:
             if t >= len(response_ids) or t >= len(step_lps):
                 continue
@@ -368,8 +389,10 @@ def main() -> int:
                 {
                     "global_index": int(global_idx),
                     "local_index": int(local_i),
-                    "data_source": str(row.get("data_source", "")),
-                    "ground_truth": _ground_truth_from_row(row),
+                    "data_source": data_source,
+                    "ground_truth": ground_truth,
+                    "response_correct": bool(response_correct),
+                    "response_eval_info": eval_info,
                     "response_t": int(t),
                     "response_len": int(len(response_ids)),
                     "h_t": float(entropies[t]),
@@ -385,7 +408,7 @@ def main() -> int:
                     "candidate_probs": [float(x) for x in cand_probs],
                     "candidate_f": [float(x) for x in f_mc],
                     "prompt_text": prompt_text,
-                    "response_text": tokenizer.decode(response_ids, skip_special_tokens=True),
+                    "response_text": response_text,
                 }
             )
 
