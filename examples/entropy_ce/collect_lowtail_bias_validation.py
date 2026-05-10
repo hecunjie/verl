@@ -19,16 +19,15 @@ from entropy_credit_experiment import (
     _restore_torchrun_dist_env,
     _snapshot_and_clear_torchrun_dist_env,
     build_prompt_text,
-    clamp_vllm_logprobs_topk,
     configure_cuda_visible_one_gpu_per_rank_for_vllm,
     entropy_from_logprobs_topk,
     estimate_F_mc_many_prefixes_vllm,
     evaluate_solution_acc,
     file_sync,
+    generate_rollouts_vllm_batched,
     init_dist,
     load_data,
     purge_all_torchrun_like_env_for_vllm_standalone,
-    vllm_generate_quiet,
 )
 from infer_topk_f_mc_compare import _ground_truth_from_row, _topp_capped_from_step_logprobs
 
@@ -36,41 +35,6 @@ try:
     from tqdm.auto import tqdm
 except ImportError:  # pragma: no cover
     tqdm = None  # type: ignore[misc, assignment]
-
-
-def _sample_rollout_with_logprobs(
-    *,
-    llm: Any,
-    prompt_ids: list[int],
-    max_new_tokens: int,
-    temperature: float,
-    top_p: float,
-    logprobs_k: int,
-) -> tuple[list[int], list[dict[int, float]], list[float]]:
-    from vllm import SamplingParams
-    from vllm.inputs import TokensPrompt
-
-    sp = SamplingParams(
-        max_tokens=int(max_new_tokens),
-        temperature=float(temperature),
-        top_p=float(top_p),
-        logprobs=clamp_vllm_logprobs_topk(logprobs_k),
-    )
-    out = vllm_generate_quiet(llm, [TokensPrompt(prompt_token_ids=prompt_ids)], sp)
-    o = out[0].outputs[0]
-    response_ids = [int(t) for t in (o.token_ids or [])]
-    step_lps: list[dict[int, float]] = []
-    entropies: list[float] = []
-    for step_lp in o.logprobs or []:
-        d: dict[int, float] = {}
-        for tid, info in step_lp.items():
-            d[int(tid)] = float(info.logprob)
-        step_lps.append(d)
-        entropies.append(float(entropy_from_logprobs_topk(d)))
-    while len(step_lps) < len(response_ids):
-        step_lps.append({})
-        entropies.append(float("nan"))
-    return response_ids, step_lps[: len(response_ids)], entropies[: len(response_ids)]
 
 
 def _select_high_entropy_positions(
@@ -202,10 +166,17 @@ def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
 
-def _compute_high_point_mc_in_batch(
+def _entropies_from_step_lps(response_ids: list[int], step_lps: list[dict[int, float]]) -> list[float]:
+    entropies: list[float] = []
+    for step_lp in step_lps[: len(response_ids)]:
+        entropies.append(float(entropy_from_logprobs_topk(step_lp)))
+    while len(entropies) < len(response_ids):
+        entropies.append(float("nan"))
+    return entropies
+
+
+def _high_entropy_mc_jobs_for_rollout(
     *,
-    llm: Any,
-    tokenizer: Any,
     prompt_ids: list[int],
     response_ids: list[int],
     step_lps: list[dict[int, float]],
@@ -213,21 +184,14 @@ def _compute_high_point_mc_in_batch(
     high_positions: list[int],
     candidate_top_p: float,
     candidate_max_k: int,
-    mc_m_samples: int,
-    mc_temperature: float,
-    mc_top_p: float,
-    vllm_logprobs_topk: int,
-    vllm_request_batch_chunk_mc: int,
-    f_continuation_mode: str,
-    f_sentence_max_new_tokens: int,
-    sentence_stop_check: Any | None,
+    tokenizer: Any,
     suffix_mode: str,
     fixed_window_tokens: int,
+    sentence_stop_check: Any | None,
     min_suffix_tokens: int,
 ) -> list[dict[str, Any]]:
-    """Batch all high-point candidate prefixes for one prompt in one MC call."""
+    """One MC job per high-entropy step: candidate prefixes + suffix stats (no vLLM yet)."""
     jobs: list[dict[str, Any]] = []
-    prefixes: list[list[int]] = []
     for t in high_positions:
         if t >= len(response_ids) or t >= len(step_lps):
             continue
@@ -251,23 +215,81 @@ def _compute_high_point_mc_in_batch(
             sentence_stop_check=sentence_stop_check,
             min_suffix_tokens=int(min_suffix_tokens),
         )
-        job = {
-            "t": int(t),
-            "h_t": float(entropies[t]),
-            "chosen": int(chosen),
-            "cands": [int(x) for x in cands],
-            "cand_probs": [float(x) for x in cand_probs],
-            "suffix_rate": float(suffix_rate),
-            "suffix_len": int(suffix_len),
-        }
-        jobs.append(job)
-        prefixes.extend([prompt_ids + response_ids[:t] + [int(c)] for c in cands])
+        prefixes = [prompt_ids + response_ids[:t] + [int(c)] for c in cands]
+        jobs.append(
+            {
+                "response_t": int(t),
+                "h_t": float(entropies[t]) if t < len(entropies) else float("nan"),
+                "chosen": int(chosen),
+                "cands": [int(x) for x in cands],
+                "cand_probs": [float(x) for x in cand_probs],
+                "suffix_rate": float(suffix_rate),
+                "suffix_len": int(suffix_len),
+                "prefixes": prefixes,
+            }
+        )
+    return jobs
+
+
+def _finalize_mc_job(
+    job: dict[str, Any],
+    f_values: list[float],
+    tokenizer: Any,
+) -> dict[str, Any] | None:
+    cands = job["cands"]
+    k = len(cands)
+    if len(f_values) != k:
+        return None
+    chosen_i = int(cands.index(job["chosen"]))
+    f_bar = float(sum(float(p) * float(f_values[i]) for i, p in enumerate(job["cand_probs"])))
+    f_real = float(f_values[chosen_i])
+    bias = float(f_bar - f_real)
+    return {
+        "response_t": int(job["response_t"]),
+        "h_t": float(job["h_t"]),
+        "chosen_token_id": int(job["chosen"]),
+        "chosen_token_text": tokenizer.decode([int(job["chosen"])], skip_special_tokens=True),
+        "f_bar": float(f_bar),
+        "f_real": float(f_real),
+        "bias": float(bias),
+        "bias_pos": bool(bias > 0.0),
+        "f_suffix_rate": float(job["suffix_rate"]),
+        "suffix_tokens_used": int(job["suffix_len"]),
+        "candidate_token_ids": [int(x) for x in cands],
+        "candidate_probs": [float(x) for x in job["cand_probs"]],
+        "candidate_f": [float(x) for x in f_values],
+    }
+
+
+def _run_all_mc_jobs(
+    llm: Any,
+    tokenizer: Any,
+    jobs: list[dict[str, Any]],
+    *,
+    mc_m_samples: int,
+    mc_temperature: float,
+    mc_top_p: float,
+    vllm_logprobs_topk: int,
+    vllm_request_batch_chunk_mc: int,
+    f_continuation_mode: str,
+    f_sentence_max_new_tokens: int,
+    sentence_stop_check: Any | None,
+) -> list[dict[str, Any]]:
+    """Single estimate_F_mc_many_prefixes_vllm over all candidate-prefixes (GPU-friendly)."""
     if not jobs:
         return []
-
+    flat_prefixes: list[list[int]] = []
+    spans: list[tuple[int, int]] = []
+    off = 0
+    for job in jobs:
+        prefs = job["prefixes"]
+        k = len(prefs)
+        spans.append((off, off + k))
+        flat_prefixes.extend(prefs)
+        off += k
     f_all = estimate_F_mc_many_prefixes_vllm(
         llm=llm,
-        prefixes=prefixes,
+        prefixes=flat_prefixes,
         m_samples=int(mc_m_samples),
         max_new_tokens=max(1, int(f_sentence_max_new_tokens)),
         temperature=float(mc_temperature),
@@ -280,38 +302,20 @@ def _compute_high_point_mc_in_batch(
         sentence_stop_check=sentence_stop_check,
         normalize_by_continuation_length=True,
     )
-    if len(f_all) != len(prefixes):
+    if len(f_all) != len(flat_prefixes):
         return []
-
     out: list[dict[str, Any]] = []
-    cur = 0
-    for job in jobs:
-        k = len(job["cands"])
-        f_values = [float(x) for x in f_all[cur : cur + k]]
-        cur += k
-        if len(f_values) != k:
-            continue
-        chosen_i = int(job["cands"].index(job["chosen"]))
-        f_bar = float(sum(float(p) * float(f_values[i]) for i, p in enumerate(job["cand_probs"])))
-        f_real = float(f_values[chosen_i])
-        bias = float(f_bar - f_real)
-        out.append(
-            {
-                "response_t": int(job["t"]),
-                "h_t": float(job["h_t"]),
-                "chosen_token_id": int(job["chosen"]),
-                "chosen_token_text": tokenizer.decode([int(job["chosen"])], skip_special_tokens=True),
-                "f_bar": float(f_bar),
-                "f_real": float(f_real),
-                "bias": float(bias),
-                "bias_pos": bool(bias > 0.0),
-                "f_suffix_rate": float(job["suffix_rate"]),
-                "suffix_tokens_used": int(job["suffix_len"]),
-                "candidate_token_ids": [int(x) for x in job["cands"]],
-                "candidate_probs": [float(x) for x in job["cand_probs"]],
-                "candidate_f": [float(x) for x in f_values],
-            }
-        )
+    for job, (a, b) in zip(jobs, spans):
+        trace = job.get("_trace") or {}
+        core = {
+            k: job[k]
+            for k in ("response_t", "h_t", "chosen", "cands", "cand_probs", "suffix_rate", "suffix_len")
+            if k in job
+        }
+        f_slice = [float(x) for x in f_all[a:b]]
+        st = _finalize_mc_job(core, f_slice, tokenizer)
+        if st is not None:
+            out.append({**trace, **st})
     return out
 
 
@@ -325,6 +329,18 @@ def main() -> int:
     parser.add_argument("--max_samples", type=int, default=200)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max_new_tokens", type=int, default=2048)
+    parser.add_argument(
+        "--rollout_n",
+        type=int,
+        default=8,
+        help="Independent rollouts per prompt (batched on GPU via generate_rollouts_vllm_batched).",
+    )
+    parser.add_argument(
+        "--rollout_batch_chunk",
+        type=int,
+        default=8,
+        help="Parallel vLLM requests per prompt for rollouts (same prompt repeated this many times).",
+    )
     parser.add_argument("--rollout_temperature", type=float, default=1.0)
     parser.add_argument("--rollout_top_p", type=float, default=0.95)
     parser.add_argument("--high_entropy_mode", choices=["threshold", "top_ratio"], default="threshold")
@@ -357,6 +373,10 @@ def main() -> int:
     )
     parser.add_argument("--no_progress", action="store_true")
     args = parser.parse_args()
+    if int(args.rollout_n) < 1:
+        raise SystemExit("--rollout_n must be >= 1")
+    if int(args.rollout_batch_chunk) < 1:
+        raise SystemExit("--rollout_batch_chunk must be >= 1")
 
     vllm_standalone = args.vllm_shard_rank is not None and args.vllm_shard_world_size is not None
     if (args.vllm_shard_rank is None) ^ (args.vllm_shard_world_size is None):
@@ -419,87 +439,93 @@ def main() -> int:
 
         sentence_stop_check = make_pysbd_first_sentence_stop_check()
 
-    point_records: list[dict[str, Any]] = []
+    all_mc_jobs: list[dict[str, Any]] = []
+    logprobs_k = max(int(args.vllm_logprobs_topk), int(args.candidate_max_k))
     prompt_iter = enumerate(local_rows)
     if tqdm is not None and not args.no_progress:
-        prompt_iter = tqdm(prompt_iter, total=len(local_rows), desc=f"rank{rank} prompts", dynamic_ncols=True)
+        prompt_iter = tqdm(prompt_iter, total=len(local_rows), desc=f"rank{rank} rollouts", dynamic_ncols=True)
 
     for local_i, row in prompt_iter:
         global_idx = local_i * world_size + rank
         prompt_text = build_prompt_text(tokenizer, row["prompt"])
         prompt_ids = tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False)["input_ids"][0].tolist()
-        response_ids, step_lps, entropies = _sample_rollout_with_logprobs(
-            llm=llm,
-            prompt_ids=prompt_ids,
-            max_new_tokens=int(args.max_new_tokens),
-            temperature=float(args.rollout_temperature),
-            top_p=float(args.rollout_top_p),
-            logprobs_k=max(int(args.vllm_logprobs_topk), int(args.candidate_max_k)),
+        rollouts = generate_rollouts_vllm_batched(
+            llm,
+            tokenizer,
+            prompt_text,
+            int(args.max_new_tokens),
+            float(args.rollout_temperature),
+            float(args.rollout_top_p),
+            logprobs_k,
+            int(args.rollout_n),
+            batch_chunk=int(args.rollout_batch_chunk),
         )
-        high_positions = _select_high_entropy_positions(
-            entropies,
-            mode=str(args.high_entropy_mode),
-            threshold=float(args.entropy_threshold),
-            top_ratio=float(args.high_entropy_top_ratio),
-        )
-        response_text = tokenizer.decode(response_ids, skip_special_tokens=True)
         data_source = str(row.get("data_source", "math_dapo"))
         ground_truth = _ground_truth_from_row(row)
-        response_correct, eval_info = evaluate_solution_acc(
-            data_source=data_source,
-            solution_str=response_text,
-            ground_truth=ground_truth,
-            math_eval_backend=str(args.math_eval_backend),
-        )
-        point_stats = _compute_high_point_mc_in_batch(
-            llm=llm,
-            tokenizer=tokenizer,
-            prompt_ids=prompt_ids,
-            response_ids=response_ids,
-            step_lps=step_lps,
-            entropies=entropies,
-            high_positions=high_positions,
-            candidate_top_p=float(args.candidate_top_p),
-            candidate_max_k=int(args.candidate_max_k),
-            mc_m_samples=int(args.mc_m_samples),
-            mc_temperature=float(args.mc_temperature),
-            mc_top_p=float(args.mc_top_p),
-            vllm_logprobs_topk=int(args.vllm_logprobs_topk),
-            vllm_request_batch_chunk_mc=int(args.vllm_request_batch_chunk_mc),
-            f_continuation_mode=str(args.f_continuation_mode),
-            f_sentence_max_new_tokens=int(args.f_sentence_max_new_tokens),
-            sentence_stop_check=sentence_stop_check,
-            suffix_mode=str(args.suffix_mode),
-            fixed_window_tokens=int(args.fixed_window_tokens),
-            min_suffix_tokens=int(args.min_suffix_tokens),
-        )
-        for st in point_stats:
-            point_records.append(
-                {
-                    "global_index": int(global_idx),
-                    "local_index": int(local_i),
-                    "data_source": data_source,
-                    "ground_truth": ground_truth,
-                    "response_correct": bool(response_correct),
-                    "response_eval_info": eval_info,
-                    "response_t": int(st["response_t"]),
-                    "response_len": int(len(response_ids)),
-                    "h_t": float(st["h_t"]),
-                    "chosen_token_id": int(st["chosen_token_id"]),
-                    "chosen_token_text": st["chosen_token_text"],
-                    "f_bar": float(st["f_bar"]),
-                    "f_real": float(st["f_real"]),
-                    "bias": float(st["bias"]),
-                    "bias_pos": bool(st["bias_pos"]),
-                    "f_suffix_rate": float(st["f_suffix_rate"]),
-                    "suffix_tokens_used": int(st["suffix_tokens_used"]),
-                    "candidate_token_ids": [int(x) for x in st["candidate_token_ids"]],
-                    "candidate_probs": [float(x) for x in st["candidate_probs"]],
-                    "candidate_f": [float(x) for x in st["candidate_f"]],
-                    "prompt_text": prompt_text,
-                    "response_text": response_text,
-                }
+        for rollout_idx, (response_ids, step_lps) in enumerate(rollouts):
+            entropies = _entropies_from_step_lps(response_ids, step_lps)
+            high_positions = _select_high_entropy_positions(
+                entropies,
+                mode=str(args.high_entropy_mode),
+                threshold=float(args.entropy_threshold),
+                top_ratio=float(args.high_entropy_top_ratio),
             )
+            response_text = tokenizer.decode(response_ids, skip_special_tokens=True)
+            response_correct, eval_info = evaluate_solution_acc(
+                data_source=data_source,
+                solution_str=response_text,
+                ground_truth=ground_truth,
+                math_eval_backend=str(args.math_eval_backend),
+            )
+            sub = _high_entropy_mc_jobs_for_rollout(
+                prompt_ids=prompt_ids,
+                response_ids=response_ids,
+                step_lps=step_lps,
+                entropies=entropies,
+                high_positions=high_positions,
+                candidate_top_p=float(args.candidate_top_p),
+                candidate_max_k=int(args.candidate_max_k),
+                tokenizer=tokenizer,
+                suffix_mode=str(args.suffix_mode),
+                fixed_window_tokens=int(args.fixed_window_tokens),
+                sentence_stop_check=sentence_stop_check,
+                min_suffix_tokens=int(args.min_suffix_tokens),
+            )
+            trace = {
+                "global_index": int(global_idx),
+                "local_index": int(local_i),
+                "rollout_idx": int(rollout_idx),
+                "data_source": data_source,
+                "ground_truth": ground_truth,
+                "response_correct": bool(response_correct),
+                "response_eval_info": eval_info,
+                "prompt_text": prompt_text,
+                "response_text": response_text,
+                "response_len": int(len(response_ids)),
+            }
+            for j in sub:
+                j["_trace"] = trace
+            all_mc_jobs.extend(sub)
+
+    if not args.no_progress:
+        print(
+            f"rank{rank}: MC phase — {len(all_mc_jobs)} high-entropy points "
+            f"({len(local_rows)} prompts × up to {args.rollout_n} rollouts)",
+            flush=True,
+        )
+    point_records = _run_all_mc_jobs(
+        llm,
+        tokenizer,
+        all_mc_jobs,
+        mc_m_samples=int(args.mc_m_samples),
+        mc_temperature=float(args.mc_temperature),
+        mc_top_p=float(args.mc_top_p),
+        vllm_logprobs_topk=int(args.vllm_logprobs_topk),
+        vllm_request_batch_chunk_mc=int(args.vllm_request_batch_chunk_mc),
+        f_continuation_mode=str(args.f_continuation_mode),
+        f_sentence_max_new_tokens=int(args.f_sentence_max_new_tokens),
+        sentence_stop_check=sentence_stop_check,
+    )
 
     _length_bucket_normalize(
         point_records,
@@ -533,6 +559,8 @@ def main() -> int:
             "n_points": int(len(merged)),
             "bias_pos_rate": float(np.mean([1.0 if r.get("bias_pos") else 0.0 for r in merged])) if merged else None,
             "output": str(out_dir / "lowtail_bias_points.jsonl"),
+            "rollout_n": int(args.rollout_n),
+            "per_record_rollout_idx": "Each row includes rollout_idx in [0, rollout_n) for the same global_index.",
             "q_definition": "rank percentile of length-bucket-normalized realized suffix entropy rate; low-tail has small q.",
             "bias_definition": "bias = f_bar - f_real; bias_pos means bias > 0.",
         }
