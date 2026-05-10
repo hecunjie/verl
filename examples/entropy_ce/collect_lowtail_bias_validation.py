@@ -7,6 +7,7 @@ import json
 import math
 import os
 import random
+import time
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +36,25 @@ try:
     from tqdm.auto import tqdm
 except ImportError:  # pragma: no cover
     tqdm = None  # type: ignore[misc, assignment]
+
+
+def _file_barrier_all_ranks(
+    out_dir: Path,
+    rank: int,
+    world_size: int,
+    tag: str,
+    *,
+    poll_s: float = 2.0,
+) -> None:
+    """Every rank writes a marker then spins until all ranks' markers exist (no torch process group)."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    marker = out_dir / f"_{tag}_rank{rank}"
+    marker.write_text("ok\n", encoding="utf-8")
+    if world_size <= 1:
+        return
+    expected = [out_dir / f"_{tag}_rank{r}" for r in range(world_size)]
+    while not all(p.exists() for p in expected):
+        time.sleep(poll_s)
 
 
 def _select_high_entropy_positions(
@@ -371,6 +391,12 @@ def main() -> int:
         default="math_verify",
         help="Correctness backend for math-like data. Default math_verify.",
     )
+    parser.add_argument(
+        "--no_global_rollout_barrier",
+        action="store_true",
+        help="If set, each rank runs MC as soon as its own rollouts finish. "
+        "Default (multi-GPU): wait until every rank finishes rollout, then all enter MC.",
+    )
     parser.add_argument("--no_progress", action="store_true")
     args = parser.parse_args()
     if int(args.rollout_n) < 1:
@@ -423,9 +449,14 @@ def main() -> int:
 
     out_dir = Path(args.output_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+    rollout_barrier_tag = "rollout_phase_done_lowtail"
     if rank == 0:
         for r in range(world_size):
             stale = out_dir / f"_done_lowtail_bias_rank{r}"
+            if stale.exists():
+                stale.unlink()
+        for r in range(world_size):
+            stale = out_dir / f"_{rollout_barrier_tag}_rank{r}"
             if stale.exists():
                 stale.unlink()
 
@@ -507,6 +538,17 @@ def main() -> int:
                 j["_trace"] = trace
             all_mc_jobs.extend(sub)
 
+    if world_size > 1 and not args.no_global_rollout_barrier:
+        if not args.no_progress:
+            print(
+                f"rank{rank}: rollout done ({len(all_mc_jobs)} MC jobs queued); "
+                f"waiting for all {world_size} ranks before MC...",
+                flush=True,
+            )
+        _file_barrier_all_ranks(out_dir, rank, world_size, rollout_barrier_tag)
+        if not args.no_progress:
+            print(f"rank{rank}: all ranks passed rollout barrier; starting MC", flush=True)
+
     if not args.no_progress:
         print(
             f"rank{rank}: MC phase — {len(all_mc_jobs)} high-entropy points "
@@ -560,6 +602,7 @@ def main() -> int:
             "bias_pos_rate": float(np.mean([1.0 if r.get("bias_pos") else 0.0 for r in merged])) if merged else None,
             "output": str(out_dir / "lowtail_bias_points.jsonl"),
             "rollout_n": int(args.rollout_n),
+            "global_rollout_barrier": bool(world_size > 1 and not args.no_global_rollout_barrier),
             "per_record_rollout_idx": "Each row includes rollout_idx in [0, rollout_n) for the same global_index.",
             "q_definition": "rank percentile of length-bucket-normalized realized suffix entropy rate; low-tail has small q.",
             "bias_definition": "bias = f_bar - f_real; bias_pos means bias > 0.",
