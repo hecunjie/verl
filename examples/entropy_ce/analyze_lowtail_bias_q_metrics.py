@@ -10,9 +10,16 @@ Definitions (aligned with collect script summary):
 - Accuracy: P(bias > 0 | q <= cutoff) among tokens with finite q in the tail set.
 - Recall: among tokens with bias > 0 and |bias| > tau, fraction with q <= cutoff.
 
-When loading multiple shard files (e.g. lowtail_bias_points_rank*.jsonl), use
---recompute-q (default) so q is computed on the union, matching merged
-lowtail_bias_points.jsonl behavior.
+Default behavior (``--recompute-q``, on by default):
+  Load **all** given JSONL files into one list, then on that **full union**
+  recompute length-bucket de-biasing for ``f_suffix_rate`` →
+  ``f_suffix_rate_norm``, then assign global rank-percentile ``q``. This
+  matches rank-0's ``lowtail_bias_points.jsonl`` pipeline and is **not** the
+  per-rank ``q`` stored inside each ``*_rank*.jsonl`` shard.
+
+Use ``--no-recompute-q`` only if you intentionally trust ``q`` already in the
+file (e.g. a single merged JSONL). With multiple shards, ``--no-recompute-q``
+is usually wrong.
 """
 
 from __future__ import annotations
@@ -161,7 +168,10 @@ def main() -> int:
         "--recompute-q",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Recompute length-bucket norm and q on loaded union (recommended for rank*.jsonl shards).",
+        help=(
+            "On the merged dataset: recompute length-bucket normalization and q "
+            "(default: true; required for correct metrics when reading multiple rank*.jsonl)."
+        ),
     )
     parser.add_argument(
         "--suffix-len-bin-width",
@@ -232,6 +242,15 @@ def main() -> int:
             extra = f" ({err})" if err else ""
             print(f"  {p}: {n}{extra}", file=sys.stderr)
         return 2
+
+    if not args.recompute_q and len(paths) > 1:
+        print(
+            "warning: --no-recompute-q with multiple input files; "
+            "shard files usually contain per-rank q — metrics may be wrong. "
+            "Omit --no-recompute-q to re-bucket and recompute q on the full union.",
+            file=sys.stderr,
+        )
+
     if args.recompute_q:
         _length_bucket_normalize(
             records,
@@ -239,6 +258,24 @@ def main() -> int:
             min_count=int(args.suffix_len_min_count),
         )
         _assign_q(records, key="f_suffix_rate_norm")
+        n_q = sum(
+            1
+            for r in records
+            if np.isfinite(float(r.get("q", float("nan"))))
+            and np.isfinite(float(r.get("f_suffix_rate_norm", float("nan"))))
+        )
+        print(
+            "recomputed on full union: "
+            f"n_records={len(records)}, finite_q={n_q}, "
+            f"suffix_len_bin_width={args.suffix_len_bin_width}, "
+            f"suffix_len_min_count={args.suffix_len_min_count}",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            "using q / f_suffix_rate_norm from JSONL as-is (no recompute).",
+            file=sys.stderr,
+        )
 
     tau = float(args.bias_abs_threshold)
     cutoffs = [float(x) for x in args.q_cutoffs]
