@@ -21,6 +21,7 @@ import argparse
 import glob as glob_module
 import json
 import math
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -98,21 +99,50 @@ def _load_jsonl_paths(paths: list[Path]) -> list[dict[str, Any]]:
 def _expand_inputs(inputs: list[str]) -> list[Path]:
     out: list[Path] = []
     for s in inputs:
+        if not s:
+            continue
         p = Path(s).expanduser()
         if any(ch in str(p) for ch in "*?["):
-            out.extend(Path(x) for x in sorted(glob_module.glob(str(p))))
+            matched = sorted(glob_module.glob(str(p)))
+            out.extend(Path(x) for x in matched)
         else:
             out.append(p.resolve())
-    return out
+    # Stable de-dupe by resolved path
+    seen: set[Path] = set()
+    deduped: list[Path] = []
+    for x in out:
+        r = x.resolve()
+        if r not in seen:
+            seen.add(r)
+            deduped.append(r)
+    return deduped
+
+
+def _paths_from_dir(dir_path: Path, name_glob: str) -> list[Path]:
+    if not dir_path.is_dir():
+        raise SystemExit(f"Not a directory: {dir_path}")
+    return sorted(dir_path.glob(name_glob))
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--jsonl",
-        nargs="+",
-        required=True,
-        help="One or more JSONL files (e.g. merged lowtail_bias_points.jsonl or rank shards).",
+        nargs="*",
+        default=[],
+        help="One or more JSONL paths; shell globs may not expand on all setups — prefer --from-dir.",
+    )
+    parser.add_argument(
+        "--from-dir",
+        type=str,
+        default="",
+        help="Directory to scan with --glob-name (avoids empty shell glob / wrong path).",
+    )
+    parser.add_argument(
+        "--glob-name",
+        type=str,
+        default="lowtail_bias_points_rank*.jsonl",
+        help="Pattern for Path.glob under --from-dir. Try low_bias_points_rank*.jsonl if needed.",
     )
     parser.add_argument(
         "--bias-abs-threshold",
@@ -153,12 +183,55 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    paths = _expand_inputs(list(args.jsonl))
+    path_inputs = list(args.jsonl)
+    if args.from_dir:
+        d = Path(args.from_dir).expanduser().resolve()
+        path_inputs.extend(str(p) for p in _paths_from_dir(d, args.glob_name))
+    paths = _expand_inputs(path_inputs)
+
+    if not paths:
+        print(
+            "error: no JSONL files to read.\n"
+            f"  --jsonl arguments: {args.jsonl!r}\n"
+            f"  --from-dir: {args.from_dir!r}  --glob-name: {args.glob_name!r}\n"
+            "Hints:\n"
+            "  • If you quoted a glob, Python should still expand it; otherwise the path may be wrong "
+            "or filenames may differ (e.g. low_bias_points_rank0.jsonl vs lowtail_...).\n"
+            "  • Use: --from-dir /path/to/eval_outcome --glob-name '*rank*.jsonl'\n"
+            "  • Or: ls /path/to/eval_outcome/*.jsonl",
+            file=sys.stderr,
+        )
+        return 2
+
     for p in paths:
         if not p.exists():
             raise SystemExit(f"Missing file: {p}")
 
+    print(f"reading {len(paths)} file(s)", file=sys.stderr)
+    for p in paths[:12]:
+        print(f"  {p}", file=sys.stderr)
+    if len(paths) > 12:
+        print(f"  ... and {len(paths) - 12} more", file=sys.stderr)
+
     records = _load_jsonl_paths(paths)
+    if not records:
+        nonempty = []
+        for p in paths:
+            try:
+                n = sum(1 for line in p.open("r", encoding="utf-8") if line.strip())
+            except OSError as e:
+                n = -1
+                nonempty.append((p, n, str(e)))
+            else:
+                nonempty.append((p, n, ""))
+        print(
+            "error: loaded 0 JSON records. Non-empty line counts per file:",
+            file=sys.stderr,
+        )
+        for p, n, err in nonempty:
+            extra = f" ({err})" if err else ""
+            print(f"  {p}: {n}{extra}", file=sys.stderr)
+        return 2
     if args.recompute_q:
         _length_bucket_normalize(
             records,
