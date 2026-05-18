@@ -7,6 +7,7 @@ import json
 import math
 import os
 import random
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -36,6 +37,62 @@ try:
     from tqdm.auto import tqdm
 except ImportError:  # pragma: no cover
     tqdm = None  # type: ignore[misc, assignment]
+
+
+def _vllm_max_valid_token_id(llm: Any) -> int | None:
+    """Upper bound on token ids accepted by vLLM v1 input validation (exclusive)."""
+    try:
+        cfg = llm.llm_engine.model_config
+    except Exception:
+        return None
+    get_vs = getattr(cfg, "get_vocab_size", None)
+    if callable(get_vs):
+        try:
+            return int(get_vs())
+        except Exception:
+            pass
+    for obj in (
+        getattr(cfg, "hf_text_config", None),
+        getattr(cfg, "hf_config", None),
+        cfg,
+    ):
+        if obj is None:
+            continue
+        vs = getattr(obj, "vocab_size", None)
+        if vs is not None:
+            try:
+                return int(vs)
+            except Exception:
+                pass
+    return None
+
+
+def _mc_prefix_token_cap(llm: Any, tokenizer: Any) -> int | None:
+    """Strictest exclusive upper bound from vLLM config and HF tokenizer.vocab_size."""
+    caps: list[int] = []
+    v = _vllm_max_valid_token_id(llm)
+    if v is not None:
+        caps.append(int(v))
+    tv = getattr(tokenizer, "vocab_size", None)
+    if tv is not None:
+        try:
+            caps.append(int(tv))
+        except Exception:
+            pass
+    if not caps:
+        return None
+    return min(caps)
+
+
+def _prefix_token_ids_ok(prefix: list[int], vmax: int | None) -> bool:
+    if not prefix:
+        return False
+    for t in prefix:
+        if t < 0:
+            return False
+        if vmax is not None and int(t) >= int(vmax):
+            return False
+    return True
 
 
 def _file_barrier_all_ranks(
@@ -294,10 +351,33 @@ def _run_all_mc_jobs(
     f_continuation_mode: str,
     f_sentence_max_new_tokens: int,
     sentence_stop_check: Any | None,
+    skip_oov_prefix_jobs: bool = True,
+    no_progress: bool = False,
 ) -> list[dict[str, Any]]:
     """Single estimate_F_mc_many_prefixes_vllm over all candidate-prefixes (GPU-friendly)."""
     if not jobs:
         return []
+    vmax = _mc_prefix_token_cap(llm, tokenizer)
+    if skip_oov_prefix_jobs and vmax is not None:
+        kept: list[dict[str, Any]] = []
+        n_drop = 0
+        for job in jobs:
+            prefs = job.get("prefixes") or []
+            if not prefs or not all(_prefix_token_ids_ok(p, vmax) for p in prefs):
+                n_drop += 1
+                continue
+            kept.append(job)
+        if n_drop and not no_progress:
+            print(
+                f"warning: dropped {n_drop} high-entropy MC job(s): token id >= strict vocab cap "
+                f"({vmax}); common with Qwen + vLLM v1 input checks. See --no-mc-skip-oov-jobs.",
+                file=sys.stderr,
+                flush=True,
+            )
+        jobs = kept
+    if not jobs:
+        return []
+
     flat_prefixes: list[list[int]] = []
     spans: list[tuple[int, int]] = []
     off = 0
@@ -381,6 +461,13 @@ def main() -> int:
     parser.add_argument("--suffix_len_min_count", type=int, default=20)
     parser.add_argument("--vllm_logprobs_topk", type=int, default=20)
     parser.add_argument("--vllm_request_batch_chunk_mc", type=int, default=32)
+    parser.add_argument(
+        "--mc-skip-oov-jobs",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Drop MC jobs whose prefix contains token ids >= vLLM vocab_size (avoids "
+        "ValueError: Token id ... is out of vocabulary on some Qwen + vLLM v1 builds).",
+    )
     parser.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.9)
     parser.add_argument("--vllm_max_model_len", type=int, default=32768)
     parser.add_argument("--vllm_shard_rank", type=int, default=None)
@@ -567,6 +654,8 @@ def main() -> int:
         f_continuation_mode=str(args.f_continuation_mode),
         f_sentence_max_new_tokens=int(args.f_sentence_max_new_tokens),
         sentence_stop_check=sentence_stop_check,
+        skip_oov_prefix_jobs=bool(args.mc_skip_oov_jobs),
+        no_progress=bool(args.no_progress),
     )
 
     _length_bucket_normalize(

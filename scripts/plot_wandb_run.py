@@ -65,12 +65,30 @@ _PALETTE = [
 
 # 多 run 对比：具名方法固定色（不区分大小写；键为方法名去掉首尾空格后的小写）
 _METHOD_COLORS: dict[str, str] = {
-    "fepo": "#D32F2F",  # red
-    "gtpo": "#1976D2",  # blue
+    "fepo": "#C62828",  # deep red
+    "gtpo": "#1565C0",  # deep blue
     "grpo": "#2E7D32",  # green
-    "etr": "#8E24AA",  # purple
+    "etr": "#6A1B9A",  # purple
     "grpo-s": "#EF6C00",  # orange
 }
+
+# 单 run / 子图：按完整 wandb metric key 固定色（优先于调色盘）
+_METRIC_COLORS: dict[str, str] = {
+    "fepo/offpolicy_abs_log_ratio_mean": "#1565C0",  # blue — log IS ratio
+    "fepo/offpolicy_spearman_p10": "#C62828",  # red — Spearman
+    "fepo/f_suffix_rate_mean_high": "#00897B",  # teal
+}
+
+
+def _color_for_metric(metric: str, fallback_index: int) -> str:
+    key = metric.strip()
+    if key in _METRIC_COLORS:
+        return _METRIC_COLORS[key]
+    lk = key.lower()
+    for pat, col in _METRIC_COLORS.items():
+        if pat.lower() == lk:
+            return col
+    return _PALETTE[fallback_index % len(_PALETTE)]
 
 
 def _color_for_method(method_label: str, fallback_index: int) -> str:
@@ -333,6 +351,58 @@ def fetch_history_by_metrics(
     return merged
 
 
+def plot_single_run_metric(
+    df: pd.DataFrame,
+    metric: str,
+    x_col: str,
+    outfile: str,
+    *,
+    method_label: str = "",
+    x_label: str = "step",
+    min_step: int | None = None,
+    max_step: int | None = None,
+    x_tick_multiple: float = 0.0,
+    show_raw_underlay: bool = False,
+    df_raw: pd.DataFrame | None = None,
+    line_width: float = 2.0,
+) -> None:
+    """单指标单图：适合 off-policy 等需要大图展示的曲线。"""
+    if metric not in df.columns:
+        raise ValueError(f"metric {metric!r} not in dataframe")
+    color = _color_for_method(method_label, 0) if method_label else _color_for_metric(metric, 0)
+    legend = method_label.strip() if method_label and method_label.strip() else short_metric_ylabel(metric)
+
+    fig, ax = plt.subplots(figsize=(10.2, 5.4), constrained_layout=True)
+    ax.grid(axis="y", color="#E8EAED", linestyle="-", linewidth=0.9, alpha=0.95, zorder=0)
+
+    dfp = _apply_step_range_mask(df, x_col, min_step, max_step)
+    xs = pd.to_numeric(dfp[x_col], errors="coerce").to_numpy()
+    ys = pd.to_numeric(dfp[metric], errors="coerce").to_numpy()
+
+    if show_raw_underlay and df_raw is not None and metric in df_raw.columns:
+        dfr = _apply_step_range_mask(df_raw, x_col, min_step, max_step)
+        xs_r = pd.to_numeric(dfr[x_col], errors="coerce").to_numpy()
+        ys_r = pd.to_numeric(dfr[metric], errors="coerce").to_numpy()
+        ax.plot(xs_r, ys_r, color=color, alpha=0.2, linewidth=line_width * 0.7, solid_capstyle="round", zorder=1)
+
+    ax.plot(xs, ys, color=color, label=legend, solid_capstyle="round", linewidth=line_width, zorder=3)
+    finite = ys[np.isfinite(ys)]
+    if finite.size > 0:
+        ymax = float(np.nanmax(finite))
+        ax.axhline(ymax, color=color, linestyle="--", linewidth=line_width * 0.75, alpha=0.55, zorder=2)
+
+    ax.set_xlabel(x_label, fontweight="medium")
+    ax.set_ylabel(short_metric_ylabel(metric), fontweight="medium", color="#333333")
+    ax.tick_params(axis="y", labelcolor="#333333")
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.legend(loc="best", framealpha=0.96, edgecolor="#D0D0D0", fancybox=True)
+    if x_tick_multiple > 0 and xs.size:
+        _set_xticks_multiple_of(ax, float(np.nanmin(xs)), float(np.nanmax(xs)), x_tick_multiple)
+    fig.savefig(outfile, bbox_inches="tight")
+    plt.close(fig)
+
+
 def plot_subplots(
     df: pd.DataFrame,
     metrics: list[str],
@@ -342,23 +412,34 @@ def plot_subplots(
     min_step: int | None = None,
     max_step: int | None = None,
     x_tick_multiple: float = 0.0,
+    *,
+    method_label: str = "",
+    show_raw_underlay: bool = False,
+    df_raw: pd.DataFrame | None = None,
 ) -> None:
     n = len(metrics)
-    fig_h = min(2.8 * n + 0.6, 26)
-    fig, axes = plt.subplots(n, 1, figsize=(10.2, fig_h), sharex=True, constrained_layout=True)
+    fig_h = min(3.1 * n + 0.8, 28)
+    fig, axes = plt.subplots(n, 1, figsize=(10.4, fig_h), sharex=True, constrained_layout=True)
     if n == 1:
         axes = [axes]
     dfp = _apply_step_range_mask(df, x_col, min_step, max_step)
     xs = pd.to_numeric(dfp[x_col], errors="coerce").to_numpy()
-    for ax, m, color in zip(axes, metrics, _PALETTE * (1 + n // len(_PALETTE))):
-        ys = pd.to_numeric(dfp[m], errors="coerce")
-        ax.plot(xs, ys, color=color, label=m, solid_capstyle="round", linewidth=1.35)
-        ax.set_ylabel(short_metric_ylabel(m), color=color, fontweight="medium")
+    legend = method_label.strip() if method_label else ""
+    for i, (ax, m) in enumerate(zip(axes, metrics)):
+        color = _color_for_method(legend, i) if legend else _color_for_metric(m, i)
+        ys = pd.to_numeric(dfp[m], errors="coerce").to_numpy()
+        if show_raw_underlay and df_raw is not None and m in df_raw.columns:
+            dfr = _apply_step_range_mask(df_raw, x_col, min_step, max_step)
+            xs_r = pd.to_numeric(dfr[x_col], errors="coerce").to_numpy()
+            ys_r = pd.to_numeric(dfr[m], errors="coerce").to_numpy()
+            ax.plot(xs_r, ys_r, color=color, alpha=0.2, linewidth=1.1, solid_capstyle="round", zorder=1)
+        ax.plot(xs, ys, color=color, solid_capstyle="round", linewidth=2.0, zorder=3)
+        ax.set_ylabel(short_metric_ylabel(m), color=color, fontweight="semibold")
         ax.tick_params(axis="y", labelcolor=color)
-        ax.grid(axis="y", color="#E5E7EB", linestyle="-", linewidth=0.8, alpha=0.9)
+        ax.grid(axis="y", color="#E8EAED", linestyle="-", linewidth=0.9, alpha=0.95, zorder=0)
         ax.spines["top"].set_visible(False)
         ax.spines["right"].set_visible(False)
-    axes[-1].set_xlabel(x_label)
+    axes[-1].set_xlabel(x_label, fontweight="medium")
     if x_tick_multiple > 0 and xs.size:
         x_lo, x_hi = float(np.nanmin(xs)), float(np.nanmax(xs))
         _set_xticks_multiple_of(axes[-1], x_lo, x_hi, x_tick_multiple)
@@ -441,9 +522,9 @@ def plot_overlay(
     dfp = _apply_step_range_mask(df, x_col, min_step, max_step)
     xs = pd.to_numeric(dfp[x_col], errors="coerce").to_numpy()
     for i, m in enumerate(metrics):
-        color = _PALETTE[i % len(_PALETTE)]
+        color = _color_for_metric(m, i)
         ys = pd.to_numeric(dfp[m], errors="coerce")
-        ax.plot(xs, ys, color=color, label=short_metric_ylabel(m), solid_capstyle="round", linewidth=1.35)
+        ax.plot(xs, ys, color=color, label=short_metric_ylabel(m), solid_capstyle="round", linewidth=2.0)
     ax.set_xlabel(x_label)
     ax.set_ylabel("value")
     ax.spines["top"].set_visible(False)
@@ -545,6 +626,23 @@ def main() -> int:
         "--no-auto-aime25-best4",
         action="store_true",
         help="Disable auto-appending AIME2025 best@4 metric plots.",
+    )
+    parser.add_argument(
+        "--method",
+        type=str,
+        default="",
+        help="单 run 图例名与配色（如 FEPO）；未指定时按 metric 固定色或调色盘",
+    )
+    parser.add_argument(
+        "--split-metrics",
+        action="store_true",
+        help="单 run：每个指标单独输出一张 PNG（更清晰；路径由 --output 推导或 --out-dir）",
+    )
+    parser.add_argument(
+        "--show-raw-underlay",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="在 EMA/rolling 平滑曲线下叠一层淡色原始曲线；默认在启用平滑时开启",
     )
     args = parser.parse_args()
 
@@ -686,18 +784,48 @@ def main() -> int:
         print(", ".join(all_numeric[:40]), file=sys.stderr)
         return 1
 
-    if (args.smooth and args.smooth > 1) or ema_alpha > 0.0:
+    smoothing_on = (args.smooth and args.smooth > 1) or ema_alpha > 0.0
+    show_raw = args.show_raw_underlay if args.show_raw_underlay is not None else smoothing_on
+    df_raw = df.copy() if show_raw and smoothing_on else None
+
+    if smoothing_on:
+        df_plot = df.copy()
         for m in metrics:
-            df[m] = _smooth_series(
-                df[m],
+            df_plot[m] = _smooth_series(
+                df_plot[m],
                 rolling_window=int(args.smooth),
                 ema_alpha=ema_alpha,
             )
+    else:
+        df_plot = df
 
+    method_label = (args.method or "").strip()
     out = args.output or f"wandb_plot_{project}_{run_id}.png"
+
+    if args.split_metrics:
+        out_dir = args.out_dir or os.path.dirname(os.path.abspath(out)) or "."
+        os.makedirs(out_dir, exist_ok=True)
+        for m in metrics:
+            out_one = os.path.join(out_dir, f"{_safe_filename(m)}.png")
+            plot_single_run_metric(
+                df_plot,
+                m,
+                x_col,
+                out_one,
+                method_label=method_label,
+                x_label=x_label,
+                min_step=min_step,
+                max_step=max_step,
+                x_tick_multiple=x_tick_multiple,
+                show_raw_underlay=bool(show_raw),
+                df_raw=df_raw,
+            )
+            print(f"saved figure: {out_one}")
+        return 0
+
     if args.layout == "multi":
         plot_subplots(
-            df,
+            df_plot,
             metrics,
             x_col,
             out,
@@ -705,10 +833,13 @@ def main() -> int:
             min_step=min_step,
             max_step=max_step,
             x_tick_multiple=x_tick_multiple,
+            method_label=method_label,
+            show_raw_underlay=bool(show_raw),
+            df_raw=df_raw,
         )
     else:
         plot_overlay(
-            df,
+            df_plot,
             metrics,
             x_col,
             out,
