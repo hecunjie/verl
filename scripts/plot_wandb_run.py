@@ -76,6 +76,7 @@ _METHOD_COLORS: dict[str, str] = {
 _METRIC_COLORS: dict[str, str] = {
     "fepo/offpolicy_abs_log_ratio_mean": "#1565C0",  # blue — log IS ratio
     "fepo/offpolicy_spearman_p10": "#C62828",  # red — Spearman
+    "fepo/offpolicy_spearman_mean": "#C62828",
     "fepo/f_suffix_rate_mean_high": "#00897B",  # teal
 }
 
@@ -130,7 +131,7 @@ def short_metric_ylabel(metric: str) -> str:
         return "suffix entropy rate mean"
     if m == "fepo/offpolicy_abs_log_ratio_mean":
         return "log IS ratio"
-    if m == "fepo/offpolicy_spearman_p10":
+    if m in ("fepo/offpolicy_spearman_p10", "fepo/offpolicy_spearman_mean"):
         return "spearman correlation"
     # Special-case for AIME25 visualization: show best@4 curve as mean@4 on y-axis label.
     if "aime2025" in m and ("best@4" in m or "best_at_4" in m or "best_at4" in m):
