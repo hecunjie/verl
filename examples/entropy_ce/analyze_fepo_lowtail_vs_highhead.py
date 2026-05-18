@@ -609,6 +609,22 @@ def main() -> None:
                 f"{r['n_suffix_tokens_used_m_eq_1']},{r['mean_suffix_tokens_used_m_eq_1']:.8f}\n"
             )
 
+    def _step_xlim_bounds() -> tuple[float | None, float | None]:
+        left = float(args.min_step) if int(args.min_step) > 0 else None
+        right = float(args.max_step) if int(args.max_step) > 0 else None
+        return left, right
+
+    def _apply_step_xlim(ax) -> None:
+        left, right = _step_xlim_bounds()
+        if left is None and right is None:
+            return
+        kw: dict[str, float] = {}
+        if left is not None:
+            kw["left"] = left
+        if right is not None:
+            kw["right"] = right
+        ax.set_xlim(**kw)
+
     try:
         import matplotlib
 
@@ -844,6 +860,7 @@ def main() -> None:
             ax15.set_ylabel(r"$E[\mathrm{adv} \mid q]$")
             ax15.grid(True, alpha=0.3)
             ax15.legend(ncol=3, fontsize=9)
+            _apply_step_xlim(ax15)
             fig10.tight_layout()
             fig10.savefig(output_dir / "top_tail_suffix_levels_adv_stats.png", dpi=160)
             plt.close(fig10)
@@ -854,8 +871,7 @@ def main() -> None:
             ax_ponly.set_ylabel(r"$P(\mathrm{adv}>0 \mid q)$")
             ax_ponly.grid(True, alpha=0.3)
             ax_ponly.legend(ncol=3, fontsize=9)
-            if int(args.max_step) > 0:
-                ax_ponly.set_xlim(left=max(0, int(args.min_step)), right=int(args.max_step))
+            _apply_step_xlim(ax_ponly)
             fig_p.tight_layout()
             fig_p.savefig(output_dir / "top_tail_suffix_levels_p_adv_pos_only.png", dpi=160)
             plt.close(fig_p)
@@ -866,6 +882,7 @@ def main() -> None:
             ax_eonly.set_ylabel(r"$E[\mathrm{adv} \mid q]$")
             ax_eonly.grid(True, alpha=0.3)
             ax_eonly.legend(ncol=3, fontsize=9)
+            _apply_step_xlim(ax_eonly)
             fig_e.tight_layout()
             fig_e.savefig(output_dir / "top_tail_suffix_levels_e_adv_only.png", dpi=160)
             plt.close(fig_e)
