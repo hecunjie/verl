@@ -131,7 +131,7 @@ def short_metric_ylabel(metric: str) -> str:
     if m == "fepo/offpolicy_abs_log_ratio_mean":
         return "log IS ratio"
     if m == "fepo/offpolicy_spearman_p10":
-        return "Spearman corr"
+        return "spearman correlation"
     # Special-case for AIME25 visualization: show best@4 curve as mean@4 on y-axis label.
     if "aime2025" in m and ("best@4" in m or "best_at_4" in m or "best_at4" in m):
         return "mean@4"
