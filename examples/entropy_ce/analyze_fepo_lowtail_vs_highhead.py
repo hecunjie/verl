@@ -151,7 +151,19 @@ def main() -> None:
         "--top_suffix_levels",
         type=str,
         default="0.1,0.2,0.3,0.5",
-        help="按后缀熵取 Top-K%% 的比例列表，逗号分隔。",
+        help="按后缀熵取 Top-K%% 的比例列表，逗号分隔（用于 top_tail_suffix_levels_* 图）。",
+    )
+    parser.add_argument(
+        "--min_step",
+        type=int,
+        default=0,
+        help="仅统计/绘制 step >= 该值的点；0 表示不限制。",
+    )
+    parser.add_argument(
+        "--max_step",
+        type=int,
+        default=0,
+        help="仅统计/绘制 step <= 该值的点；0 表示不限制。",
     )
     args = parser.parse_args()
     quantile_levels = [float(x.strip()) for x in str(args.quantile_levels).split(",") if x.strip()]
@@ -255,6 +267,12 @@ def main() -> None:
         raise SystemExit("没有可用记录：请检查字段名或数据内容。")
 
     steps = sorted(raw_by_step.keys())
+    if int(args.min_step) > 0:
+        steps = [s for s in steps if int(s) >= int(args.min_step)]
+    if int(args.max_step) > 0:
+        steps = [s for s in steps if int(s) <= int(args.max_step)]
+    if not steps:
+        raise SystemExit("step 过滤后无数据，请检查 --min_step / --max_step。")
     min_group_count = max(1, int(args.min_group_count))
 
     rows: list[dict[str, float | int]] = []
@@ -836,6 +854,8 @@ def main() -> None:
             ax_ponly.set_ylabel(r"$P(\mathrm{adv}>0 \mid q)$")
             ax_ponly.grid(True, alpha=0.3)
             ax_ponly.legend(ncol=3, fontsize=9)
+            if int(args.max_step) > 0:
+                ax_ponly.set_xlim(left=max(0, int(args.min_step)), right=int(args.max_step))
             fig_p.tight_layout()
             fig_p.savefig(output_dir / "top_tail_suffix_levels_p_adv_pos_only.png", dpi=160)
             plt.close(fig_p)
