@@ -57,6 +57,91 @@ def _iter_jsonl_paths(input_dir: Path) -> list[Path]:
     return files
 
 
+def _filter_rows_by_step(
+    rows: list[dict[str, float | int]],
+    *,
+    min_step: int,
+    max_step: int,
+) -> list[dict[str, float | int]]:
+    out = rows
+    if int(min_step) > 0:
+        out = [r for r in out if int(r["step"]) >= int(min_step)]
+    if int(max_step) > 0:
+        out = [r for r in out if int(r["step"]) <= int(max_step)]
+    return out
+
+
+def save_top_tail_suffix_levels_p_adv_pos_only(
+    output_dir: Path,
+    *,
+    top_suffix_rows: list[dict[str, float | int]],
+    tail_suffix_rows: list[dict[str, float | int]],
+    top_suffix_levels: list[float],
+    min_step: int = 0,
+    max_step: int = 0,
+    include_high_head: bool = True,
+    include_low_tail: bool = True,
+) -> Path:
+    """Dedicated figure: P(adv>0|q) vs step for selected suffix-level fractions."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    top_suffix_rows = _filter_rows_by_step(top_suffix_rows, min_step=min_step, max_step=max_step)
+    tail_suffix_rows = _filter_rows_by_step(tail_suffix_rows, min_step=min_step, max_step=max_step)
+    if not top_suffix_rows or not tail_suffix_rows:
+        raise ValueError("no rows after step filter for top_tail_suffix_levels_p_adv_pos_only")
+
+    x_top = np.array([r["step"] for r in top_suffix_rows], dtype=np.float64)
+    x_tail = np.array([r["step"] for r in tail_suffix_rows], dtype=np.float64)
+    cmap = plt.cm.get_cmap("tab10")
+
+    fig, ax = plt.subplots(1, 1, figsize=(11, 4.6))
+    for i, tl in enumerate(top_suffix_levels):
+        tname = f"{tl:.1f}"
+        color = cmap(i % 10)
+        if include_high_head:
+            p_top = np.array([r[f"p_pos_top{tname}"] for r in top_suffix_rows], dtype=np.float64)
+            ax.plot(
+                x_top,
+                p_top,
+                linewidth=2.0,
+                linestyle="-",
+                color=color,
+                label=rf"$q_{{\mathrm{{high}}}}$, $p={tl:.2f}$",
+            )
+        if include_low_tail:
+            p_tail = np.array([r[f"p_pos_tail{tname}"] for r in tail_suffix_rows], dtype=np.float64)
+            ax.plot(
+                x_tail,
+                p_tail,
+                linewidth=1.8,
+                linestyle="--",
+                color=color,
+                label=rf"$q_{{\mathrm{{low}}}}$, $p={tl:.2f}$",
+            )
+
+    ax.set_xlabel("step")
+    ax.set_ylabel(r"$P(\mathrm{adv}>0 \mid q)$")
+    ax.grid(True, alpha=0.3)
+    ax.legend(ncol=3, fontsize=9)
+    if int(min_step) > 0 or int(max_step) > 0:
+        left = float(min_step) if int(min_step) > 0 else None
+        right = float(max_step) if int(max_step) > 0 else None
+        kw: dict[str, float] = {}
+        if left is not None:
+            kw["left"] = left
+        if right is not None:
+            kw["right"] = right
+        ax.set_xlim(**kw)
+    fig.tight_layout()
+    out_path = output_dir / "top_tail_suffix_levels_p_adv_pos_only.png"
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+    return out_path
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
@@ -165,7 +250,30 @@ def main() -> None:
         default=0,
         help="仅统计/绘制 step <= 该值的点；0 表示不限制。",
     )
+    parser.add_argument(
+        "--figures",
+        type=str,
+        default="all",
+        help="要生成的图，逗号分隔：all 或 p_adv_pos_only（仅重画该 PNG，仍会写 CSV）。",
+    )
+    parser.add_argument(
+        "--p-adv-pos-high-head",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="top_tail_suffix_levels_p_adv_pos_only 是否画 q_high 实线。",
+    )
+    parser.add_argument(
+        "--p-adv-pos-low-tail",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="top_tail_suffix_levels_p_adv_pos_only 是否画 q_low 虚线。",
+    )
     args = parser.parse_args()
+    figure_set = {x.strip().lower() for x in str(args.figures).split(",") if x.strip()}
+    if not figure_set:
+        figure_set = {"all"}
+    plot_all_figures = "all" in figure_set
+    plot_p_adv_pos_only = plot_all_figures or "p_adv_pos_only" in figure_set
     quantile_levels = [float(x.strip()) for x in str(args.quantile_levels).split(",") if x.strip()]
     if not quantile_levels:
         raise SystemExit("--quantile_levels 不能为空。")
@@ -625,6 +733,26 @@ def main() -> None:
             kw["right"] = right
         ax.set_xlim(**kw)
 
+    if plot_p_adv_pos_only and top_suffix_rows and tail_suffix_rows:
+        try:
+            p_out = save_top_tail_suffix_levels_p_adv_pos_only(
+                output_dir,
+                top_suffix_rows=top_suffix_rows,
+                tail_suffix_rows=tail_suffix_rows,
+                top_suffix_levels=top_suffix_levels,
+                min_step=int(args.min_step),
+                max_step=int(args.max_step),
+                include_high_head=bool(args.p_adv_pos_high_head),
+                include_low_tail=bool(args.p_adv_pos_low_tail),
+            )
+            print(f"saved figure: {p_out}")
+        except Exception as e:  # pragma: no cover
+            print(f"[warn] top_tail_suffix_levels_p_adv_pos_only 失败: {e}")
+
+    if not plot_all_figures:
+        print(f"Done. steps={len(steps)}, used={n_used}, skipped={n_bad} (--figures={args.figures})")
+        return 0
+
     try:
         import matplotlib
 
@@ -865,16 +993,7 @@ def main() -> None:
             fig10.savefig(output_dir / "top_tail_suffix_levels_adv_stats.png", dpi=160)
             plt.close(fig10)
 
-            fig_p, ax_ponly = plt.subplots(1, 1, figsize=(11, 4.6))
-            _plot_top_tail_suffix_level_curves(ax_ponly, None)
-            ax_ponly.set_xlabel("step")
-            ax_ponly.set_ylabel(r"$P(\mathrm{adv}>0 \mid q)$")
-            ax_ponly.grid(True, alpha=0.3)
-            ax_ponly.legend(ncol=3, fontsize=9)
-            _apply_step_xlim(ax_ponly)
-            fig_p.tight_layout()
-            fig_p.savefig(output_dir / "top_tail_suffix_levels_p_adv_pos_only.png", dpi=160)
-            plt.close(fig_p)
+            # p_adv_pos_only 已由 save_top_tail_suffix_levels_p_adv_pos_only() 单独生成
 
             fig_e, ax_eonly = plt.subplots(1, 1, figsize=(11, 4.6))
             _plot_top_tail_suffix_level_curves(None, ax_eonly)
